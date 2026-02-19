@@ -11,7 +11,7 @@ are vibrant and opaque inside.
 Single-shader transparency doesn't work on dense molecular surface meshes (opacity
 accumulates across thousands of faces). Instead we use two render passes:
 
-1. **Pass 1 (atoms):** Ball-and-stick of internal components on dark background
+1. **Pass 1 (internal):** Cartoon representation of internal components on dark background
 2. **Pass 2 (surface):** Opaque flat-shaded surface of the ribosome
 3. **Composite in Python (PIL/numpy):**
    - Blend surface over atoms at ~20% opacity (translucent overlay)
@@ -29,26 +29,20 @@ and reused identically in pass 1.
 - **Outline:** Blue edge line (~7px), computed via edge detection on the surface silhouette
 - **No per-chain coloring** — uniform across all subunits
 
-## mRNA (chain A4)
+## Internal components (mRNA, tRNAs, polypeptide)
 
-- **Representation:** Ball-and-stick
+- **Representation:** Cartoon (StyleCartoon) — distinct arrows for beta-sheets, cylinders for helices. Chosen over ribbon (too smooth) and ball-and-stick (too noisy at this scale).
 - **Color:** Vibrant blue
 - **Opacity:** Fully opaque
 - **Material:** Principled BSDF, roughness=0.25, emission=0.8
 
-## tRNAs (chains B4, D4)
+### Per-component colors
 
-- **Representation:** Ball-and-stick
-- **Color:** Vibrant orange (could differentiate A-site vs P-site)
-- **Opacity:** Fully opaque
-- **Material:** Same as mRNA
-
-## Nascent polypeptide (chain C4 + procedural extension)
-
-- **Representation:** Ball-and-stick
-- **Color:** Magenta / purple
-- **Opacity:** Fully opaque
-- **Material:** Same as mRNA
+| Component | Chain(s) | Color |
+|-----------|----------|-------|
+| mRNA | A4 | Vibrant blue |
+| tRNAs | B4, D4 | Vibrant orange |
+| Nascent polypeptide | C4 + extension | Magenta / purple |
 
 ## Background
 

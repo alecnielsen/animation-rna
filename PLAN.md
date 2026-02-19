@@ -118,7 +118,7 @@ For a seamless loop, either:
 - [x] Basic test render of 6Y0G (proof of pipeline)
 - [x] Visual style proven on 2PTC test structure
   - [x] Two-pass compositing: translucent surface + edge outline
-  - [x] Ball-and-stick for internal atoms
+  - [x] Cartoon for internal components (chosen over ribbon, ball-and-stick, surface)
   - [x] Camera alignment between passes
 - [ ] Apply style to full 6Y0G ribosome (single frame)
 - [ ] Separate 6Y0G into component objects for animation
