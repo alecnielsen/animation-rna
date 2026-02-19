@@ -16,7 +16,7 @@ mn.register()
 
 RES = (1920, 1080)
 OUTLINE_COLOR = (70, 120, 200)
-OUTLINE_THICKNESS = 7
+OUTLINE_THICKNESS = 3
 
 
 def make_solid_material(color):
@@ -35,14 +35,13 @@ def make_solid_material(color):
 
 
 def make_surface_material():
-    """Flat pale blue surface for translucent overlay + edge detection."""
+    """Flat diffuse surface — shading variations create interior detail in outline."""
     mat = bpy.data.materials.new(name="surface_flat")
     n = mat.node_tree.nodes
     l = mat.node_tree.links
     n.clear()
-    # Flat diffuse — no specular, matte look
     bsdf = n.new("ShaderNodeBsdfDiffuse")
-    bsdf.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)  # pale blue-gray
+    bsdf.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)
     bsdf.inputs["Roughness"].default_value = 1.0
     out = n.new("ShaderNodeOutputMaterial")
     l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
@@ -72,6 +71,12 @@ mol2.add_style(
     name="surface",
 )
 
+# Rotate the molecule 90 degrees around Z axis BEFORE framing
+import math
+for o in bpy.data.objects:
+    if "2PTC" in o.name and o.type == "MESH":
+        o.rotation_euler.z = math.pi / 2
+
 # Frame on the surface — this is the larger object
 canvas2.frame_object(mol2)
 
@@ -98,11 +103,16 @@ scene1.cycles.max_bounces = 12
 
 mol1 = mn.Molecule.fetch("2PTC")
 mol1.add_style(
-    style=mn.StyleBallAndStick(),
+    style=mn.StyleCartoon(),
     selection=mol1.select.chain_id(["I"]),
     material=make_solid_material((0.1, 0.35, 0.95)),
     name="atoms",
 )
+
+# Apply same rotation to pass 1 molecule
+for o in bpy.data.objects:
+    if "2PTC" in o.name and o.type == "MESH":
+        o.rotation_euler.z = math.pi / 2
 
 # Apply same camera
 cam1 = scene1.camera
@@ -126,13 +136,12 @@ surface = Image.open("renders/pass2_surface.png").convert("RGBA")
 surface_gray = Image.open("renders/pass2_surface.png").convert("L")
 
 # --- Layer 1: Translucent surface overlay ---
-# Blend surface over atoms at low opacity
 surface_np = np.array(surface).astype(np.float32)
-surface_np[:, :, 3] = SURFACE_OPACITY * 255  # set alpha
+surface_np[:, :, 3] = SURFACE_OPACITY * 255
 translucent = Image.fromarray(surface_np.astype(np.uint8), "RGBA")
 result = Image.alpha_composite(atoms, translucent)
 
-# --- Layer 2: Edge outline ---
+# --- Layer 2: Edge outline (thin, crisp, with interior detail) ---
 edges = surface_gray.filter(ImageFilter.FIND_EDGES)
 edges_np = np.array(edges)
 edges_binary = (edges_np > 15).astype(np.uint8) * 255
@@ -140,15 +149,14 @@ edges_binary = (edges_np > 15).astype(np.uint8) * 255
 edges_img = Image.fromarray(edges_binary)
 for _ in range(OUTLINE_THICKNESS // 2):
     edges_img = edges_img.filter(ImageFilter.MaxFilter(3))
-edges_img = edges_img.filter(ImageFilter.GaussianBlur(2.0))
 edges_np = np.array(edges_img)
 
 overlay = np.zeros((*edges_np.shape, 4), dtype=np.uint8)
-mask = edges_np > 40
+mask = edges_np > 100
 overlay[mask, 0] = OUTLINE_COLOR[0]
 overlay[mask, 1] = OUTLINE_COLOR[1]
 overlay[mask, 2] = OUTLINE_COLOR[2]
-overlay[mask, 3] = np.minimum(edges_np[mask], 255).astype(np.uint8)
+overlay[mask, 3] = 255
 
 result = Image.alpha_composite(result, Image.fromarray(overlay, "RGBA"))
 result.save("renders/test_style.png")
