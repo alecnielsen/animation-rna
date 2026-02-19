@@ -1,0 +1,25 @@
+# Python
+mn_env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Blender
+*.blend1
+*.blend2
+
+# Molecular Nodes cache
+.MolecularNodes/
+
+# Renders
+renders/
+*.mp4
+*.webm
+*.avi
+
+# OS
+.DS_Store
+Thumbs.db
