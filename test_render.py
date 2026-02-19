@@ -1,100 +1,156 @@
 """
-Test script: Load human 80S ribosome (6Y0G) and render with per-component styling.
-- Ribosome: near-transparent surface with outline
-- mRNA, tRNAs, polypeptide: solid ball-and-stick
+Style development: Two-pass compositing.
+Frame camera on the SURFACE (larger object) so outline is centered.
 
 Run with: python3.11 test_render.py
 """
 
 import molecularnodes as mn
 import bpy
+import numpy as np
+from PIL import Image, ImageFilter
 import os
 
 os.makedirs("renders", exist_ok=True)
 mn.register()
 
-# --- Chain ID definitions ---
+RES = (1920, 1080)
+OUTLINE_COLOR = (70, 120, 200)
+OUTLINE_THICKNESS = 7
 
-CHAINS_40S = [
-    "S2", "SA", "SB", "SC", "SD", "SE", "SF", "SG", "SH", "SI", "SJ", "SK",
-    "SL", "SM", "SN", "SO", "SP", "SQ", "SR", "SS", "ST", "SU", "SV", "SW",
-    "SX", "SY", "SZ", "Sa", "Sb", "Sc", "Sd", "Se", "Sf", "Sg",
-]
 
-CHAINS_60S = [
-    "L5", "L7", "L8", "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI",
-    "LJ", "LL", "LM", "LN", "LO", "LP", "LQ", "LR", "LS", "LT", "LU", "LV",
-    "LW", "LX", "LY", "LZ", "La", "Lb", "Lc", "Ld", "Le", "Lf", "Lg", "Lh",
-    "Li", "Lj", "Lk", "Ll", "Lm", "Ln", "Lo", "Lp", "Lr",
-]
+def make_solid_material(color):
+    mat = bpy.data.materials.new(name="solid")
+    n = mat.node_tree.nodes
+    l = mat.node_tree.links
+    n.clear()
+    bsdf = n.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+    bsdf.inputs["Roughness"].default_value = 0.25
+    bsdf.inputs["Emission Color"].default_value = (*color, 1.0)
+    bsdf.inputs["Emission Strength"].default_value = 0.8
+    out = n.new("ShaderNodeOutputMaterial")
+    l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return mat
 
-CHAINS_RIBOSOME = CHAINS_40S + CHAINS_60S
 
-CHAIN_MRNA = "A4"
-CHAIN_TRNA_P = "B4"
-CHAIN_TRNA_A = "D4"
-CHAIN_PEPTIDE = "C4"
-CHAINS_PAYLOAD = [CHAIN_MRNA, CHAIN_TRNA_P, CHAIN_TRNA_A, CHAIN_PEPTIDE]
+def make_surface_material():
+    """Flat pale blue surface for translucent overlay + edge detection."""
+    mat = bpy.data.materials.new(name="surface_flat")
+    n = mat.node_tree.nodes
+    l = mat.node_tree.links
+    n.clear()
+    # Flat diffuse — no specular, matte look
+    bsdf = n.new("ShaderNodeBsdfDiffuse")
+    bsdf.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)  # pale blue-gray
+    bsdf.inputs["Roughness"].default_value = 1.0
+    out = n.new("ShaderNodeOutputMaterial")
+    l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return mat
 
-# --- Setup ---
 
-print("Setting up canvas...")
-canvas = mn.Canvas(
-    mn.scene.Cycles(samples=64),
-    resolution=(1920, 1080),
-)
+def set_bg(scene, color, strength):
+    bg = scene.world.node_tree.nodes.get("Background")
+    if bg:
+        bg.inputs["Color"].default_value = (*color, 1.0)
+        bg.inputs["Strength"].default_value = strength
 
-print("Fetching 6Y0G (human 80S ribosome)...")
-mol = mn.Molecule.fetch("6Y0G")
 
-# Debug: print actual chain IDs in the structure
-unique_chains = set(mol.array.chain_id) if hasattr(mol.array, 'chain_id') else set()
-print(f"Chain IDs in structure ({len(unique_chains)}): {sorted(unique_chains)}")
+# ==========================================
+# PASS 2 FIRST — Surface mask (for camera framing)
+# ==========================================
+print("=== Pass 2: Surface mask (render first for framing) ===")
+canvas2 = mn.Canvas(mn.scene.Cycles(samples=16), resolution=RES)
+scene2 = bpy.context.scene
+set_bg(scene2, (0.02, 0.02, 0.03), 0.3)
 
-# --- Style: Ribosome — transparent surface with outline ---
-
-print("Applying ribosome surface style (transparent)...")
-mol.add_style(
+mol2 = mn.Molecule.fetch("2PTC")
+mol2.add_style(
     style=mn.StyleSurface(),
-    selection=mol.select.chain_id(CHAINS_RIBOSOME),
-    material=mn.material.TransparentOutline(),
-    name="ribosome_surface",
+    selection=mol2.select.chain_id(["E"]),
+    material=make_surface_material(),
+    name="surface",
 )
 
-# --- Style: mRNA — ball and stick, blue ---
+# Frame on the surface — this is the larger object
+canvas2.frame_object(mol2)
 
-print("Applying mRNA style...")
-mol.add_style(
+# Capture camera
+cam = scene2.camera
+cam_loc = tuple(cam.location)
+cam_rot = tuple(cam.rotation_euler)
+cam_lens = cam.data.lens
+cam_clip = (cam.data.clip_start, cam.data.clip_end)
+print(f"  Camera: loc={cam_loc}")
+
+canvas2.snapshot("renders/pass2_surface.png")
+print("  Saved")
+canvas2.clear()
+
+# ==========================================
+# PASS 1 — Atoms with same camera
+# ==========================================
+print("=== Pass 1: Atoms ===")
+canvas1 = mn.Canvas(mn.scene.Cycles(samples=48), resolution=RES)
+scene1 = bpy.context.scene
+set_bg(scene1, (0.04, 0.04, 0.06), 0.5)
+scene1.cycles.max_bounces = 12
+
+mol1 = mn.Molecule.fetch("2PTC")
+mol1.add_style(
     style=mn.StyleBallAndStick(),
-    selection=mol.select.chain_id([CHAIN_MRNA]),
-    material=mn.material.Default(),
-    name="mrna",
+    selection=mol1.select.chain_id(["I"]),
+    material=make_solid_material((0.1, 0.35, 0.95)),
+    name="atoms",
 )
 
-# --- Style: tRNAs — ball and stick ---
+# Apply same camera
+cam1 = scene1.camera
+cam1.location = cam_loc
+cam1.rotation_euler = cam_rot
+cam1.data.lens = cam_lens
+cam1.data.clip_start, cam1.data.clip_end = cam_clip
 
-print("Applying tRNA styles...")
-mol.add_style(
-    style=mn.StyleBallAndStick(),
-    selection=mol.select.chain_id([CHAIN_TRNA_P, CHAIN_TRNA_A]),
-    material=mn.material.Default(),
-    name="trnas",
-)
+canvas1.snapshot("renders/pass1_atoms.png")
+print("  Saved")
 
-# --- Style: Nascent peptide — ball and stick ---
+# ==========================================
+# COMPOSITE
+# ==========================================
+print("=== Compositing ===")
 
-print("Applying peptide style...")
-mol.add_style(
-    style=mn.StyleBallAndStick(),
-    selection=mol.select.chain_id([CHAIN_PEPTIDE]),
-    material=mn.material.Default(),
-    name="peptide",
-)
+SURFACE_OPACITY = 0.20  # 20% translucent overlay
 
-# --- Render ---
+atoms = Image.open("renders/pass1_atoms.png").convert("RGBA")
+surface = Image.open("renders/pass2_surface.png").convert("RGBA")
+surface_gray = Image.open("renders/pass2_surface.png").convert("L")
 
-print("Framing and rendering...")
-canvas.frame_object(mol)
-canvas.snapshot("renders/test_styled.png")
+# --- Layer 1: Translucent surface overlay ---
+# Blend surface over atoms at low opacity
+surface_np = np.array(surface).astype(np.float32)
+surface_np[:, :, 3] = SURFACE_OPACITY * 255  # set alpha
+translucent = Image.fromarray(surface_np.astype(np.uint8), "RGBA")
+result = Image.alpha_composite(atoms, translucent)
 
-print("Done! Check renders/test_styled.png")
+# --- Layer 2: Edge outline ---
+edges = surface_gray.filter(ImageFilter.FIND_EDGES)
+edges_np = np.array(edges)
+edges_binary = (edges_np > 15).astype(np.uint8) * 255
+
+edges_img = Image.fromarray(edges_binary)
+for _ in range(OUTLINE_THICKNESS // 2):
+    edges_img = edges_img.filter(ImageFilter.MaxFilter(3))
+edges_img = edges_img.filter(ImageFilter.GaussianBlur(2.0))
+edges_np = np.array(edges_img)
+
+overlay = np.zeros((*edges_np.shape, 4), dtype=np.uint8)
+mask = edges_np > 40
+overlay[mask, 0] = OUTLINE_COLOR[0]
+overlay[mask, 1] = OUTLINE_COLOR[1]
+overlay[mask, 2] = OUTLINE_COLOR[2]
+overlay[mask, 3] = np.minimum(edges_np[mask], 255).astype(np.uint8)
+
+result = Image.alpha_composite(result, Image.fromarray(overlay, "RGBA"))
+result.save("renders/test_style.png")
+
+print("Done! Check renders/test_style.png")

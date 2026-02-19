@@ -2,71 +2,69 @@
 
 ## Overview
 
-Cel-shaded molecular visualization. The ribosome is a ghostly transparent shell that reveals
-the solid, vibrant machinery inside.
+Translucent molecular surface with solid internal machinery. The ribosome reads as a
+semi-transparent shell with an edge outline, while the mRNA, tRNAs, and polypeptide
+are vibrant and opaque inside.
+
+## Rendering approach: Two-pass compositing
+
+Single-shader transparency doesn't work on dense molecular surface meshes (opacity
+accumulates across thousands of faces). Instead we use two render passes:
+
+1. **Pass 1 (atoms):** Ball-and-stick of internal components on dark background
+2. **Pass 2 (surface):** Opaque flat-shaded surface of the ribosome
+3. **Composite in Python (PIL/numpy):**
+   - Blend surface over atoms at ~20% opacity (translucent overlay)
+   - Edge-detect the surface silhouette (FIND_EDGES + dilate + gaussian blur)
+   - Overlay colored outline on top
+
+Camera position is captured from pass 2 (surface is the larger object for framing)
+and reused identically in pass 1.
 
 ## Ribosome (40S + 60S subunits)
 
-- **Representation:** Surface mesh only (no atoms, no ribbons, no cartoon)
-- **Color:** Uniform single color across all subunits/chains — light cool gray or pale blue
-- **Transparency:** Near-transparent (~10-15% opacity). Should be able to clearly see through it
-- **Outline:** Solid dark outline on the silhouette/perimeter edges only (Freestyle or inverted-hull)
-- **Feel:** Cel-shaded / illustration style. Think "glass ghost" with ink edges
+- **Representation:** Surface mesh (StyleSurface)
+- **Color:** Uniform pale blue-gray, flat diffuse (roughness=1.0)
+- **Translucency:** ~20% opacity via compositing blend
+- **Outline:** Blue edge line (~7px), computed via edge detection on the surface silhouette
+- **No per-chain coloring** — uniform across all subunits
 
 ## mRNA (chain A4)
 
-- **Representation:** Atomic (ball-and-stick or spheres)
+- **Representation:** Ball-and-stick
 - **Color:** Vibrant blue
 - **Opacity:** Fully opaque
-- **Material:** Solid, slightly glossy
+- **Material:** Principled BSDF, roughness=0.25, emission=0.8
 
 ## tRNAs (chains B4, D4)
 
-- **Representation:** Atomic (ball-and-stick or spheres)
-- **Color:** Vibrant orange (could differentiate A-site vs P-site with orange vs warm yellow)
+- **Representation:** Ball-and-stick
+- **Color:** Vibrant orange (could differentiate A-site vs P-site)
 - **Opacity:** Fully opaque
-- **Material:** Solid, slightly glossy
+- **Material:** Same as mRNA
 
-## Nascent polypeptide (chain C4)
+## Nascent polypeptide (chain C4 + procedural extension)
 
-- **Representation:** Atomic (ball-and-stick or spheres)
+- **Representation:** Ball-and-stick
 - **Color:** Magenta / purple
 - **Opacity:** Fully opaque
-- **Material:** Solid, slightly glossy
+- **Material:** Same as mRNA
 
 ## Background
 
-- Dark neutral (charcoal or near-black), no gradient
+- Dark charcoal (0.04, 0.04, 0.06), low world strength (~0.5)
 
 ## Lighting
 
-- Soft, even lighting (HDRI or 3-point). No harsh shadows — the focus is readability.
+- Cycles default + world background. Soft, even.
+- Emission on atoms (strength ~0.8) for self-illumination through translucent surface.
 
-## Technical approach for transparency + outline
+## Compositing parameters
 
-The built-in MN `TransparentOutline` material does NOT achieve the desired look (it just dims
-the surface while keeping it opaque). We need a custom approach:
-
-### Option A: Principled BSDF with alpha + Freestyle edges
-- Custom Principled BSDF material with `alpha = 0.1`, blend mode = alpha blend
-- Enable Freestyle rendering in Blender for silhouette edge detection
-- Freestyle line set: silhouette + border edges, dark stroke
-
-### Option B: Shader-based outline (inverted hull)
-- Two-pass approach: render the surface with a glass/transparent shader
-- Add a solidify modifier with flipped normals + black emission material for outline
-- More control over line thickness, works in Cycles
-
-### Option C: Compositing
-- Render ribosome surface as a separate pass
-- Composite with edge detection (Sobel filter) in post
-- Most flexible but requires multi-pass pipeline
-
-**Recommendation:** Start with Option A (Principled BSDF + Freestyle). Simplest to script
-and Freestyle is well-supported in headless Blender.
-
-## Development strategy
-
-Use a small test structure (e.g. PDB 2PTC — trypsin-BPTI complex, ~300 residues, 2 chains)
-to iterate on the shader/outline look before applying to the full 80S ribosome (83 chains,
-~300K atoms). This keeps render times under a few seconds per frame.
+```python
+SURFACE_OPACITY = 0.20
+OUTLINE_COLOR = (70, 120, 200)
+OUTLINE_THICKNESS = 7       # pixels (MaxFilter dilations)
+EDGE_THRESHOLD = 15
+GAUSSIAN_BLUR = 2.0
+```

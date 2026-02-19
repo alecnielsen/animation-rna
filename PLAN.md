@@ -5,9 +5,9 @@
 ~10-15 second looping video of protein translation for a product webpage.
 Human 80S ribosome (PDB 6Y0G) with mRNA, tRNAs, and growing polypeptide chain.
 
-## PDB structures
+## PDB structure
 
-### Primary: 6Y0G — Human 80S ribosome, classical PRE state (3.2 A)
+### 6Y0G — Human 80S ribosome, classical PRE state (3.2 A)
 
 | Chain(s) | Component |
 |----------|-----------|
@@ -18,64 +18,123 @@ Human 80S ribosome (PDB 6Y0G) with mRNA, tRNAs, and growing polypeptide chain.
 | `D4` | A-site tRNA |
 | `C4` | Nascent peptide (dipeptide) |
 
-### Style development: 2PTC — Trypsin-BPTI complex (~300 residues)
+## Rendering approach
 
-Small 2-chain structure for fast iteration on materials and shaders.
-Chain E = trypsin (transparent surface role), Chain I = BPTI (solid atomic role).
+Two-pass compositing per frame (see STYLE.md for details):
+1. Render internal atoms (ball-and-stick) — mRNA, tRNAs, polypeptide
+2. Render ribosome surface (flat opaque)
+3. Composite: translucent surface overlay + edge outline
+
+For animation, each frame is rendered as two passes and composited.
+This can be parallelized (render all pass-1 frames, then all pass-2 frames).
 
 ## Animation approach: Rigid-body choreography
 
-Load 6Y0G once, split into component objects (ribosome shell, mRNA, tRNAs, peptide),
-and animate them as rigid bodies along scripted keyframe paths. This gives full control
-over timing and is much simpler than morphing between PDB states.
+Load 6Y0G and separate into component objects. The ribosome stays static
+(it's the frame of reference). Moving parts are animated as rigid bodies
+along scripted keyframe paths.
 
-### Sequence (one elongation cycle)
+### Moving parts
+
+1. **mRNA** — slides through the ribosome channel. Translate along the mRNA
+   axis by ~3 nucleotide widths per cycle (one codon). The mRNA in 6Y0G is
+   only 28 nt, so we may need to extend it procedurally (duplicate + offset)
+   to avoid running out of strand.
+
+2. **tRNAs** — three copies cycling through positions:
+   - **Incoming tRNA**: starts outside the ribosome, glides into A-site
+   - **A→P transition**: after peptide transfer, A-site tRNA moves to P-site
+   - **P→E transition**: P-site tRNA moves to E-site and departs
+   - We extract the tRNA geometry from chains B4/D4 and place copies at
+     each position. Keyframe their location/rotation to interpolate between
+     sites.
+
+3. **Polypeptide chain** — grows by one amino acid per cycle, emerging from
+   the exit tunnel. Approaches:
+   - **(a) Progressive reveal:** Pre-build a long polypeptide (e.g. poly-Ala
+     helix, ~20 residues). Use a geometry nodes mask or clip plane to reveal
+     one residue at a time.
+   - **(b) Procedural growth:** Use biotite/MDAnalysis to generate amino acid
+     coordinates. Add residues to the Blender mesh at the peptide transfer
+     keyframe.
+   - **(c) Simple tube:** Animated curve/tube that extends from the exit
+     tunnel. Less accurate but visually clean.
+   - **Recommended: (a)** — pre-build and progressively reveal. Simplest to
+     keyframe and looks good.
+
+### Sequence (one elongation cycle, 240 frames @ 24fps = 10 seconds)
 
 ```
-Frame 0-30:    ESTABLISH — Camera orbits to reveal ribosome with mRNA inside.
-               P-site tRNA holds growing peptide. A-site is empty.
+Frame 0-30:    ESTABLISH
+               Ribosome with mRNA threaded through.
+               P-site tRNA holds growing peptide.
+               A-site is empty. E-site is empty.
 
-Frame 30-90:   DELIVERY — New aminoacyl-tRNA glides into the A-site from outside.
+Frame 30-90:   tRNA DELIVERY
+               Aminoacyl-tRNA glides into the A-site from outside.
                Enters through the intersubunit space.
 
-Frame 90-120:  ACCOMMODATION — tRNA settles into A-site, slight ribosome flex.
+Frame 90-120:  ACCOMMODATION
+               tRNA settles into A-site.
 
-Frame 120-150: PEPTIDE TRANSFER — Peptide chain visually "jumps" from P-site tRNA
-               to A-site tRNA (grows by one residue).
+Frame 120-150: PEPTIDE TRANSFER
+               Peptide chain extends by one residue.
+               Visual: new amino acid appears on A-site tRNA,
+               polypeptide in exit tunnel grows by one unit.
 
-Frame 150-210: TRANSLOCATION — tRNAs shift: A→P, P→E. mRNA advances one codon.
+Frame 150-210: TRANSLOCATION
+               A-site tRNA → P-site (with peptide)
+               P-site tRNA → E-site (deacylated)
+               mRNA advances by one codon (~3 nt translation)
+
+Frame 210-240: tRNA DEPARTURE + LOOP RESET
                E-site tRNA departs.
-
-Frame 210-240: RESET — Seamless transition back to frame 0 state
-               (new tRNA now in P-site, A-site empty, chain is one residue longer).
+               State is now identical to frame 0 but with
+               polypeptide one residue longer.
+               Camera position loops seamlessly.
 ```
-
-At 24fps this is 10 seconds. The loop should be seamless.
 
 ### Camera
 
-Slow continuous orbit (~30 degrees over the full sequence). Slightly angled to show
-the exit tunnel where the polypeptide emerges.
+Slow continuous orbit (~30 degrees over the full 240 frames).
+Slightly angled to show the exit tunnel where the polypeptide emerges.
+The orbit should loop seamlessly (end angle = start angle + N*360 for some N,
+or use a subtle back-and-forth).
+
+### Making it loop
+
+The elongation cycle is inherently repeatable. At frame 240, the state is
+the same as frame 0 except:
+- The polypeptide is one residue longer (progressive reveal continues)
+- The mRNA has advanced one codon
+
+For a seamless loop, either:
+- Accept the polypeptide growth as a slow drift (viewers won't notice in 10s)
+- Or reset the polypeptide clip plane at the loop point
 
 ## Milestones
 
 - [x] Environment setup (Python 3.11 + Molecular Nodes + headless bpy)
 - [x] Basic test render of 6Y0G (proof of pipeline)
-- [ ] Nail the visual style on small test structure (2PTC)
-  - [ ] Transparent surface + outline shader for "ribosome" role
-  - [ ] Opaque vibrant atomic materials for "payload" role
-  - [ ] Cel-shaded look with Freestyle or inverted hull
-- [ ] Apply style to full 6Y0G ribosome
-- [ ] Split 6Y0G into component objects for animation
-- [ ] Keyframe the elongation cycle
-- [ ] Camera path
-- [ ] Render full animation
-- [ ] Export as web-ready video (MP4/WebM, H.264/VP9)
+- [x] Visual style proven on 2PTC test structure
+  - [x] Two-pass compositing: translucent surface + edge outline
+  - [x] Ball-and-stick for internal atoms
+  - [x] Camera alignment between passes
+- [ ] Apply style to full 6Y0G ribosome (single frame)
+- [ ] Separate 6Y0G into component objects for animation
+- [ ] Pre-build polypeptide chain for progressive reveal
+- [ ] Extend mRNA strand (duplicate + offset)
+- [ ] Keyframe the elongation cycle (rigid-body paths)
+- [ ] Camera orbit path
+- [ ] Render all frames (two-pass per frame)
+- [ ] Composite all frames
+- [ ] Encode as web-ready video (MP4 H.264 + WebM VP9)
 
 ## Tech stack
 
 - **Python 3.11** — required by Blender
 - **Molecular Nodes 4.5.10** — PDB loading, molecular styles
-- **bpy (Blender Python)** — headless rendering, materials, animation
-- **Cycles renderer** — for transparency and refraction
-- **Freestyle** — for silhouette edge rendering (if Option A for outlines)
+- **bpy (Blender Python)** — headless rendering, materials, keyframes
+- **Cycles renderer** — lighting, materials
+- **PIL / numpy** — per-frame compositing (translucent overlay + edge outline)
+- **ffmpeg** — final video encoding
