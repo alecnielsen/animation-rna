@@ -120,7 +120,10 @@ For a seamless loop, either:
   - [x] Two-pass compositing: translucent surface + edge outline
   - [x] Cartoon for internal components (chosen over ribbon, ball-and-stick, surface)
   - [x] Camera alignment between passes
-- [ ] Apply style to full 6Y0G ribosome (single frame)
+- [x] Apply style to full 6Y0G ribosome (single frame)
+  - [x] Alpha-based silhouette detection (transparent film render)
+  - [x] Ribosome surface with 79 chains (40S + 60S)
+  - [x] Internal components: mRNA (A4), tRNAs (B4, D4), polypeptide (C4)
 - [ ] Separate 6Y0G into component objects for animation
 - [ ] Pre-build polypeptide chain for progressive reveal
 - [ ] Extend mRNA strand (duplicate + offset)

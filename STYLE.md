@@ -15,7 +15,7 @@ accumulates across thousands of faces). Instead we use two render passes:
 2. **Pass 2 (surface):** Opaque flat-shaded surface of the ribosome
 3. **Composite in Python (PIL/numpy):**
    - Blend surface over atoms at ~20% opacity (translucent overlay)
-   - Edge-detect the surface silhouette (FIND_EDGES + dilate + gaussian blur)
+   - Edge-detect the alpha-channel silhouette (FIND_EDGES + dilate)
    - Overlay colored outline on top
 
 Camera position is captured from pass 2 (surface is the larger object for framing)
@@ -26,7 +26,7 @@ and reused identically in pass 1.
 - **Representation:** Surface mesh (StyleSurface)
 - **Color:** Uniform pale blue-gray, flat diffuse (roughness=1.0)
 - **Translucency:** ~20% opacity via compositing blend
-- **Outline:** Blue edge line (~7px), computed via edge detection on the surface silhouette
+- **Outline:** Blue edge line (~3px), computed via edge detection on alpha-channel silhouette (surface rendered with `film_transparent=True`)
 - **No per-chain coloring** — uniform across all subunits
 
 ## Internal components (mRNA, tRNAs, polypeptide)
@@ -58,7 +58,6 @@ and reused identically in pass 1.
 ```python
 SURFACE_OPACITY = 0.20
 OUTLINE_COLOR = (70, 120, 200)
-OUTLINE_THICKNESS = 7       # pixels (MaxFilter dilations)
-EDGE_THRESHOLD = 15
-GAUSSIAN_BLUR = 2.0
+OUTLINE_THICKNESS = 3       # pixels (MaxFilter dilations)
+EDGE_THRESHOLD = 30         # on alpha-channel silhouette
 ```
