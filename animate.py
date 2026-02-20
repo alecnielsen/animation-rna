@@ -148,37 +148,62 @@ def scale_frames(f):
 # ---------------------------------------------------------------------------
 # Molecular jitter — sum-of-sines with irrational frequency ratios
 # ---------------------------------------------------------------------------
-JITTER_TRANS_AMP = 0.15   # BU per axis
-JITTER_ROT_AMP = 1.5      # degrees per axis
+JITTER_TRANS_AMP = 0.15   # BU per axis (rigid-body translation)
+JITTER_ROT_AMP = 15.0     # degrees per axis (rigid-body rotation)
 JITTER_HARMONICS = 4
 # Golden-ratio-spaced frequencies (irrational → never repeats)
 PHI = (1 + math.sqrt(5)) / 2
 JITTER_FREQS = [0.07 * PHI**k for k in range(JITTER_HARMONICS)]
 
+# Per-atom thermal jitter
+ATOM_JITTER_AMP = 0.3     # BU per atom — displacement amplitude
+# Spatial frequency vectors: each harmonic uses a different direction so
+# the noise has complex spatial structure (not just a single plane wave).
+ATOM_SPATIAL_VECS = np.array([
+    [0.13, 0.17, 0.11],
+    [0.19, -0.11, 0.15],
+    [-0.14, 0.18, 0.12],
+    [0.16, 0.13, -0.17],
+])
+
 
 def compute_jitter(frame, obj_index):
-    """Return (trans_xyz, rot_xyz) jitter for given frame and object index.
-
-    Uses sum-of-sines with golden-ratio frequency spacing for smooth,
-    deterministic, non-repeating thermal motion. Each object gets a unique
-    phase offset based on obj_index.
-    """
+    """Return (trans_xyz, rot_xyz) rigid-body jitter for given frame and object index."""
     trans = np.zeros(3)
     rot = np.zeros(3)
     for axis in range(3):
         t_sum = 0.0
         r_sum = 0.0
         for h in range(JITTER_HARMONICS):
-            # Unique phase per object, axis, and harmonic
             phase = (obj_index * 7.3 + axis * 2.9 + h * 1.7) % (2 * math.pi)
             val = math.sin(2 * math.pi * JITTER_FREQS[h] * frame + phase)
-            t_sum += val / (h + 1)  # decreasing amplitude for higher harmonics
+            t_sum += val / (h + 1)
             r_sum += val / (h + 1)
-        # Normalize by harmonic series sum
         norm = sum(1.0 / (h + 1) for h in range(JITTER_HARMONICS))
         trans[axis] = JITTER_TRANS_AMP * t_sum / norm
         rot[axis] = math.radians(JITTER_ROT_AMP) * r_sum / norm
     return trans, rot
+
+
+def compute_per_atom_jitter(frame, obj_index, positions):
+    """Return (N, 3) per-atom displacement with spatial correlation.
+
+    Nearby atoms move similarly (correlated via position-dependent phase),
+    giving a natural thermal wobble rather than dissolution. Each harmonic
+    uses a different spatial direction so the deformation is complex, not
+    a single plane wave.
+    """
+    n = len(positions)
+    noise = np.zeros((n, 3))
+    for h in range(JITTER_HARMONICS):
+        freq = JITTER_FREQS[h]
+        time_val = 2 * math.pi * freq * frame
+        spatial_phase = positions @ ATOM_SPATIAL_VECS[h]  # (n,) — varies smoothly with position
+        for axis in range(3):
+            phase_offset = axis * 2.9 + obj_index * 7.3 + h * 1.7
+            noise[:, axis] += np.sin(time_val + spatial_phase + phase_offset) / (h + 1)
+    norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
+    return ATOM_JITTER_AMP * noise / norm
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +405,16 @@ def main():
     animated_objects = mrna_copies + [obj_trna_p, obj_trna_a, obj_peptide]
     all_objects = [obj_surface] + animated_objects
 
+    # --- Store original vertex positions for per-atom jitter ---
+    jitter_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+    orig_verts = {}
+    for obj in jitter_objects:
+        n = len(obj.data.vertices)
+        co = np.empty(n * 3, dtype=np.float64)
+        obj.data.vertices.foreach_get('co', co)
+        orig_verts[obj.name] = co.reshape(-1, 3).copy()
+        print(f"  Stored {n} vertices for {obj.name}")
+
     # --- Camera setup ---
     # Frame on ribosome surface first
     canvas.frame_object(mol_surface)
@@ -434,6 +469,14 @@ def main():
         obj_peptide.location = tuple(peptide_d + jitter_pep_t)
         obj_peptide.rotation_euler = (jitter_pep_r[0], jitter_pep_r[1],
                                       math.pi / 2 + jitter_pep_r[2])
+
+        # Per-atom thermal jitter (displace mesh vertices)
+        for obj_idx, obj in enumerate(jitter_objects):
+            orig = orig_verts[obj.name]
+            displacement = compute_per_atom_jitter(frame, obj_idx, orig)
+            displaced = (orig + displacement).ravel()
+            obj.data.vertices.foreach_set('co', displaced)
+            obj.data.update()
 
         # Camera orbit
         orbit_t = frame / max(TOTAL_FRAMES - 1, 1)
