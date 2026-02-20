@@ -82,7 +82,7 @@ MRNA_CHAIN_LEN = 7.52  # BU, measured extent of chain A4
 MRNA_COPIES = 6  # 3 each side of original → ~52 BU total
 
 # Camera orbit
-CAMERA_ORBIT_DEGREES = 30  # total orbit over full animation
+CAMERA_ORBIT_DEGREES = 0  # disabled while iterating on other aspects
 
 
 # ---------------------------------------------------------------------------

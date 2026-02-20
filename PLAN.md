@@ -133,9 +133,11 @@ For a seamless loop, either:
 - [x] Batch compositing script (`composite.py`)
 - [x] Video encoding script (`encode.py` — H.264 MP4 + VP9 WebM)
 - [x] Debug render test (480x270, 24 frames)
-- [x] Camera centering fix (orbit empty at ribosome centroid instead of origin)
-- [x] Extended mRNA (6 linked duplicates along principal axis, ~52 BU total coverage)
-- [x] Molecular jitter (sum-of-sines thermal motion on mRNA, tRNAs, polypeptide; ribosome stays rigid)
+- [x] Rigid-body jitter (sum-of-sines on mRNA, tRNAs, polypeptide; ribosome stays rigid)
+- [ ] Camera orbit (disabled — centroid-based pivot drifts off-frame, needs investigation)
+- [ ] Extended mRNA (linked duplicates don't render — MN geometry nodes don't evaluate on copies, need different approach)
+- [ ] Per-atom thermal jitter (current jitter is rigid-body only; need vertex-level displacement for realistic Brownian motion)
+- [ ] Increase rotational jitter amplitude (1.5° is invisible at render scale)
 - [ ] Full production render (1920x1080, 240 frames)
 - [ ] Deferred to v2:
   - [ ] Pre-build polypeptide chain for progressive reveal
