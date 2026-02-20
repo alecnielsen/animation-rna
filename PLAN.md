@@ -132,7 +132,7 @@ For a seamless loop, either:
   - [x] Two-pass render per frame (hide_render toggle)
 - [x] Batch compositing script (`composite.py`)
 - [x] Video encoding script (`encode.py` — H.264 MP4 + VP9 WebM)
-- [ ] Debug render test (480x270, 24 frames)
+- [x] Debug render test (480x270, 24 frames)
 - [ ] Full production render (1920x1080, 240 frames)
 - [ ] Deferred to v2:
   - [ ] Pre-build polypeptide chain for progressive reveal
