@@ -124,14 +124,22 @@ For a seamless loop, either:
   - [x] Alpha-based silhouette detection (transparent film render)
   - [x] Ribosome surface with 79 chains (40S + 60S)
   - [x] Internal components: mRNA (A4), tRNAs (B4, D4), polypeptide (C4)
-- [ ] Separate 6Y0G into component objects for animation
-- [ ] Pre-build polypeptide chain for progressive reveal
-- [ ] Extend mRNA strand (duplicate + offset)
-- [ ] Keyframe the elongation cycle (rigid-body paths)
-- [ ] Camera orbit path
-- [ ] Render all frames (two-pass per frame)
-- [ ] Composite all frames
-- [ ] Encode as web-ready video (MP4 H.264 + WebM VP9)
+- [x] Measure chain centroids and compute animation vectors (`measure_positions.py`)
+- [x] Animation script with 5 independent molecule objects (`animate.py`)
+  - [x] Separate 6Y0G into component objects (surface, mRNA, tRNA_P, tRNA_A, polypeptide)
+  - [x] Keyframe elongation cycle (240 frames: delivery, accommodation, transfer, translocation, departure)
+  - [x] Camera orbit (30° over full animation via parented empty)
+  - [x] Two-pass render per frame (hide_render toggle)
+- [x] Batch compositing script (`composite.py`)
+- [x] Video encoding script (`encode.py` — H.264 MP4 + VP9 WebM)
+- [ ] Debug render test (480x270, 24 frames)
+- [ ] Full production render (1920x1080, 240 frames)
+- [ ] Deferred to v2:
+  - [ ] Pre-build polypeptide chain for progressive reveal
+  - [ ] Extend mRNA strand (duplicate + offset)
+  - [ ] tRNA rotation animation (v1 is translation only)
+  - [ ] Smooth easing curves on keyframes
+  - [ ] 3rd tRNA for seamless loop
 
 ## Tech stack
 

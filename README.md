@@ -26,11 +26,35 @@ source mn_env/bin/activate
 # Style development (small test structure, fast iteration)
 python3.11 test_render.py
 
-# Full ribosome render (slow, only after style is locked)
+# Single-frame ribosome render (slow, only after style is locked)
 python3.11 render.py
 ```
 
 Output goes to `renders/`.
+
+## Animation
+
+Three-step pipeline: render frames → composite → encode video.
+
+```bash
+source mn_env/bin/activate
+
+# 1. Render all frames (two passes per frame)
+python3.11 animate.py          # 1920x1080, 240 frames (production)
+python3.11 animate.py --debug  # 480x270, 24 frames (fast preview)
+
+# 2. Composite pass1 + pass2 for each frame
+python3.11 composite.py
+
+# 3. Encode to video
+python3.11 encode.py
+```
+
+Output:
+- `renders/frames/` — raw pass1/pass2 PNGs per frame
+- `renders/composited/` — final composited PNGs
+- `renders/ribosome_animation.mp4` — H.264 video
+- `renders/ribosome_animation.webm` — VP9 video
 
 ## Visual style spec
 
