@@ -73,6 +73,14 @@ ENTRY_OFFSET = 3.0 * PA_VEC   # starting position for incoming tRNA (relative to
 # E-site departure offset: 2x beyond E-site
 DEPART_OFFSET = 3.0 * EP_VEC  # departure position for leaving tRNA
 
+# Ribosome visual centroid (from measure_positions.py) — camera orbits around this
+RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
+
+# mRNA extension: principal axis direction and chain length (~7.52 BU)
+MRNA_AXIS = np.array((-0.747, 0.355, -0.563))
+MRNA_CHAIN_LEN = 7.52  # BU, measured extent of chain A4
+MRNA_COPIES = 6  # 3 each side of original → ~52 BU total
+
 # Camera orbit
 CAMERA_ORBIT_DEGREES = 30  # total orbit over full animation
 
@@ -135,6 +143,42 @@ def frame_t(frame, start, end):
 def scale_frames(f):
     """Scale frame number from 240-frame schedule to actual TOTAL_FRAMES."""
     return int(round(f * TOTAL_FRAMES / 240))
+
+
+# ---------------------------------------------------------------------------
+# Molecular jitter — sum-of-sines with irrational frequency ratios
+# ---------------------------------------------------------------------------
+JITTER_TRANS_AMP = 0.15   # BU per axis
+JITTER_ROT_AMP = 1.5      # degrees per axis
+JITTER_HARMONICS = 4
+# Golden-ratio-spaced frequencies (irrational → never repeats)
+PHI = (1 + math.sqrt(5)) / 2
+JITTER_FREQS = [0.07 * PHI**k for k in range(JITTER_HARMONICS)]
+
+
+def compute_jitter(frame, obj_index):
+    """Return (trans_xyz, rot_xyz) jitter for given frame and object index.
+
+    Uses sum-of-sines with golden-ratio frequency spacing for smooth,
+    deterministic, non-repeating thermal motion. Each object gets a unique
+    phase offset based on obj_index.
+    """
+    trans = np.zeros(3)
+    rot = np.zeros(3)
+    for axis in range(3):
+        t_sum = 0.0
+        r_sum = 0.0
+        for h in range(JITTER_HARMONICS):
+            # Unique phase per object, axis, and harmonic
+            phase = (obj_index * 7.3 + axis * 2.9 + h * 1.7) % (2 * math.pi)
+            val = math.sin(2 * math.pi * JITTER_FREQS[h] * frame + phase)
+            t_sum += val / (h + 1)  # decreasing amplitude for higher harmonics
+            r_sum += val / (h + 1)
+        # Normalize by harmonic series sum
+        norm = sum(1.0 / (h + 1) for h in range(JITTER_HARMONICS))
+        trans[axis] = JITTER_TRANS_AMP * t_sum / norm
+        rot[axis] = math.radians(JITTER_ROT_AMP) * r_sum / norm
+    return trans, rot
 
 
 # ---------------------------------------------------------------------------
@@ -311,12 +355,30 @@ def main():
     obj_trna_a = mol_objects[3]
     obj_peptide = mol_objects[4]
 
-    animated_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
-    all_objects = [obj_surface] + animated_objects
-
-    # Apply rotation to all objects (same as render.py)
-    for o in all_objects:
+    # Apply rotation to primary objects (same as render.py)
+    primary_objects = [obj_surface, obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+    for o in primary_objects:
         o.rotation_euler.z = math.pi / 2
+
+    # --- Create mRNA linked duplicates for extended coverage ---
+    mrna_copies = [obj_mrna]  # original at offset 0
+    mrna_base_offsets = {obj_mrna.name: np.zeros(3)}
+    for i in range(1, MRNA_COPIES + 1):
+        # Alternate: +1, -1, +2, -2, +3, -3
+        sign = 1 if i % 2 == 1 else -1
+        n = (i + 1) // 2
+        offset = sign * n * MRNA_CHAIN_LEN * MRNA_AXIS
+        dup = obj_mrna.copy()  # linked duplicate (shares mesh data)
+        bpy.context.collection.objects.link(dup)
+        dup.name = f"mRNA_copy_{i}"
+        dup.rotation_euler.z = math.pi / 2
+        dup.location = tuple(offset)
+        mrna_copies.append(dup)
+        mrna_base_offsets[dup.name] = offset
+    print(f"  Created {MRNA_COPIES} mRNA linked duplicates ({len(mrna_copies)} total)")
+
+    animated_objects = mrna_copies + [obj_trna_p, obj_trna_a, obj_peptide]
+    all_objects = [obj_surface] + animated_objects
 
     # --- Camera setup ---
     # Frame on ribosome surface first
@@ -329,7 +391,7 @@ def main():
     print(f"  Camera: loc={tuple(cam_loc_orig)}, lens={cam_lens}")
 
     # Create empty at ribosome centroid for camera orbit
-    bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
+    bpy.ops.object.empty_add(type="PLAIN_AXES", location=tuple(RIBO_CENTROID))
     orbit_empty = bpy.context.active_object
     orbit_empty.name = "CameraOrbit"
 
@@ -347,11 +409,31 @@ def main():
         # Compute animation positions
         mrna_d, trna_p_d, trna_a_d, peptide_d = get_positions(frame)
 
-        # Apply position deltas
-        obj_mrna.location = (mrna_d[0], mrna_d[1], mrna_d[2])
-        obj_trna_p.location = (trna_p_d[0], trna_p_d[1], trna_p_d[2])
-        obj_trna_a.location = (trna_a_d[0], trna_a_d[1], trna_a_d[2])
-        obj_peptide.location = (peptide_d[0], peptide_d[1], peptide_d[2])
+        # Compute jitter (all mRNA copies share obj_index=0)
+        jitter_mrna_t, jitter_mrna_r = compute_jitter(frame, 0)
+        jitter_trna_p_t, jitter_trna_p_r = compute_jitter(frame, 1)
+        jitter_trna_a_t, jitter_trna_a_r = compute_jitter(frame, 2)
+        jitter_pep_t, jitter_pep_r = compute_jitter(frame, 3)
+
+        # Apply position deltas + jitter (mRNA copies share the same delta & jitter)
+        for mc in mrna_copies:
+            base = mrna_base_offsets[mc.name]
+            pos = base + mrna_d + jitter_mrna_t
+            mc.location = tuple(pos)
+            mc.rotation_euler = (jitter_mrna_r[0], jitter_mrna_r[1],
+                                 math.pi / 2 + jitter_mrna_r[2])
+
+        obj_trna_p.location = tuple(trna_p_d + jitter_trna_p_t)
+        obj_trna_p.rotation_euler = (jitter_trna_p_r[0], jitter_trna_p_r[1],
+                                     math.pi / 2 + jitter_trna_p_r[2])
+
+        obj_trna_a.location = tuple(trna_a_d + jitter_trna_a_t)
+        obj_trna_a.rotation_euler = (jitter_trna_a_r[0], jitter_trna_a_r[1],
+                                     math.pi / 2 + jitter_trna_a_r[2])
+
+        obj_peptide.location = tuple(peptide_d + jitter_pep_t)
+        obj_peptide.rotation_euler = (jitter_pep_r[0], jitter_pep_r[1],
+                                      math.pi / 2 + jitter_pep_r[2])
 
         # Camera orbit
         orbit_t = frame / max(TOTAL_FRAMES - 1, 1)

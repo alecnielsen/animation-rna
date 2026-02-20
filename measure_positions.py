@@ -16,6 +16,8 @@ arr = mol.array
 coords = arr.coord[0]  # first model
 chain_ids = arr.chain_id
 
+nm = 0.1  # Angstroms to Blender units (nm) conversion factor
+
 rot_z = math.pi / 2
 cos_r, sin_r = math.cos(rot_z), math.sin(rot_z)
 
@@ -67,7 +69,12 @@ mrna_centered = mrna_rotated - mrna_rotated.mean(axis=0)
 _, _, vt = np.linalg.svd(mrna_centered, full_matrices=False)
 mrna_axis = vt[0]
 codon_shift = mrna_axis * 10.0  # ~10 A for one codon
+# mRNA extent along principal axis
+mrna_proj = mrna_centered @ mrna_axis
+mrna_extent_angstrom = mrna_proj.max() - mrna_proj.min()
+mrna_extent_bu = mrna_extent_angstrom * nm
 print(f"\n  mRNA axis: ({mrna_axis[0]:.3f}, {mrna_axis[1]:.3f}, {mrna_axis[2]:.3f})")
+print(f"  mRNA extent: {mrna_extent_angstrom:.1f} A = {mrna_extent_bu:.2f} BU")
 print(f"  Codon shift (10A): ({codon_shift[0]:.1f}, {codon_shift[1]:.1f}, {codon_shift[2]:.1f})")
 
 # Ribosome centroid
@@ -86,7 +93,6 @@ for o in sorted(bpy.data.objects, key=lambda x: x.name):
         print(f"  {o.name}: loc=({loc.x:.2f}, {loc.y:.2f}, {loc.z:.2f}), type={o.type}")
 
 # Output as constants in nm (MN Blender units = Angstroms / 10)
-nm = 0.1
 print("\n=== CONSTANTS FOR animate.py (Blender units / nm) ===")
 print(f"P_SITE = ({p_site[0]*nm:.2f}, {p_site[1]*nm:.2f}, {p_site[2]*nm:.2f})")
 print(f"A_SITE = ({a_site[0]*nm:.2f}, {a_site[1]*nm:.2f}, {a_site[2]*nm:.2f})")
@@ -96,3 +102,5 @@ print(f"PA_VEC = ({pa_vec[0]*nm:.2f}, {pa_vec[1]*nm:.2f}, {pa_vec[2]*nm:.2f})")
 print(f"CODON_SHIFT = ({codon_shift[0]*nm:.2f}, {codon_shift[1]*nm:.2f}, {codon_shift[2]*nm:.2f})")
 print(f"RIBO_CENTROID = ({ribo_centroid[0]*nm:.2f}, {ribo_centroid[1]*nm:.2f}, {ribo_centroid[2]*nm:.2f})")
 print(f"PEPTIDE_POS = ({peptide[0]*nm:.2f}, {peptide[1]*nm:.2f}, {peptide[2]*nm:.2f})")
+print(f"MRNA_AXIS = ({mrna_axis[0]:.3f}, {mrna_axis[1]:.3f}, {mrna_axis[2]:.3f})")
+print(f"MRNA_CHAIN_LEN = {mrna_extent_bu:.2f}  # BU")

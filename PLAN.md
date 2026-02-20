@@ -133,11 +133,12 @@ For a seamless loop, either:
 - [x] Batch compositing script (`composite.py`)
 - [x] Video encoding script (`encode.py` — H.264 MP4 + VP9 WebM)
 - [x] Debug render test (480x270, 24 frames)
+- [x] Camera centering fix (orbit empty at ribosome centroid instead of origin)
+- [x] Extended mRNA (6 linked duplicates along principal axis, ~52 BU total coverage)
+- [x] Molecular jitter (sum-of-sines thermal motion on mRNA, tRNAs, polypeptide; ribosome stays rigid)
 - [ ] Full production render (1920x1080, 240 frames)
 - [ ] Deferred to v2:
   - [ ] Pre-build polypeptide chain for progressive reveal
-  - [ ] Extend mRNA strand (duplicate + offset)
-  - [ ] tRNA rotation animation (v1 is translation only)
   - [ ] Smooth easing curves on keyframes
   - [ ] 3rd tRNA for seamless loop
 
