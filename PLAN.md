@@ -71,18 +71,14 @@ stays static (frame of reference). Moving parts:
 4. **tRNA (A→P)** — translocates A→P site (becomes new P-site tRNA)
 5. **Polypeptide** — progressive reveal of one residue per cycle
 
-### Layer 2: ProDy NMA thermal texture
+### Layer 2: Thermal jitter (sum-of-sines)
 
-Replace hand-rolled jitter with physically realistic per-atom displacements
-from Normal Mode Analysis:
+Per-object rigid-body jitter (translation + rotation) plus per-atom spatially-
+correlated displacement using sum-of-sines with deterministic phase offsets.
 
-1. Compute ANM modes from 6Y0G with ProDy (`sparse=True`, C-alpha/P atoms)
-2. Pre-generate displacement frames via `sampleModes()`
-3. Extend to all atoms with `extendModel()`
-4. Each render frame: `positions = original + choreography_delta + NMA_displacement`
-
-NMA inherently encodes structural constraints: atoms buried in the ribosome
-barely move, exposed mRNA ends and free tRNAs fluctuate more.
+For seamless looping, jitter frequencies are integer harmonics of the total
+animation period (1/T, 2/T, 3/T, 4/T) so every component returns to its
+exact starting phase at the loop point.
 
 ### Sequence (one elongation cycle, frames scaled to total)
 
@@ -129,14 +125,17 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Debug render test (480x270, 24 frames)
 
 ### v2 (current)
-- [~] Extended mRNA: procedurally build long strand with biotite
+- [x] Extended mRNA: procedurally build long strand with biotite
   - [x] `build_extended_mrna.py`: tiles chain A4 x10 with correct backbone spacing
+  - [x] OpenMM MD relaxation at 400K to break tile symmetry (minimize → MD → quench)
   - [x] `animate.py`: loads extended mRNA from local PDB instead of linked duplicates
-  - [ ] Test render to verify extended mRNA displays correctly
-- [ ] Extended polypeptide: long alpha helix for progressive reveal
-- [ ] 10-cycle choreography with seamless loop
-- [ ] ProDy NMA thermal motion (replace hand-rolled jitter)
-- [ ] Camera orbit fix (centroid pivot)
+- [~] Extended polypeptide: ~30 residue polyalanine alpha helix
+  - [ ] `build_extended_polypeptide.py`: ideal helix geometry, aligned to C4 position
+  - [ ] Progressive reveal in animate.py (1 residue per cycle)
+- [~] 10-cycle choreography with seamless loop
+  - [ ] Nested loop: N_CYCLES x FRAMES_PER_CYCLE
+  - [ ] Cumulative mRNA offset per cycle
+  - [ ] Loop-safe integer-harmonic jitter frequencies
 - [ ] Full production render
 
 ## Tech stack
@@ -147,5 +146,5 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - **Cycles renderer** — lighting, materials
 - **PIL / numpy** — per-frame compositing (translucent overlay + edge outline)
 - **ffmpeg** — final video encoding
-- **ProDy** — Normal Mode Analysis for thermal motion (v2)
-- **biotite** — procedural mRNA/polypeptide construction (v2)
+- **OpenMM** — MD simulation for mRNA relaxation (amber14 + GBn2 implicit solvent)
+- **biotite** — procedural mRNA/polypeptide construction
