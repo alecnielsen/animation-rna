@@ -30,23 +30,32 @@ def main():
     if isinstance(arr, AtomArrayStack):
         arr = arr[0]
 
-    a4 = arr[arr.chain_id == "A4"]
-    print(f"  Chain A4: {len(a4)} atoms")
+    a4_raw = arr[arr.chain_id == "A4"]
+    # Filter out non-nucleotide heteroatoms (e.g. MG²⁺ ion at res 101)
+    nuc_names = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"}
+    nuc_mask = np.isin(a4_raw.res_name, list(nuc_names))
+    a4 = a4_raw[nuc_mask]
+    print(f"  Chain A4: {len(a4_raw)} atoms total, {len(a4)} nucleotide atoms")
 
-    # Backbone P atoms for tile offset computation
+    # Compute tile offset using backbone atom positions for tight junctions.
+    # Place each copy so its first P is one O3'→P bond step from the previous
+    # copy's last O3', matching the internal backbone geometry.
+    unique_res = np.unique(a4.res_id)
+    o3_last = a4.coord[(a4.res_id == unique_res[-1]) & (a4.atom_name == "O3'")][0]
+    p_first = a4.coord[(a4.res_id == unique_res[0]) & (a4.atom_name == "P")][0]
+    # Reference O3'→P bond vector from within the chain (res 0 → res 1)
+    o3_res0 = a4.coord[(a4.res_id == unique_res[0]) & (a4.atom_name == "O3'")][0]
+    p_res1 = a4.coord[(a4.res_id == unique_res[1]) & (a4.atom_name == "P")][0]
+    bond_vec = p_res1 - o3_res0  # internal O3'→P step (~1.6 Å)
+    tile_offset = o3_last + bond_vec - p_first
+
     p_mask = a4.atom_name == "P"
     p_coords = a4.coord[p_mask]
     print(f"  P atoms: {len(p_coords)}")
-
-    # Tile offset: place each copy so its first P is one backbone step past
-    # the previous copy's last P
-    step_vec = p_coords[-1] - p_coords[-2]
-    tile_offset = (p_coords[-1] + step_vec) - p_coords[0]
     print(f"  Tile offset: ({tile_offset[0]:.1f}, {tile_offset[1]:.1f}, {tile_offset[2]:.1f}) A")
     print(f"  |tile_offset| = {np.linalg.norm(tile_offset):.1f} A")
 
     # Map each atom's res_id to a 0-based index within the tile
-    unique_res = np.unique(a4.res_id)
     n_res = len(unique_res)
     res_to_idx = {int(r): j for j, r in enumerate(unique_res)}
     base_idx = np.array([res_to_idx[int(r)] for r in a4.res_id])
@@ -77,8 +86,8 @@ def main():
     # --- Verification ---
     print(f"\n=== Junction verification (O3'->P at tile boundaries) ===")
     for i in range(N_COPIES - 1):
-        last_res = (i + 1) * n_res        # last residue of tile i
-        first_res = (i + 1) * n_res + 1   # first residue of tile i+1
+        last_res = (i + 1) * n_res        # last residue of tile i (1-indexed)
+        first_res = last_res + 1           # first residue of tile i+1
         m_o3 = (extended.res_id == last_res) & (extended.atom_name == "O3'")
         m_p = (extended.res_id == first_res) & (extended.atom_name == "P")
         if np.any(m_o3) and np.any(m_p):
