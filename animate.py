@@ -76,11 +76,6 @@ DEPART_OFFSET = 3.0 * EP_VEC  # departure position for leaving tRNA
 # Ribosome visual centroid (from measure_positions.py) — camera orbits around this
 RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 
-# mRNA extension: principal axis direction and chain length (~7.52 BU)
-MRNA_AXIS = np.array((-0.747, 0.355, -0.563))
-MRNA_CHAIN_LEN = 7.52  # BU, measured extent of chain A4
-MRNA_COPIES = 6  # 3 each side of original → ~52 BU total
-
 # Camera orbit
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating on other aspects
 
@@ -314,7 +309,7 @@ def main():
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
     scene.cycles.max_bounces = 12
 
-    # --- Load 5 molecule instances ---
+    # --- Load molecules (4 fetched from 6Y0G + 1 extended mRNA from PDB) ---
     print("  Loading molecules...")
 
     # 1. Ribosome surface (40S + 60S)
@@ -326,11 +321,10 @@ def main():
         name="surface",
     )
 
-    # 2. mRNA (chain A4)
-    mol_mrna = mn.Molecule.fetch("6Y0G")
+    # 2. mRNA (extended, from preprocessed PDB)
+    mol_mrna = mn.Molecule.load("extended_mrna.pdb")
     mol_mrna.add_style(
         style=mn.StyleCartoon(),
-        selection=mol_mrna.select.chain_id(["A4"]),
         material=make_solid_material((0.1, 0.35, 0.95)),
         name="mRNA",
     )
@@ -363,46 +357,31 @@ def main():
     )
 
     # --- Find Blender objects ---
-    # MN creates objects named "6Y0G", "6Y0G.001", etc. in load order
-    mol_objects = sorted(
+    # 4 fetched 6Y0G objects + 1 loaded extended_mrna
+    objs_6y0g = sorted(
         [o for o in bpy.data.objects if "6Y0G" in o.name and o.type == "MESH"],
         key=lambda o: o.name,
     )
-    print(f"  Found {len(mol_objects)} molecule objects: {[o.name for o in mol_objects]}")
+    objs_mrna = [o for o in bpy.data.objects if "extended_mrna" in o.name and o.type == "MESH"]
+    print(f"  Found {len(objs_6y0g)} 6Y0G objects: {[o.name for o in objs_6y0g]}")
+    print(f"  Found {len(objs_mrna)} mRNA objects: {[o.name for o in objs_mrna]}")
 
-    if len(mol_objects) < 5:
-        print(f"  ERROR: Expected 5 objects, got {len(mol_objects)}")
+    if len(objs_6y0g) < 4 or len(objs_mrna) < 1:
+        print(f"  ERROR: Expected 4 6Y0G + 1 mRNA objects")
         return
 
-    obj_surface = mol_objects[0]
-    obj_mrna = mol_objects[1]
-    obj_trna_p = mol_objects[2]
-    obj_trna_a = mol_objects[3]
-    obj_peptide = mol_objects[4]
+    obj_surface = objs_6y0g[0]
+    obj_trna_p = objs_6y0g[1]
+    obj_trna_a = objs_6y0g[2]
+    obj_peptide = objs_6y0g[3]
+    obj_mrna = objs_mrna[0]
 
     # Apply rotation to primary objects (same as render.py)
     primary_objects = [obj_surface, obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
     for o in primary_objects:
         o.rotation_euler.z = math.pi / 2
 
-    # --- Create mRNA linked duplicates for extended coverage ---
-    mrna_copies = [obj_mrna]  # original at offset 0
-    mrna_base_offsets = {obj_mrna.name: np.zeros(3)}
-    for i in range(1, MRNA_COPIES + 1):
-        # Alternate: +1, -1, +2, -2, +3, -3
-        sign = 1 if i % 2 == 1 else -1
-        n = (i + 1) // 2
-        offset = sign * n * MRNA_CHAIN_LEN * MRNA_AXIS
-        dup = obj_mrna.copy()  # linked duplicate (shares mesh data)
-        bpy.context.collection.objects.link(dup)
-        dup.name = f"mRNA_copy_{i}"
-        dup.rotation_euler.z = math.pi / 2
-        dup.location = tuple(offset)
-        mrna_copies.append(dup)
-        mrna_base_offsets[dup.name] = offset
-    print(f"  Created {MRNA_COPIES} mRNA linked duplicates ({len(mrna_copies)} total)")
-
-    animated_objects = mrna_copies + [obj_trna_p, obj_trna_a, obj_peptide]
+    animated_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
     all_objects = [obj_surface] + animated_objects
 
     # --- Store original vertex positions for per-atom jitter ---
@@ -444,19 +423,16 @@ def main():
         # Compute animation positions
         mrna_d, trna_p_d, trna_a_d, peptide_d = get_positions(frame)
 
-        # Compute jitter (all mRNA copies share obj_index=0)
+        # Compute jitter
         jitter_mrna_t, jitter_mrna_r = compute_jitter(frame, 0)
         jitter_trna_p_t, jitter_trna_p_r = compute_jitter(frame, 1)
         jitter_trna_a_t, jitter_trna_a_r = compute_jitter(frame, 2)
         jitter_pep_t, jitter_pep_r = compute_jitter(frame, 3)
 
-        # Apply position deltas + jitter (mRNA copies share the same delta & jitter)
-        for mc in mrna_copies:
-            base = mrna_base_offsets[mc.name]
-            pos = base + mrna_d + jitter_mrna_t
-            mc.location = tuple(pos)
-            mc.rotation_euler = (jitter_mrna_r[0], jitter_mrna_r[1],
-                                 math.pi / 2 + jitter_mrna_r[2])
+        # Apply position deltas + jitter
+        obj_mrna.location = tuple(mrna_d + jitter_mrna_t)
+        obj_mrna.rotation_euler = (jitter_mrna_r[0], jitter_mrna_r[1],
+                                   math.pi / 2 + jitter_mrna_r[2])
 
         obj_trna_p.location = tuple(trna_p_d + jitter_trna_p_t)
         obj_trna_p.rotation_euler = (jitter_trna_p_r[0], jitter_trna_p_r[1],

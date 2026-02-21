@@ -34,10 +34,13 @@ Output goes to `renders/`.
 
 ## Animation
 
-Three-step pipeline: render frames → composite → encode video.
+Four-step pipeline: build extended structures → render frames → composite → encode video.
 
 ```bash
 source mn_env/bin/activate
+
+# 0. Build extended mRNA (tiles chain A4 x10, writes extended_mrna.pdb)
+python3.11 build_extended_mrna.py
 
 # 1. Render all frames (two passes per frame)
 python3.11 animate.py          # 1920x1080, 240 frames (production)

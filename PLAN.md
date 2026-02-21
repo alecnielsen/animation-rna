@@ -129,7 +129,10 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Debug render test (480x270, 24 frames)
 
 ### v2 (current)
-- [ ] Extended mRNA: procedurally build long strand with biotite
+- [~] Extended mRNA: procedurally build long strand with biotite
+  - [x] `build_extended_mrna.py`: tiles chain A4 x10 with correct backbone spacing
+  - [x] `animate.py`: loads extended mRNA from local PDB instead of linked duplicates
+  - [ ] Test render to verify extended mRNA displays correctly
 - [ ] Extended polypeptide: long alpha helix for progressive reveal
 - [ ] 10-cycle choreography with seamless loop
 - [ ] ProDy NMA thermal motion (replace hand-rolled jitter)
