@@ -1,5 +1,12 @@
 """Animate 10 elongation cycles of the 6Y0G human 80S ribosome.
 
+v5: Fix mRNA gaps, bend visibility, and ribosome opacity
+- mRNA backbone_threshold raised to 8.0 Å (fixes disconnected segments)
+- mRNA bend axis computed via SVD in local space (fixes invisible bend)
+- MRNA_BEND_STRENGTH reduced to 0.015 (correct scale for local-space axis)
+- Ribosome StyleSurface quality=1 (fewer mesh layers) + 3% opacity per face
+  (was 15%), giving ~69% transmission — clearly translucent
+
 v4: Architectural overhaul
 - All molecules use StyleSurface (unified realistic look)
 - Single-pass rendering with shader transparency (proper depth occlusion)
@@ -86,9 +93,8 @@ CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 INITIAL_PEPTIDE_RESIDUES = 2  # visible at start (matching C4 dipeptide)
 
 # mRNA bend — droop outside the ribosome channel
-MRNA_AXIS = CODON_SHIFT / np.linalg.norm(CODON_SHIFT)  # principal direction
 MRNA_CHANNEL_HALF_LEN = 4.0   # BU — straight zone around mRNA centroid
-MRNA_BEND_STRENGTH = 0.08     # BU per BU² beyond channel (quadratic droop)
+MRNA_BEND_STRENGTH = 0.015    # BU per BU² beyond channel (quadratic droop)
 
 
 # ---------------------------------------------------------------------------
@@ -102,22 +108,30 @@ def apply_mrna_bend(positions, res_ids):
     perpendicular to the axis, giving the mRNA an organic curved look
     instead of a rigid rod.
 
+    The principal axis is computed via SVD on the actual vertex positions
+    (local/object space), avoiding coordinate-space mismatches with any
+    world-space constants.
+
     Modifies positions in-place and returns them.
     """
     centroid = positions.mean(axis=0)
     relative = positions - centroid
 
-    # Project onto mRNA axis
-    proj = relative @ MRNA_AXIS  # scalar projection per vertex
+    # Compute principal axis from vertex positions via SVD (local space)
+    _, _, vt = np.linalg.svd(relative, full_matrices=False)
+    local_axis = vt[0]  # first principal component = mRNA long axis
 
-    # Droop direction: perpendicular to MRNA_AXIS in the XY plane
+    # Project onto mRNA axis
+    proj = relative @ local_axis  # scalar projection per vertex
+
+    # Droop direction: perpendicular to local_axis in the XY plane
     # Use cross product with Z to get a horizontal perpendicular
     z_up = np.array([0.0, 0.0, 1.0])
-    droop_dir = np.cross(MRNA_AXIS, z_up)
+    droop_dir = np.cross(local_axis, z_up)
     droop_norm = np.linalg.norm(droop_dir)
     if droop_norm < 1e-6:
-        # MRNA_AXIS is nearly vertical, use X instead
-        droop_dir = np.cross(MRNA_AXIS, np.array([1.0, 0.0, 0.0]))
+        # local_axis is nearly vertical, use X instead
+        droop_dir = np.cross(local_axis, np.array([1.0, 0.0, 0.0]))
         droop_norm = np.linalg.norm(droop_dir)
     droop_dir = droop_dir / droop_norm
 
@@ -157,13 +171,14 @@ def make_solid_material(color):
 def make_translucent_surface_material():
     """Shader-based translucent material for the ribosome.
 
-    Uses backface culling + front-face transparency to achieve ~35% opacity
-    in a single render pass. Only front-facing faces contribute opacity,
-    preventing accumulation across dense surface meshes.
+    Uses backface culling + front-face transparency to achieve ~3% opacity
+    per face in a single render pass. Combined with quality=1 surface
+    (~10-15 layers), gives ~69% transmission — clearly translucent while
+    still providing depth cues.
 
     Node graph:
       Geometry.Backfacing -> outer MixShader.Fac
-        Shader1: inner MixShader (fac=0.65, Transparent + Diffuse)
+        Shader1: inner MixShader (fac=0.97, Transparent + Diffuse)
         Shader2: Transparent BSDF (cull backfaces entirely)
       -> Material Output
     """
@@ -186,9 +201,9 @@ def make_translucent_surface_material():
     transparent_inner = n.new("ShaderNodeBsdfTransparent")
     transparent_back = n.new("ShaderNodeBsdfTransparent")
 
-    # Inner mix: 65% transparent + 35% diffuse (front faces)
+    # Inner mix: 97% transparent + 3% diffuse (front faces)
     mix_inner = n.new("ShaderNodeMixShader")
-    mix_inner.inputs["Fac"].default_value = 0.65
+    mix_inner.inputs["Fac"].default_value = 0.97
     l.new(transparent_inner.outputs["BSDF"], mix_inner.inputs[1])
     l.new(diffuse.outputs["BSDF"], mix_inner.inputs[2])
 
@@ -608,16 +623,16 @@ def main():
     # 1. Ribosome surface (40S + 60S) — translucent shader material
     mol_surface = mn.Molecule.fetch("6Y0G")
     mol_surface.add_style(
-        style=mn.StyleSurface(),
+        style=mn.StyleSurface(quality=1),
         selection=mol_surface.select.chain_id(RIBOSOME_CHAINS),
         material=make_translucent_surface_material(),
         name="surface",
     )
 
-    # 2. mRNA (extended, from preprocessed PDB) — StyleSurface
+    # 2. mRNA (extended, from preprocessed PDB) — StyleCartoon for continuous backbone
     mol_mrna = mn.Molecule.load("extended_mrna.pdb")
     mol_mrna.add_style(
-        style=mn.StyleSurface(),
+        style=mn.StyleCartoon(backbone_threshold=8.0),
         material=make_solid_material((0.1, 0.35, 0.95)),
         name="mRNA",
     )
@@ -640,14 +655,14 @@ def main():
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded from preprocessed PDB) — StyleSurface
+    # 5. Polypeptide (tunnel-threaded from preprocessed PDB) — StyleCartoon for continuous backbone
     peptide_pdb = "tunnel_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
-        style=mn.StyleSurface(),
+        style=mn.StyleCartoon(),
         material=make_solid_material((0.8, 0.15, 0.6)),
         name="polypeptide",
     )
