@@ -2,14 +2,16 @@
 
 Creates a single continuous ~170-nucleotide mRNA from 10 copies of the
 17 nt chain A4, with correct backbone spacing and sequential residue
-numbering. Then runs extended MD annealing with OpenMM (amber14 RNA.OL3
-force field) to break tile symmetry and produce natural conformational
-diversity.
+numbering. Randomizes nucleotide sequence per tile to produce genuinely
+different backbone conformations. Then runs extended 3-stage MD annealing
+with OpenMM (amber14 RNA.OL3 force field) to break tile symmetry.
 
-Protocol: 200K MD steps total
-  - 0.2A random perturbation per tile before MD (seed different pathways)
-  - 150K steps at 350K (conformational sampling)
-  - 50K steps at 300K (cool to physiological)
+Protocol: 500K MD steps total
+  - 0.5A random perturbation per tile before MD (seed different pathways)
+  - Randomized nucleotide sequence per tile (ACGU mix)
+  - 300K steps at 400K (high-temperature conformational sampling)
+  - 100K steps at 350K (intermediate cooling)
+  - 100K steps at 310K (physiological temperature)
   - Final energy minimization (quench)
 
 Output: extended_mrna.pdb
@@ -73,16 +75,23 @@ def tile_mrna():
     print(f"  Residues per tile: {n_res}")
 
     # Create N_COPIES offset copies, centered so i=CENTER_INDEX is at origin
-    # Add small random perturbation per tile to seed different conformational pathways
+    # Randomize sequence per tile and add perturbation to seed different pathways
     rng = np.random.default_rng(42)
+    nuc_choices = ["A", "C", "G", "U"]
     copies = []
     for i in range(N_COPIES):
         tile = a4.copy()
         tile.coord += (i - CENTER_INDEX) * tile_offset
-        # 0.2A random perturbation per atom to break tile symmetry before MD
-        tile.coord += rng.normal(0, 0.2, tile.coord.shape)
+        # 0.5A random perturbation per atom (was 0.2A) for stronger symmetry breaking
+        tile.coord += rng.normal(0, 0.5, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
+        # Randomize nucleotide sequence per tile — different force field
+        # interactions produce genuinely different backbone conformations
+        tile_unique_res = np.unique(tile.res_id)
+        for res in tile_unique_res:
+            new_name = rng.choice(nuc_choices)
+            tile.res_name[tile.res_id == res] = new_name
         copies.append(tile)
 
     extended = concatenate(copies)
@@ -137,16 +146,18 @@ def _load_and_prepare(input_pdb):
 
 
 def relax_rna(input_pdb, output_pdb):
-    """Extended annealing to eliminate tile periodicity.
+    """3-stage annealing to eliminate tile periodicity.
 
     Pipeline:
       1. Energy minimization
-      2. 150K MD steps at 350K (conformational sampling)
-      3. 50K MD steps at 300K (cool to physiological temperature)
-      4. Final energy minimization (quench)
+      2. 300K MD steps at 400K (high-temperature conformational sampling)
+      3. 100K MD steps at 350K (intermediate cooling)
+      4. 100K MD steps at 310K (physiological temperature)
+      5. Final energy minimization (quench)
 
-    Total: 200K steps. The two-stage annealing with per-tile perturbation
-    produces diverse backbone conformations that eliminate visible tiling.
+    Total: 500K steps. The 3-stage annealing with per-tile sequence
+    randomization and 0.5A perturbation produces diverse backbone
+    conformations that eliminate visible tiling patterns.
     """
     from openmm.app import (
         PDBFile as OmmPDB, Simulation, NoCutoff, HBonds,
@@ -155,20 +166,23 @@ def relax_rna(input_pdb, output_pdb):
     from openmm import LangevinMiddleIntegrator
     from openmm.unit import kelvin, picosecond, picoseconds, nanometer
 
-    PHASE1_STEPS = 150000
-    PHASE1_TEMP = 350  # K
-    PHASE2_STEPS = 50000
-    PHASE2_TEMP = 300  # K
-    TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS
+    PHASE1_STEPS = 300000
+    PHASE1_TEMP = 400  # K
+    PHASE2_STEPS = 100000
+    PHASE2_TEMP = 350  # K
+    PHASE3_STEPS = 100000
+    PHASE3_TEMP = 310  # K
+    TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS + PHASE3_STEPS
 
     print(f"\n=== Relaxation ({TOTAL_STEPS} MD steps: "
-          f"{PHASE1_STEPS}@{PHASE1_TEMP}K + {PHASE2_STEPS}@{PHASE2_TEMP}K + quench) ===")
+          f"{PHASE1_STEPS}@{PHASE1_TEMP}K + {PHASE2_STEPS}@{PHASE2_TEMP}K + "
+          f"{PHASE3_STEPS}@{PHASE3_TEMP}K + quench) ===")
 
     ff, modeller = _load_and_prepare(input_pdb)
 
     system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
 
-    # Phase 1: 350K conformational sampling
+    # Phase 1: 400K high-temperature conformational sampling
     integrator = LangevinMiddleIntegrator(
         PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
     sim = Simulation(modeller.topology, system, integrator)
@@ -182,7 +196,7 @@ def relax_rna(input_pdb, output_pdb):
     state1 = sim.context.getState(getEnergy=True)
     print(f"  Post-minimize energy: {state1.getPotentialEnergy()}")
 
-    # Step 2: Phase 1 — MD at 350K
+    # Step 2: Phase 1 — MD at 400K
     print(f"  Phase 1: {PHASE1_STEPS} MD steps (dt=2fs, T={PHASE1_TEMP}K)...")
     sim.reporters.append(
         StateDataReporter(sys.stdout, max(PHASE1_STEPS // 5, 1), step=True,
@@ -190,12 +204,17 @@ def relax_rna(input_pdb, output_pdb):
     )
     sim.step(PHASE1_STEPS)
 
-    # Step 3: Phase 2 — cool to 300K
+    # Step 3: Phase 2 — cool to 350K
     print(f"  Phase 2: {PHASE2_STEPS} MD steps (dt=2fs, T={PHASE2_TEMP}K)...")
     integrator.setTemperature(PHASE2_TEMP * kelvin)
     sim.step(PHASE2_STEPS)
 
-    # Step 4: Final minimization (quench)
+    # Step 4: Phase 3 — cool to 310K (physiological)
+    print(f"  Phase 3: {PHASE3_STEPS} MD steps (dt=2fs, T={PHASE3_TEMP}K)...")
+    integrator.setTemperature(PHASE3_TEMP * kelvin)
+    sim.step(PHASE3_STEPS)
+
+    # Step 5: Final minimization (quench)
     print("  Final minimization (quench)...")
     sim.minimizeEnergy(maxIterations=0)
     state_final = sim.context.getState(getEnergy=True, getPositions=True)

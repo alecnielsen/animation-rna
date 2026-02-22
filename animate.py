@@ -1,11 +1,11 @@
 """Animate 10 elongation cycles of the 6Y0G human 80S ribosome.
 
-v3: Visual overhaul
-- Ribosome jitter (subtle rigid-body motion)
-- mRNA: no rigid-body rotation, PCA deformation + reduced per-atom jitter
-- tRNA tumbling during approach/departure
-- Polypeptide: no rigid-body jitter, no choreographic motion, just progressive reveal
-- PCA structural modes for physically realistic deformation
+v4: Architectural overhaul
+- All molecules use StyleSurface (unified realistic look)
+- Single-pass rendering with shader transparency (proper depth occlusion)
+- Per-residue deformation (replaces per-atom jitter)
+- Increased ribosome jitter (5x) and PCA amplitude (3x)
+- Extended tRNA tumbling windows with residual tumble when bound
 
 Renders N_CYCLES * FRAMES_PER_CYCLE frames (seamless loop) showing:
 - tRNA delivery to A-site (with tumbling)
@@ -13,10 +13,10 @@ Renders N_CYCLES * FRAMES_PER_CYCLE frames (seamless loop) showing:
 - Translocation (A->P, P->E)
 - tRNA departure (with tumbling)
 
-Two-pass rendering per frame (internal cartoon + surface), saved to renders/frames/.
+Single-pass rendering to renders/frames/frame_NNNN.png.
 
 Run with: python3.11 animate.py [--debug]
-  --debug: 480x270, 24 frames/cycle, 4 samples (fast preview)
+  --debug: 480x270, 24 frames/cycle, 8 samples (fast preview)
 """
 
 import molecularnodes as mn
@@ -35,13 +35,11 @@ N_CYCLES = 10
 if DEBUG:
     RES = (480, 270)
     FRAMES_PER_CYCLE = 24
-    SAMPLES_INTERNAL = 4
-    SAMPLES_SURFACE = 4
+    SAMPLES = 8
 else:
     RES = (1920, 1080)
     FRAMES_PER_CYCLE = 240
-    SAMPLES_INTERNAL = 48
-    SAMPLES_SURFACE = 16
+    SAMPLES = 64
 
 TOTAL_FRAMES = N_CYCLES * FRAMES_PER_CYCLE
 FPS = 24
@@ -49,7 +47,7 @@ FPS = 24
 if DEBUG:
     print(f"=== DEBUG MODE: {RES[0]}x{RES[1]}, {N_CYCLES} cycles x "
           f"{FRAMES_PER_CYCLE} frames = {TOTAL_FRAMES} total, "
-          f"{SAMPLES_INTERNAL} samples ===")
+          f"{SAMPLES} samples ===")
 
 # Output dirs
 FRAMES_DIR = "renders/frames"
@@ -106,16 +104,54 @@ def make_solid_material(color):
     return mat
 
 
-def make_surface_material():
-    mat = bpy.data.materials.new(name="surface_flat")
+def make_translucent_surface_material():
+    """Shader-based translucent material for the ribosome.
+
+    Uses backface culling + front-face transparency to achieve ~35% opacity
+    in a single render pass. Only front-facing faces contribute opacity,
+    preventing accumulation across dense surface meshes.
+
+    Node graph:
+      Geometry.Backfacing -> outer MixShader.Fac
+        Shader1: inner MixShader (fac=0.65, Transparent + Diffuse)
+        Shader2: Transparent BSDF (cull backfaces entirely)
+      -> Material Output
+    """
+    mat = bpy.data.materials.new(name="translucent_surface")
+    mat.use_backface_culling = False  # handled in shader
+    mat.blend_method = 'HASHED'
     n = mat.node_tree.nodes
     l = mat.node_tree.links
     n.clear()
-    bsdf = n.new("ShaderNodeBsdfDiffuse")
-    bsdf.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)
-    bsdf.inputs["Roughness"].default_value = 1.0
+
+    # Geometry node for backfacing detection
+    geom = n.new("ShaderNodeNewGeometry")
+
+    # Diffuse shader (ribosome color)
+    diffuse = n.new("ShaderNodeBsdfDiffuse")
+    diffuse.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)
+    diffuse.inputs["Roughness"].default_value = 1.0
+
+    # Transparent shader
+    transparent_inner = n.new("ShaderNodeBsdfTransparent")
+    transparent_back = n.new("ShaderNodeBsdfTransparent")
+
+    # Inner mix: 65% transparent + 35% diffuse (front faces)
+    mix_inner = n.new("ShaderNodeMixShader")
+    mix_inner.inputs["Fac"].default_value = 0.65
+    l.new(transparent_inner.outputs["BSDF"], mix_inner.inputs[1])
+    l.new(diffuse.outputs["BSDF"], mix_inner.inputs[2])
+
+    # Outer mix: backfacing selects fully transparent
+    mix_outer = n.new("ShaderNodeMixShader")
+    l.new(geom.outputs["Backfacing"], mix_outer.inputs["Fac"])
+    l.new(mix_inner.outputs["Shader"], mix_outer.inputs[1])
+    l.new(transparent_back.outputs["BSDF"], mix_outer.inputs[2])
+
+    # Output
     out = n.new("ShaderNodeOutputMaterial")
-    l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    l.new(mix_outer.outputs["Shader"], out.inputs["Surface"])
+
     return mat
 
 
@@ -149,10 +185,10 @@ def scale_frames(f):
 
 
 # ---------------------------------------------------------------------------
-# Molecular jitter — sum-of-sines with integer-harmonic frequencies
+# Molecular jitter -- sum-of-sines with integer-harmonic frequencies
 #
 # Frequencies are integer multiples of 1/TOTAL_FRAMES, guaranteeing that
-# sin(2pi * freq * TOTAL_FRAMES + phase) == sin(phase) — perfect loop.
+# sin(2pi * freq * TOTAL_FRAMES + phase) == sin(phase) -- perfect loop.
 # ---------------------------------------------------------------------------
 JITTER_HARMONICS = 4
 
@@ -162,28 +198,24 @@ _TARGET_FREQS = [0.07, 0.113, 0.183, 0.296]
 JITTER_HARMONIC_NUMBERS = [max(1, round(f * TOTAL_FRAMES)) for f in _TARGET_FREQS]
 JITTER_FREQS = [k / TOTAL_FRAMES for k in JITTER_HARMONIC_NUMBERS]
 
-# Ribosome jitter (subtle: issue 1)
-RIBO_JITTER_TRANS_AMP = 0.03  # BU per axis
-RIBO_JITTER_ROT_AMP = 1.5     # degrees per axis
+# Ribosome jitter (increased 5x from v3)
+RIBO_JITTER_TRANS_AMP = 0.15  # BU per axis (was 0.03)
+RIBO_JITTER_ROT_AMP = 5.0     # degrees per axis (was 1.5)
 
 # tRNA jitter (moderate)
 TRNA_JITTER_TRANS_AMP = 0.12  # BU per axis
 TRNA_JITTER_ROT_AMP = 8.0     # degrees per axis
 
-# Per-atom thermal jitter amplitudes (per object type)
-ATOM_JITTER_MRNA = 0.1        # BU — reduced from 0.3 (issue 3)
-ATOM_JITTER_TRNA = 0.2        # BU
-ATOM_JITTER_PEPTIDE = 0.15    # BU
+# Per-residue thermal jitter amplitudes (replaces per-atom jitter)
+RESIDUE_JITTER_MRNA = 0.05     # BU (was ATOM_JITTER_MRNA = 0.1)
+RESIDUE_JITTER_TRNA = 0.08     # BU (was 0.2)
+RESIDUE_JITTER_PEPTIDE = 0.05  # BU (was 0.15)
 
-ATOM_SPATIAL_VECS = np.array([
-    [0.13, 0.17, 0.11],
-    [0.19, -0.11, 0.15],
-    [-0.14, 0.18, 0.12],
-    [0.16, 0.13, -0.17],
-])
+# PCA deformation amplitude (BU, scaled per mode) — increased 3x from v3
+PCA_BASE_AMP = 1.5  # base amplitude for mode 0 (was 0.5)
 
-# PCA deformation amplitude (BU, scaled per mode)
-PCA_BASE_AMP = 0.5  # base amplitude for mode 0, decreases for higher modes
+# Residual tumble when tRNA is bound (5%)
+RESIDUAL_TUMBLE = 0.05
 
 
 def compute_jitter(global_frame, obj_index, trans_amp, rot_amp):
@@ -204,19 +236,38 @@ def compute_jitter(global_frame, obj_index, trans_amp, rot_amp):
     return trans, rot
 
 
-def compute_per_atom_jitter(global_frame, obj_index, positions, amplitude):
-    """Return (N, 3) per-atom displacement with spatial correlation."""
+def compute_per_residue_jitter(global_frame, obj_index, positions, res_ids, amplitude):
+    """Return (N, 3) per-vertex displacement with per-residue coherence.
+
+    Groups atoms by res_id and computes ONE displacement per residue using
+    integer-harmonic sines with spatial correlation along residue index.
+    All atoms in a residue get the same displacement, so surface meshes
+    re-evaluate cleanly.
+    """
     n = len(positions)
-    noise = np.zeros((n, 3))
-    for h in range(JITTER_HARMONICS):
-        freq = JITTER_FREQS[h]
-        time_val = 2 * math.pi * freq * global_frame
-        spatial_phase = positions @ ATOM_SPATIAL_VECS[h]
+    displacement = np.zeros((n, 3))
+
+    if res_ids is None:
+        return displacement
+
+    unique_res = np.unique(res_ids)
+
+    for ri, res in enumerate(unique_res):
+        mask = res_ids == res
+        # Per-residue displacement from sum-of-sines
+        disp = np.zeros(3)
         for axis in range(3):
-            phase_offset = axis * 2.9 + obj_index * 7.3 + h * 1.7
-            noise[:, axis] += np.sin(time_val + spatial_phase + phase_offset) / (h + 1)
-    norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
-    return amplitude * noise / norm
+            total = 0.0
+            for h in range(JITTER_HARMONICS):
+                freq = JITTER_FREQS[h]
+                # Phase depends on residue index for spatial correlation
+                phase = (obj_index * 7.3 + axis * 2.9 + h * 1.7 + ri * 0.37) % (2 * math.pi)
+                total += math.sin(2 * math.pi * freq * global_frame + phase) / (h + 1)
+            norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
+            disp[axis] = amplitude * total / norm
+        displacement[mask] = disp
+
+    return displacement
 
 
 # ---------------------------------------------------------------------------
@@ -308,57 +359,63 @@ def compute_tumble_rotation(global_frame, obj_index, max_angle_deg=180):
 
 # ---------------------------------------------------------------------------
 # Animation position calculator (single-cycle logic)
+#
+# v4 schedule (in 240-frame units):
+#   Phase 1: ESTABLISH        f0-f12    (5%)
+#   Phase 2: tRNA DELIVERY    f12-f96   (35%)
+#   Phase 3: ACCOMMODATION    f96-f120  (10%)
+#   Phase 4: PEPTIDE TRANSFER f120-f144 (10%)
+#   Phase 5: TRANSLOCATION    f144-f192 (20%)
+#   Phase 6: tRNA DEPARTURE   f192-f240 (20%)
 # ---------------------------------------------------------------------------
 def get_positions(local_frame):
     """Return (mRNA_delta, tRNA_P_delta, tRNA_A_delta) for one cycle.
 
     local_frame: frame index within a single cycle (0 to FRAMES_PER_CYCLE-1).
     All deltas are relative to the object's crystallographic pose (0 = no movement).
-    Does NOT include cumulative offsets — caller adds those.
-
-    Note: polypeptide no longer has choreographic motion (issue 8).
+    Does NOT include cumulative offsets -- caller adds those.
     """
     f0 = scale_frames(0)
-    f30 = scale_frames(30)
-    f90 = scale_frames(90)
+    f12 = scale_frames(12)
+    f96 = scale_frames(96)
     f120 = scale_frames(120)
-    f150 = scale_frames(150)
-    f210 = scale_frames(210)
+    f144 = scale_frames(144)
+    f192 = scale_frames(192)
     f240 = scale_frames(240)
 
     zero = np.zeros(3)
 
-    # --- mRNA (translation only, no rotation — issue 3) ---
-    if local_frame < f150:
+    # --- mRNA (translation only, no rotation) ---
+    if local_frame < f144:
         mrna_delta = zero.copy()
-    elif local_frame < f210:
-        t = frame_t(local_frame, f150, f210)
+    elif local_frame < f192:
+        t = frame_t(local_frame, f144, f192)
         mrna_delta = lerp(zero, CODON_SHIFT, t)
     else:
         mrna_delta = CODON_SHIFT.copy()
 
     # --- P-site tRNA ---
-    if local_frame < f150:
+    if local_frame < f144:
         trna_p_delta = zero.copy()
-    elif local_frame < f210:
-        t = frame_t(local_frame, f150, f210)
+    elif local_frame < f192:
+        t = frame_t(local_frame, f144, f192)
         trna_p_delta = lerp(zero, EP_VEC, t)
     elif local_frame < f240:
-        t = frame_t(local_frame, f210, f240)
+        t = frame_t(local_frame, f192, f240)
         trna_p_delta = lerp(EP_VEC, EP_VEC + DEPART_OFFSET, t)
     else:
         trna_p_delta = EP_VEC + DEPART_OFFSET
 
     # --- A-site tRNA ---
-    if local_frame < f30:
+    if local_frame < f12:
         trna_a_delta = PA_VEC + ENTRY_OFFSET
-    elif local_frame < f90:
-        t = frame_t(local_frame, f30, f90)
+    elif local_frame < f96:
+        t = frame_t(local_frame, f12, f96)
         trna_a_delta = lerp(PA_VEC + ENTRY_OFFSET, PA_VEC, t)
-    elif local_frame < f150:
+    elif local_frame < f144:
         trna_a_delta = PA_VEC.copy()
-    elif local_frame < f210:
-        t = frame_t(local_frame, f150, f210)
+    elif local_frame < f192:
+        t = frame_t(local_frame, f144, f192)
         trna_a_delta = lerp(PA_VEC, zero, t)
     else:
         trna_a_delta = zero.copy()
@@ -367,38 +424,43 @@ def get_positions(local_frame):
 
 
 def get_trna_tumble_factor(local_frame, site):
-    """Return tumble amplitude factor [0, 1] for tRNA.
+    """Return tumble amplitude factor for tRNA.
 
-    A-site tRNA:
-      - Full tumble during approach (before accommodation at f90)
-      - Ramps down during accommodation (f30-f90)
-      - Zero when bound
+    Returns at least RESIDUAL_TUMBLE when bound (5% residual tumble).
+
+    A-site tRNA (v4 extended windows):
+      - Full tumble during delivery (f12-f96, was f30-f90)
+      - Ramps down during accommodation (f96-f120)
+      - Residual tumble when bound
 
     P-site tRNA:
-      - Zero when bound
-      - Ramps up during departure (f210-f240)
+      - Residual tumble when bound
+      - Ramps up during departure (f192-f240, was f210-f240)
     """
-    f30 = scale_frames(30)
-    f90 = scale_frames(90)
-    f210 = scale_frames(210)
+    f12 = scale_frames(12)
+    f96 = scale_frames(96)
+    f120 = scale_frames(120)
+    f192 = scale_frames(192)
     f240 = scale_frames(240)
 
     if site == "A":
-        if local_frame < f30:
-            return 1.0  # full tumble during approach
-        elif local_frame < f90:
+        if local_frame < f12:
+            return 1.0  # full tumble before delivery starts
+        elif local_frame < f96:
+            return 1.0  # full tumble during delivery
+        elif local_frame < f120:
             # Decay during accommodation
-            t = frame_t(local_frame, f30, f90)
-            return 1.0 - t
+            t = frame_t(local_frame, f96, f120)
+            return max(RESIDUAL_TUMBLE, 1.0 - t)
         else:
-            return 0.0  # bound, no tumble
+            return RESIDUAL_TUMBLE  # bound, residual tumble
     elif site == "P":
-        if local_frame < f210:
-            return 0.0  # bound, no tumble
+        if local_frame < f192:
+            return RESIDUAL_TUMBLE  # bound, residual tumble
         elif local_frame < f240:
             # Ramp up during departure
-            t = frame_t(local_frame, f210, f240)
-            return t
+            t = frame_t(local_frame, f192, f240)
+            return RESIDUAL_TUMBLE + (1.0 - RESIDUAL_TUMBLE) * t
         else:
             return 1.0  # fully departed
 
@@ -432,13 +494,13 @@ def compute_peptide_positions(orig_positions, res_ids, cycle, local_frame):
     # Number of fully visible residues at start of this cycle
     base_visible = min(INITIAL_PEPTIDE_RESIDUES + cycle, n_res)
 
-    # During peptide transfer (f120-f150), animate next residue appearing
+    # During peptide transfer (f120-f144), animate next residue appearing
     f120 = scale_frames(120)
-    f150 = scale_frames(150)
+    f144 = scale_frames(144)
 
-    if f120 <= local_frame < f150:
-        reveal_t = (local_frame - f120) / max(f150 - f120, 1)
-    elif local_frame >= f150:
+    if f120 <= local_frame < f144:
+        reveal_t = (local_frame - f120) / max(f144 - f120, 1)
+    elif local_frame >= f144:
         reveal_t = 1.0
     else:
         reveal_t = 0.0
@@ -480,7 +542,7 @@ def main():
     print(f"  Jitter harmonics: {JITTER_HARMONIC_NUMBERS} "
           f"(freqs: {[f'{f:.4f}' for f in JITTER_FREQS]})")
 
-    canvas = mn.Canvas(mn.scene.Cycles(samples=SAMPLES_INTERNAL), resolution=RES)
+    canvas = mn.Canvas(mn.scene.Cycles(samples=SAMPLES), resolution=RES)
     scene = bpy.context.scene
     scene.render.film_transparent = False
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
@@ -493,49 +555,49 @@ def main():
     # --- Load molecules ---
     print("  Loading molecules...")
 
-    # 1. Ribosome surface (40S + 60S)
+    # 1. Ribosome surface (40S + 60S) — translucent shader material
     mol_surface = mn.Molecule.fetch("6Y0G")
     mol_surface.add_style(
         style=mn.StyleSurface(),
         selection=mol_surface.select.chain_id(RIBOSOME_CHAINS),
-        material=make_surface_material(),
+        material=make_translucent_surface_material(),
         name="surface",
     )
 
-    # 2. mRNA (extended, from preprocessed PDB)
+    # 2. mRNA (extended, from preprocessed PDB) — StyleSurface
     mol_mrna = mn.Molecule.load("extended_mrna.pdb")
     mol_mrna.add_style(
-        style=mn.StyleCartoon(),
+        style=mn.StyleSurface(),
         material=make_solid_material((0.1, 0.35, 0.95)),
         name="mRNA",
     )
 
-    # 3. P-site tRNA (chain B4)
+    # 3. P-site tRNA (chain B4) — StyleSurface
     mol_trna_p = mn.Molecule.fetch("6Y0G")
     mol_trna_p.add_style(
-        style=mn.StyleCartoon(),
+        style=mn.StyleSurface(),
         selection=mol_trna_p.select.chain_id(["B4"]),
         material=make_solid_material((0.95, 0.5, 0.1)),
         name="tRNA_P",
     )
 
-    # 4. A-site tRNA (chain B4)
+    # 4. A-site tRNA (chain B4) — StyleSurface
     mol_trna_a = mn.Molecule.fetch("6Y0G")
     mol_trna_a.add_style(
-        style=mn.StyleCartoon(),
+        style=mn.StyleSurface(),
         selection=mol_trna_a.select.chain_id(["B4"]),
         material=make_solid_material((0.95, 0.5, 0.1)),
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded from preprocessed PDB — issue 9)
+    # 5. Polypeptide (tunnel-threaded from preprocessed PDB) — StyleSurface
     peptide_pdb = "tunnel_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
-        style=mn.StyleCartoon(),
+        style=mn.StyleSurface(),
         material=make_solid_material((0.8, 0.15, 0.6)),
         name="polypeptide",
     )
@@ -570,19 +632,17 @@ def main():
     for o in primary_objects:
         o.rotation_euler.z = math.pi / 2
 
-    animated_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
-
-    # --- Store original vertex positions for per-atom jitter ---
-    jitter_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+    # --- Store original vertex positions for per-residue deformation ---
+    deform_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
     orig_verts = {}
-    for obj in jitter_objects:
+    for obj in deform_objects:
         n = len(obj.data.vertices)
         co = np.empty(n * 3, dtype=np.float64)
         obj.data.vertices.foreach_get('co', co)
         orig_verts[obj.name] = co.reshape(-1, 3).copy()
         print(f"  Stored {n} vertices for {obj.name}")
 
-    # --- Get mesh res_ids for PCA mapping ---
+    # --- Get mesh res_ids for PCA mapping and per-residue jitter ---
     mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
     trna_p_mesh_res_ids = get_mesh_res_ids(obj_trna_p)
     trna_a_mesh_res_ids = get_mesh_res_ids(obj_trna_a)
@@ -613,7 +673,7 @@ def main():
     cam.parent = orbit_empty
     cam.matrix_parent_inverse = orbit_empty.matrix_world.inverted()
 
-    # --- Render loop ---
+    # --- Render loop (single-pass) ---
     print(f"\n=== Rendering {TOTAL_FRAMES} frames ({N_CYCLES} cycles) ===")
 
     for cycle in range(N_CYCLES):
@@ -622,20 +682,20 @@ def main():
             print(f"\n--- Cycle {cycle}, Frame {local_frame}/{FRAMES_PER_CYCLE - 1} "
                   f"(global {global_frame}/{TOTAL_FRAMES - 1}) ---")
 
-            # Single-cycle deltas (no polypeptide choreography — issue 8)
+            # Single-cycle deltas
             mrna_d, trna_p_d, trna_a_d = get_positions(local_frame)
 
             # Cumulative mRNA offset (slides further each cycle)
             mrna_d = mrna_d + cycle * CODON_SHIFT
 
-            # --- Ribosome jitter (issue 1) ---
+            # --- Ribosome jitter (5x increased from v3) ---
             ribo_t, ribo_r = compute_jitter(
                 global_frame, 10, RIBO_JITTER_TRANS_AMP, RIBO_JITTER_ROT_AMP)
             obj_surface.location = tuple(ribo_t)
             obj_surface.rotation_euler = (ribo_r[0], ribo_r[1],
                                           math.pi / 2 + ribo_r[2])
 
-            # --- mRNA: translation only, NO rigid-body rotation (issue 3) ---
+            # --- mRNA: translation only, NO rigid-body rotation ---
             obj_mrna.location = tuple(mrna_d)
             obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
@@ -653,7 +713,7 @@ def main():
             obj_trna_p.rotation_euler = (trna_p_jitter_r[0], trna_p_jitter_r[1],
                                          math.pi / 2 + trna_p_jitter_r[2])
 
-            # A-site tRNA (issue 6: tumbling during approach)
+            # A-site tRNA (tumbling during delivery)
             trna_a_jitter_t, trna_a_jitter_r = compute_jitter(
                 global_frame, 2, TRNA_JITTER_TRANS_AMP, TRNA_JITTER_ROT_AMP)
 
@@ -666,58 +726,63 @@ def main():
             obj_trna_a.rotation_euler = (trna_a_jitter_r[0], trna_a_jitter_r[1],
                                          math.pi / 2 + trna_a_jitter_r[2])
 
-            # --- Polypeptide: NO rigid-body jitter, NO choreographic motion (issue 8) ---
+            # --- Polypeptide: NO rigid-body jitter, NO choreographic motion ---
             obj_peptide.location = (0, 0, 0)
             obj_peptide.rotation_euler = (0, 0, math.pi / 2)
 
-            # --- Per-atom deformation ---
-            for obj_idx, obj in enumerate(jitter_objects):
+            # --- Per-residue deformation (replaces per-atom jitter) ---
+            for obj_idx, obj in enumerate(deform_objects):
                 orig = orig_verts[obj.name]
 
                 if obj is obj_peptide:
-                    # Polypeptide: progressive reveal + small per-atom jitter (issue 8)
+                    # Polypeptide: progressive reveal + per-residue jitter
                     revealed = compute_peptide_positions(
                         orig, pep_res_ids, cycle, local_frame)
-                    displacement = compute_per_atom_jitter(
-                        global_frame, obj_idx, orig, ATOM_JITTER_PEPTIDE)
+                    displacement = compute_per_residue_jitter(
+                        global_frame, obj_idx, orig, pep_res_ids,
+                        RESIDUE_JITTER_PEPTIDE)
                     displaced = (revealed + displacement).ravel()
 
                 elif obj is obj_mrna:
-                    # mRNA: PCA deformation + reduced per-atom jitter (issues 3, 4, 7)
+                    # mRNA: PCA deformation + per-residue jitter
                     positions = orig.copy()
                     pca_disp = compute_pca_displacement(
                         global_frame, mrna_modes, obj_index=0)
                     positions = apply_pca_to_vertices(
                         positions, mrna_mesh_res_ids, pca_disp, mrna_pca_res)
-                    displacement = compute_per_atom_jitter(
-                        global_frame, obj_idx, orig, ATOM_JITTER_MRNA)
+                    displacement = compute_per_residue_jitter(
+                        global_frame, obj_idx, orig, mrna_mesh_res_ids,
+                        RESIDUE_JITTER_MRNA)
                     displaced = (positions + displacement).ravel()
 
                 elif obj is obj_trna_p:
-                    # P-site tRNA: PCA deformation + per-atom jitter
+                    # P-site tRNA: PCA deformation + per-residue jitter
                     positions = orig.copy()
                     pca_disp = compute_pca_displacement(
                         global_frame, trna_modes, obj_index=1)
                     positions = apply_pca_to_vertices(
                         positions, trna_p_mesh_res_ids, pca_disp, trna_pca_res)
-                    displacement = compute_per_atom_jitter(
-                        global_frame, obj_idx, orig, ATOM_JITTER_TRNA)
+                    displacement = compute_per_residue_jitter(
+                        global_frame, obj_idx, orig, trna_p_mesh_res_ids,
+                        RESIDUE_JITTER_TRNA)
                     displaced = (positions + displacement).ravel()
 
                 elif obj is obj_trna_a:
-                    # A-site tRNA: PCA deformation + per-atom jitter
+                    # A-site tRNA: PCA deformation + per-residue jitter
                     positions = orig.copy()
                     pca_disp = compute_pca_displacement(
                         global_frame, trna_modes, obj_index=2)
                     positions = apply_pca_to_vertices(
                         positions, trna_a_mesh_res_ids, pca_disp, trna_pca_res)
-                    displacement = compute_per_atom_jitter(
-                        global_frame, obj_idx, orig, ATOM_JITTER_TRNA)
+                    displacement = compute_per_residue_jitter(
+                        global_frame, obj_idx, orig, trna_a_mesh_res_ids,
+                        RESIDUE_JITTER_TRNA)
                     displaced = (positions + displacement).ravel()
 
                 else:
-                    displacement = compute_per_atom_jitter(
-                        global_frame, obj_idx, orig, ATOM_JITTER_TRNA)
+                    displacement = compute_per_residue_jitter(
+                        global_frame, obj_idx, orig, None,
+                        RESIDUE_JITTER_TRNA)
                     displaced = (orig + displacement).ravel()
 
                 obj.data.vertices.foreach_set('co', displaced)
@@ -730,34 +795,14 @@ def main():
 
             bpy.context.view_layer.update()
 
-            # --- Pass 1: Internal components (cartoon) ---
-            obj_surface.hide_render = True
-            for o in animated_objects:
-                o.hide_render = False
-
-            set_bg(scene, (0.04, 0.04, 0.06), 0.5)
-            scene.render.film_transparent = False
-            scene.cycles.samples = SAMPLES_INTERNAL
-
-            pass1_path = os.path.join(FRAMES_DIR, f"pass1_{global_frame:04d}.png")
-            canvas.snapshot(pass1_path)
-            print(f"  Pass 1 saved: {pass1_path}")
-
-            # --- Pass 2: Surface (ribosome only) ---
-            obj_surface.hide_render = False
-            for o in animated_objects:
-                o.hide_render = True
-
-            set_bg(scene, (0.02, 0.02, 0.03), 0.3)
-            scene.render.film_transparent = True
-            scene.cycles.samples = SAMPLES_SURFACE
-
-            pass2_path = os.path.join(FRAMES_DIR, f"pass2_{global_frame:04d}.png")
-            canvas.snapshot(pass2_path)
-            print(f"  Pass 2 saved: {pass2_path}")
+            # --- Single-pass render (all objects visible) ---
+            scene.cycles.samples = SAMPLES
+            frame_path = os.path.join(FRAMES_DIR, f"frame_{global_frame:04d}.png")
+            canvas.snapshot(frame_path)
+            print(f"  Frame saved: {frame_path}")
 
     print(f"\n=== Done! {TOTAL_FRAMES} frames rendered to {FRAMES_DIR}/ ===")
-    print("Next: python3.11 composite.py [--debug]")
+    print("Next: python3.11 encode.py [--debug]")
 
 
 if __name__ == "__main__":

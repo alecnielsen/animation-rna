@@ -34,13 +34,13 @@ Output goes to `renders/`.
 
 ## Animation
 
-Multi-step pipeline: build extended structures → compute modes → render frames → composite → encode video.
+Multi-step pipeline: build extended structures → compute modes → render frames → encode video.
 
 ```bash
 source mn_env/bin/activate
 
-# 0a. Build extended mRNA (tiles chain A4 x10, 200K-step annealing)
-#     Writes extended_mrna.pdb (~20-30 min on CPU)
+# 0a. Build extended mRNA (tiles chain A4 x10, 500K-step 3-stage annealing)
+#     Writes extended_mrna.pdb (~40-60 min on CPU)
 python3.11 build_extended_mrna.py
 
 # 0b. Build tunnel-threaded polypeptide (traces exit tunnel, builds helix)
@@ -51,22 +51,17 @@ python3.11 build_tunnel_polypeptide.py
 #     Writes mrna_modes.npz, trna_modes.npz (~30-60 min)
 python3.11 compute_md_modes.py
 
-# 1. Render all frames (two passes per frame, 10 elongation cycles)
+# 1. Render all frames (single-pass, 10 elongation cycles)
 python3.11 animate.py          # 1920x1080, 2400 frames (production)
 python3.11 animate.py --debug  # 480x270, 240 frames (fast preview)
 
-# 2. Composite pass1 + pass2 for each frame
-python3.11 composite.py
-python3.11 composite.py --debug
-
-# 3. Encode to video
+# 2. Encode to video
 python3.11 encode.py
 python3.11 encode.py --debug
 ```
 
 Output:
-- `renders/frames/` — raw pass1/pass2 PNGs per frame
-- `renders/composited/` — final composited PNGs
+- `renders/frames/` — rendered PNGs per frame
 - `renders/ribosome_animation.mp4` — H.264 video
 - `renders/ribosome_animation.webm` — VP9 video
 
@@ -74,7 +69,7 @@ Output:
 
 | Script | Output | Purpose |
 |--------|--------|---------|
-| `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x10, 200K-step MD annealing |
+| `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x10, randomize sequence, 500K-step 3-stage MD annealing |
 | `build_tunnel_polypeptide.py` | `tunnel_polypeptide.pdb` | Trace exit tunnel, build helix along centerline |
 | `compute_md_modes.py` | `mrna_modes.npz`, `trna_modes.npz` | PCA modes from MD for structural deformation |
 | `build_extended_polypeptide.py` | `extended_polypeptide.pdb` | (legacy) Simple ideal helix aligned to C4 |

@@ -1,6 +1,6 @@
-"""Encode composited frames to video.
+"""Encode rendered frames to video.
 
-Reads renders/composited/frame_NNNN.png and produces:
+Reads renders/frames/frame_NNNN.png and produces:
 - renders/ribosome_animation.mp4  (H.264, web-compatible)
 - renders/ribosome_animation.webm (VP9, smaller file)
 
@@ -14,7 +14,7 @@ import sys
 import glob
 
 DEBUG = "--debug" in sys.argv
-INPUT_DIR = "renders/composited"
+INPUT_DIR = "renders/frames"
 OUTPUT_DIR = "renders"
 
 FPS = 24
@@ -74,7 +74,7 @@ def main():
 
     n_frames = count_frames()
     if n_frames == 0:
-        print(f"No composited frames found in {INPUT_DIR}/")
+        print(f"No frames found in {INPUT_DIR}/")
         return
 
     print(f"=== Encoding {n_frames} frames @ {FPS}fps ===")

@@ -2,43 +2,40 @@
 
 ## Overview
 
-Translucent molecular surface with solid internal machinery. The ribosome reads as a
-semi-transparent shell, while the mRNA, tRNAs, and polypeptide are vibrant and opaque inside.
+All molecules rendered as atomic surface meshes (StyleSurface) for a unified, physically realistic look. The ribosome appears as a translucent shell via shader-based transparency, while mRNA, tRNAs, and polypeptide are vibrant and opaque inside. Proper depth occlusion — internal molecules dim/disappear behind the ribosome.
 
-## Rendering approach: Two-pass compositing
+## Rendering approach: Single-pass with shader transparency
 
-Single-shader transparency doesn't work on dense molecular surface meshes (opacity
-accumulates across thousands of faces). Instead we use two render passes:
+Single Cycles render pass. All objects render simultaneously with correct depth.
 
-1. **Pass 1 (internal):** Cartoon representation of internal components on dark background
-2. **Pass 2 (surface):** Opaque flat-shaded surface of the ribosome
-3. **Composite in Python (PIL/numpy):**
-   - Blend surface over atoms at ~35% opacity (translucent overlay)
+Ribosome translucency is achieved via a backface-culling shader:
+- Front-facing faces: 35% opacity (MixShader: 65% Transparent + 35% Diffuse)
+- Back-facing faces: fully transparent (culled in shader)
+- This prevents opacity accumulation on dense surface meshes
 
-Camera position is captured from pass 2 (surface is the larger object for framing)
-and reused identically in pass 1.
+No compositing step needed — `animate.py` outputs final frames directly.
 
 ## Ribosome (40S + 60S subunits)
 
 - **Representation:** Surface mesh (StyleSurface)
 - **Color:** Uniform pale blue-gray, flat diffuse (roughness=1.0)
-- **Translucency:** ~35% opacity via compositing blend
-- **Jitter:** Subtle rigid-body motion (0.03 BU translation, 1.5deg rotation) via integer-harmonic sum-of-sines
+- **Translucency:** ~35% opacity via shader (backface culling + front-face transparency)
+- **Jitter:** Visible rigid-body motion (0.15 BU translation, 5.0deg rotation) via integer-harmonic sum-of-sines
 - **No per-chain coloring** — uniform across all subunits
 
 ## Internal components (mRNA, tRNAs, polypeptide)
 
-- **Representation:** Cartoon (StyleCartoon) — distinct arrows for beta-sheets, cylinders for helices. Chosen over ribbon (too smooth) and ball-and-stick (too noisy at this scale).
-- **Color:** Vibrant blue
+- **Representation:** Surface mesh (StyleSurface) — realistic atomic surface, unified look with ribosome
 - **Opacity:** Fully opaque
 - **Material:** Principled BSDF, roughness=0.25, emission=0.8
+- **Deformation:** Per-residue jitter (coherent displacement per residue) + PCA structural modes
 
 ### Per-component colors
 
 | Component | Chain(s) | Color |
 |-----------|----------|-------|
 | mRNA | A4 | Vibrant blue |
-| tRNAs | B4, D4 | Vibrant orange |
+| tRNAs | B4 | Vibrant orange |
 | Nascent polypeptide | C4 + extension | Magenta / purple |
 
 ## Background
@@ -48,10 +45,20 @@ and reused identically in pass 1.
 ## Lighting
 
 - Cycles default + world background. Soft, even.
-- Emission on atoms (strength ~0.8) for self-illumination through translucent surface.
+- Emission on internal molecules (strength ~0.8) for self-illumination through translucent ribosome.
 
-## Compositing parameters
+## Deformation parameters
 
 ```python
-SURFACE_OPACITY = 0.35
+# Per-residue jitter (replaces per-atom jitter)
+RESIDUE_JITTER_MRNA = 0.05     # BU
+RESIDUE_JITTER_TRNA = 0.08     # BU
+RESIDUE_JITTER_PEPTIDE = 0.05  # BU
+
+# PCA structural breathing
+PCA_BASE_AMP = 1.5  # BU, mode 0 (30:1 ratio over residue jitter)
+
+# Ribosome rigid-body
+RIBO_JITTER_TRANS_AMP = 0.15  # BU
+RIBO_JITTER_ROT_AMP = 5.0    # degrees
 ```

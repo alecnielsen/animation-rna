@@ -20,12 +20,11 @@ Human 80S ribosome (PDB 6Y0G) with extended mRNA, tRNAs cycling, and visible pol
 
 ## Rendering approach
 
-Two-pass compositing per frame (see STYLE.md for details):
-1. Render internal atoms (cartoon) — mRNA, tRNAs, polypeptide
-2. Render ribosome surface (flat opaque)
-3. Composite: translucent surface overlay (35% opacity)
-
-For animation, each frame is rendered as two passes and composited.
+Single-pass Cycles rendering with shader-based transparency (see STYLE.md):
+- All molecules render simultaneously with correct depth occlusion
+- Ribosome: translucent via backface-culling shader (~35% opacity)
+- Internal molecules: opaque StyleSurface with emission
+- No compositing step needed
 
 ## Seamless loop design
 
@@ -75,11 +74,14 @@ stays near-static (subtle jitter only). Moving parts:
 
 - **PCA modes:** Pre-computed from MD trajectories, applied as per-residue
   displacement via integer-harmonic sines. Gives physically realistic
-  backbone undulation that loops perfectly.
-- **Per-atom jitter:** Spatially correlated sum-of-sines displacement.
-- **Ribosome jitter:** Subtle rigid-body translation + rotation.
+  backbone undulation that loops perfectly. Amplitude 1.5 BU (30:1 ratio
+  over residue jitter).
+- **Per-residue jitter:** Coherent sum-of-sines displacement grouped by
+  residue (all atoms in a residue move together). Surface meshes re-evaluate
+  cleanly.
+- **Ribosome jitter:** Visible rigid-body translation (0.15 BU) + rotation (5deg).
 - **tRNA tumbling:** Full rotational freedom during approach/departure,
-  smooth decay during accommodation.
+  smooth decay during accommodation, 5% residual tumble when bound.
 
 For seamless looping, all frequencies are integer harmonics of the total
 animation period (k/T) so every component returns to its exact starting
@@ -88,25 +90,25 @@ phase at the loop point.
 ### Sequence (one elongation cycle, frames scaled to total)
 
 ```
-Phase 1: ESTABLISH (0-12%)
+Phase 1: ESTABLISH (0-5%, f0-f12)
          P-site tRNA holds peptide. A-site empty.
 
-Phase 2: tRNA DELIVERY (12-38%)
+Phase 2: tRNA DELIVERY (5-40%, f12-f96)
          Aminoacyl-tRNA glides into A-site from outside (tumbling).
 
-Phase 3: ACCOMMODATION (38-50%)
-         tRNA settles into A-site (tumble decays to 0).
+Phase 3: ACCOMMODATION (40-50%, f96-f120)
+         tRNA settles into A-site (tumble decays to residual 5%).
 
-Phase 4: PEPTIDE TRANSFER (50-62%)
+Phase 4: PEPTIDE TRANSFER (50-60%, f120-f144)
          Polypeptide grows by one residue (progressive reveal).
 
-Phase 5: TRANSLOCATION (62-88%)
+Phase 5: TRANSLOCATION (60-80%, f144-f192)
          A-site tRNA → P-site (with peptide).
          P-site tRNA → E-site (deacylated).
          mRNA advances one codon.
 
-Phase 6: tRNA DEPARTURE (88-100%)
-         E-site tRNA departs (tumble ramps up).
+Phase 6: tRNA DEPARTURE (80-100%, f192-f240)
+         E-site tRNA departs (tumble ramps up from residual).
          State is identical to Phase 1 → next cycle begins.
 ```
 
@@ -142,7 +144,7 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Cumulative mRNA offset per cycle
   - [x] Loop-safe integer-harmonic jitter frequencies
 
-### v3 (current)
+### v3 (complete)
 - [x] Remove edge outline, increase surface opacity to 35%
 - [x] Ribosome jitter (subtle rigid-body motion)
 - [x] mRNA: remove rigid-body rotation, reduce per-atom jitter
@@ -152,8 +154,18 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Polypeptide: remove rigid-body jitter and choreographic motion
 - [x] Tunnel-threaded polypeptide (void-tracing through 60S)
 - [x] PCA modes for tRNA structural deformation
+
+### v4 (current)
+- [x] All molecules use StyleSurface (unified realistic look)
+- [x] Single-pass rendering with shader transparency (proper depth occlusion)
+- [x] Per-residue deformation (replaces broken per-atom jitter on surface meshes)
+- [x] Increase ribosome jitter 5x (0.15 BU trans, 5deg rot)
+- [x] Increase PCA amplitude 3x (1.5 BU base, 30:1 ratio over jitter)
+- [x] Extended tRNA tumbling windows + 5% residual tumble when bound
+- [x] Enhanced mRNA MD: 500K steps, 3-stage anneal, sequence randomization
+- [x] Eliminate composite.py from pipeline (single-pass handles occlusion)
+- [ ] Debug render validation
 - [ ] Full production render
-- [ ] Visual validation
 
 ## Tech stack
 
@@ -161,7 +173,7 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - **Molecular Nodes 4.5.10** — PDB loading, molecular styles
 - **bpy (Blender Python)** — headless rendering, materials, keyframes
 - **Cycles renderer** — lighting, materials
-- **PIL / numpy** — per-frame compositing (translucent overlay)
+- **PIL / numpy** — image processing (legacy compositing removed in v4)
 - **ffmpeg** — final video encoding
 - **OpenMM** — MD simulation for mRNA relaxation, polypeptide relaxation, PCA trajectory generation
 - **biotite** — procedural mRNA/polypeptide construction
