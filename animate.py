@@ -1,13 +1,17 @@
 """Animate 10 elongation cycles of the 6Y0G human 80S ribosome.
 
+v3: Visual overhaul
+- Ribosome jitter (subtle rigid-body motion)
+- mRNA: no rigid-body rotation, PCA deformation + reduced per-atom jitter
+- tRNA tumbling during approach/departure
+- Polypeptide: no rigid-body jitter, no choreographic motion, just progressive reveal
+- PCA structural modes for physically realistic deformation
+
 Renders N_CYCLES * FRAMES_PER_CYCLE frames (seamless loop) showing:
-- tRNA delivery to A-site
+- tRNA delivery to A-site (with tumbling)
 - Peptide transfer with progressive polypeptide reveal
 - Translocation (A->P, P->E)
-- tRNA departure
-
-Seamless loop via conveyor belt: mRNA extends far beyond camera frame,
-absorbing cumulative codon shifts. Polypeptide grows 1 residue per cycle.
+- tRNA departure (with tumbling)
 
 Two-pass rendering per frame (internal cartoon + surface), saved to renders/frames/.
 
@@ -150,8 +154,6 @@ def scale_frames(f):
 # Frequencies are integer multiples of 1/TOTAL_FRAMES, guaranteeing that
 # sin(2pi * freq * TOTAL_FRAMES + phase) == sin(phase) — perfect loop.
 # ---------------------------------------------------------------------------
-JITTER_TRANS_AMP = 0.15   # BU per axis (rigid-body translation)
-JITTER_ROT_AMP = 15.0     # degrees per axis (rigid-body rotation)
 JITTER_HARMONICS = 4
 
 # Target frequencies (cycles/frame) matching original visual feel.
@@ -160,8 +162,19 @@ _TARGET_FREQS = [0.07, 0.113, 0.183, 0.296]
 JITTER_HARMONIC_NUMBERS = [max(1, round(f * TOTAL_FRAMES)) for f in _TARGET_FREQS]
 JITTER_FREQS = [k / TOTAL_FRAMES for k in JITTER_HARMONIC_NUMBERS]
 
-# Per-atom thermal jitter
-ATOM_JITTER_AMP = 0.3     # BU per atom displacement amplitude
+# Ribosome jitter (subtle: issue 1)
+RIBO_JITTER_TRANS_AMP = 0.03  # BU per axis
+RIBO_JITTER_ROT_AMP = 1.5     # degrees per axis
+
+# tRNA jitter (moderate)
+TRNA_JITTER_TRANS_AMP = 0.12  # BU per axis
+TRNA_JITTER_ROT_AMP = 8.0     # degrees per axis
+
+# Per-atom thermal jitter amplitudes (per object type)
+ATOM_JITTER_MRNA = 0.1        # BU — reduced from 0.3 (issue 3)
+ATOM_JITTER_TRNA = 0.2        # BU
+ATOM_JITTER_PEPTIDE = 0.15    # BU
+
 ATOM_SPATIAL_VECS = np.array([
     [0.13, 0.17, 0.11],
     [0.19, -0.11, 0.15],
@@ -169,8 +182,11 @@ ATOM_SPATIAL_VECS = np.array([
     [0.16, 0.13, -0.17],
 ])
 
+# PCA deformation amplitude (BU, scaled per mode)
+PCA_BASE_AMP = 0.5  # base amplitude for mode 0, decreases for higher modes
 
-def compute_jitter(global_frame, obj_index):
+
+def compute_jitter(global_frame, obj_index, trans_amp, rot_amp):
     """Return (trans_xyz, rot_xyz) rigid-body jitter for given frame and object index."""
     trans = np.zeros(3)
     rot = np.zeros(3)
@@ -183,12 +199,12 @@ def compute_jitter(global_frame, obj_index):
             t_sum += val / (h + 1)
             r_sum += val / (h + 1)
         norm = sum(1.0 / (h + 1) for h in range(JITTER_HARMONICS))
-        trans[axis] = JITTER_TRANS_AMP * t_sum / norm
-        rot[axis] = math.radians(JITTER_ROT_AMP) * r_sum / norm
+        trans[axis] = trans_amp * t_sum / norm
+        rot[axis] = math.radians(rot_amp) * r_sum / norm
     return trans, rot
 
 
-def compute_per_atom_jitter(global_frame, obj_index, positions):
+def compute_per_atom_jitter(global_frame, obj_index, positions, amplitude):
     """Return (N, 3) per-atom displacement with spatial correlation."""
     n = len(positions)
     noise = np.zeros((n, 3))
@@ -200,18 +216,107 @@ def compute_per_atom_jitter(global_frame, obj_index, positions):
             phase_offset = axis * 2.9 + obj_index * 7.3 + h * 1.7
             noise[:, axis] += np.sin(time_val + spatial_phase + phase_offset) / (h + 1)
     norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
-    return ATOM_JITTER_AMP * noise / norm
+    return amplitude * noise / norm
+
+
+# ---------------------------------------------------------------------------
+# PCA deformation
+# ---------------------------------------------------------------------------
+def load_pca_modes(npz_path):
+    """Load PCA modes from npz file. Returns (modes, residue_ids) or (None, None)."""
+    if not os.path.exists(npz_path):
+        print(f"  WARNING: {npz_path} not found, PCA deformation disabled")
+        return None, None
+    data = np.load(npz_path)
+    modes = data['modes']  # (n_modes, n_residues, 3)
+    residue_ids = data['residue_ids']
+    print(f"  Loaded {npz_path}: {modes.shape[0]} modes, {modes.shape[1]} residues")
+    return modes, residue_ids
+
+
+def compute_pca_displacement(global_frame, modes, obj_index):
+    """Compute per-residue PCA displacement for a given frame.
+
+    Returns (n_residues, 3) displacement vector.
+    Uses integer-harmonic sines with different frequency per mode.
+    """
+    if modes is None:
+        return None
+
+    n_modes, n_res, _ = modes.shape
+    displacement = np.zeros((n_res, 3))
+
+    for m in range(n_modes):
+        # Each mode gets a unique harmonic number (avoid collisions with jitter)
+        harmonic_num = max(1, JITTER_HARMONIC_NUMBERS[0] + m * 3 + obj_index * 2)
+        freq = harmonic_num / TOTAL_FRAMES
+        phase = (m * 3.7 + obj_index * 5.1) % (2 * math.pi)
+        amplitude = PCA_BASE_AMP / (m + 1)  # decreasing amplitude for higher modes
+
+        val = math.sin(2 * math.pi * freq * global_frame + phase)
+        displacement += amplitude * val * modes[m]
+
+    return displacement
+
+
+def apply_pca_to_vertices(positions, res_ids, pca_displacement, pca_residue_ids):
+    """Apply per-residue PCA displacement to mesh vertices.
+
+    Maps PCA residue indices to mesh res_id attribute.
+    """
+    if pca_displacement is None or res_ids is None:
+        return positions
+
+    result = positions.copy()
+    unique_mesh_res = np.unique(res_ids)
+
+    # Map PCA residue indices to mesh residues (by order)
+    n_pca = len(pca_residue_ids)
+    n_mesh = len(unique_mesh_res)
+    n_map = min(n_pca, n_mesh)
+
+    for i in range(n_map):
+        mesh_res = unique_mesh_res[i]
+        mask = res_ids == mesh_res
+        # PCA displacement is in Angstroms, mesh is in BU (1 BU = 10 A)
+        result[mask] += pca_displacement[i] * 0.1  # A -> BU
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# tRNA tumbling
+# ---------------------------------------------------------------------------
+def compute_tumble_rotation(global_frame, obj_index, max_angle_deg=180):
+    """Compute tumbling rotation angles for a tRNA in solution.
+
+    Returns (rx, ry, rz) Euler angles.
+    Uses integer-harmonic sines with unique frequencies per axis.
+    """
+    rot = np.zeros(3)
+    for axis in range(3):
+        total = 0.0
+        for h in range(JITTER_HARMONICS):
+            harmonic_num = max(1, JITTER_HARMONIC_NUMBERS[h] + axis * 5 + obj_index * 11)
+            freq = harmonic_num / TOTAL_FRAMES
+            phase = (obj_index * 11.3 + axis * 4.1 + h * 2.3) % (2 * math.pi)
+            total += math.sin(2 * math.pi * freq * global_frame + phase) / (h + 1)
+        norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
+        rot[axis] = math.radians(max_angle_deg) * total / norm
+    return rot
 
 
 # ---------------------------------------------------------------------------
 # Animation position calculator (single-cycle logic)
 # ---------------------------------------------------------------------------
 def get_positions(local_frame):
-    """Return (mRNA_delta, tRNA_P_delta, tRNA_A_delta, peptide_delta) for one cycle.
+    """Return (mRNA_delta, tRNA_P_delta, tRNA_A_delta) for one cycle.
 
     local_frame: frame index within a single cycle (0 to FRAMES_PER_CYCLE-1).
     All deltas are relative to the object's crystallographic pose (0 = no movement).
     Does NOT include cumulative offsets — caller adds those.
+
+    Note: polypeptide no longer has choreographic motion (issue 8).
     """
     f0 = scale_frames(0)
     f30 = scale_frames(30)
@@ -223,7 +328,7 @@ def get_positions(local_frame):
 
     zero = np.zeros(3)
 
-    # --- mRNA ---
+    # --- mRNA (translation only, no rotation — issue 3) ---
     if local_frame < f150:
         mrna_delta = zero.copy()
     elif local_frame < f210:
@@ -258,19 +363,44 @@ def get_positions(local_frame):
     else:
         trna_a_delta = zero.copy()
 
-    # --- Polypeptide ---
-    if local_frame < f120:
-        peptide_delta = zero.copy()
-    elif local_frame < f150:
-        t = frame_t(local_frame, f120, f150)
-        peptide_delta = lerp(zero, PA_VEC, t)
-    elif local_frame < f210:
-        t = frame_t(local_frame, f150, f210)
-        peptide_delta = lerp(PA_VEC, zero, t)
-    else:
-        peptide_delta = zero.copy()
+    return mrna_delta, trna_p_delta, trna_a_delta
 
-    return mrna_delta, trna_p_delta, trna_a_delta, peptide_delta
+
+def get_trna_tumble_factor(local_frame, site):
+    """Return tumble amplitude factor [0, 1] for tRNA.
+
+    A-site tRNA:
+      - Full tumble during approach (before accommodation at f90)
+      - Ramps down during accommodation (f30-f90)
+      - Zero when bound
+
+    P-site tRNA:
+      - Zero when bound
+      - Ramps up during departure (f210-f240)
+    """
+    f30 = scale_frames(30)
+    f90 = scale_frames(90)
+    f210 = scale_frames(210)
+    f240 = scale_frames(240)
+
+    if site == "A":
+        if local_frame < f30:
+            return 1.0  # full tumble during approach
+        elif local_frame < f90:
+            # Decay during accommodation
+            t = frame_t(local_frame, f30, f90)
+            return 1.0 - t
+        else:
+            return 0.0  # bound, no tumble
+    elif site == "P":
+        if local_frame < f210:
+            return 0.0  # bound, no tumble
+        elif local_frame < f240:
+            # Ramp up during departure
+            t = frame_t(local_frame, f210, f240)
+            return t
+        else:
+            return 1.0  # fully departed
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +486,10 @@ def main():
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
     scene.cycles.max_bounces = 12
 
+    # --- Load PCA modes ---
+    mrna_modes, mrna_pca_res = load_pca_modes("mrna_modes.npz")
+    trna_modes, trna_pca_res = load_pca_modes("trna_modes.npz")
+
     # --- Load molecules ---
     print("  Loading molecules...")
 
@@ -394,8 +528,12 @@ def main():
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (extended helix from preprocessed PDB)
-    mol_peptide = mn.Molecule.load("extended_polypeptide.pdb")
+    # 5. Polypeptide (tunnel-threaded from preprocessed PDB — issue 9)
+    peptide_pdb = "tunnel_polypeptide.pdb"
+    if not os.path.exists(peptide_pdb):
+        print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
+        peptide_pdb = "extended_polypeptide.pdb"
+    mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
         style=mn.StyleCartoon(),
         material=make_solid_material((0.8, 0.15, 0.6)),
@@ -407,8 +545,11 @@ def main():
         [o for o in bpy.data.objects if "6Y0G" in o.name and o.type == "MESH"],
         key=lambda o: o.name,
     )
-    objs_mrna = [o for o in bpy.data.objects if "extended_mrna" in o.name and o.type == "MESH"]
-    objs_pep = [o for o in bpy.data.objects if "extended_polypeptide" in o.name and o.type == "MESH"]
+    # Match mRNA/peptide objects by PDB filename
+    mrna_search = "extended_mrna"
+    pep_search = os.path.splitext(os.path.basename(peptide_pdb))[0]
+    objs_mrna = [o for o in bpy.data.objects if mrna_search in o.name and o.type == "MESH"]
+    objs_pep = [o for o in bpy.data.objects if pep_search in o.name and o.type == "MESH"]
 
     print(f"  Found {len(objs_6y0g)} 6Y0G objects: {[o.name for o in objs_6y0g]}")
     print(f"  Found {len(objs_mrna)} mRNA objects: {[o.name for o in objs_mrna]}")
@@ -440,6 +581,11 @@ def main():
         obj.data.vertices.foreach_get('co', co)
         orig_verts[obj.name] = co.reshape(-1, 3).copy()
         print(f"  Stored {n} vertices for {obj.name}")
+
+    # --- Get mesh res_ids for PCA mapping ---
+    mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
+    trna_p_mesh_res_ids = get_mesh_res_ids(obj_trna_p)
+    trna_a_mesh_res_ids = get_mesh_res_ids(obj_trna_a)
 
     # --- Polypeptide residue mapping for progressive reveal ---
     pep_res_ids = get_mesh_res_ids(obj_peptide)
@@ -476,47 +622,104 @@ def main():
             print(f"\n--- Cycle {cycle}, Frame {local_frame}/{FRAMES_PER_CYCLE - 1} "
                   f"(global {global_frame}/{TOTAL_FRAMES - 1}) ---")
 
-            # Single-cycle deltas
-            mrna_d, trna_p_d, trna_a_d, peptide_d = get_positions(local_frame)
+            # Single-cycle deltas (no polypeptide choreography — issue 8)
+            mrna_d, trna_p_d, trna_a_d = get_positions(local_frame)
 
             # Cumulative mRNA offset (slides further each cycle)
             mrna_d = mrna_d + cycle * CODON_SHIFT
 
-            # Rigid-body jitter (uses global frame for seamless looping)
-            jitter_mrna_t, jitter_mrna_r = compute_jitter(global_frame, 0)
-            jitter_trna_p_t, jitter_trna_p_r = compute_jitter(global_frame, 1)
-            jitter_trna_a_t, jitter_trna_a_r = compute_jitter(global_frame, 2)
-            jitter_pep_t, jitter_pep_r = compute_jitter(global_frame, 3)
+            # --- Ribosome jitter (issue 1) ---
+            ribo_t, ribo_r = compute_jitter(
+                global_frame, 10, RIBO_JITTER_TRANS_AMP, RIBO_JITTER_ROT_AMP)
+            obj_surface.location = tuple(ribo_t)
+            obj_surface.rotation_euler = (ribo_r[0], ribo_r[1],
+                                          math.pi / 2 + ribo_r[2])
 
-            # Apply position deltas + jitter
-            obj_mrna.location = tuple(mrna_d + jitter_mrna_t)
-            obj_mrna.rotation_euler = (jitter_mrna_r[0], jitter_mrna_r[1],
-                                       math.pi / 2 + jitter_mrna_r[2])
+            # --- mRNA: translation only, NO rigid-body rotation (issue 3) ---
+            obj_mrna.location = tuple(mrna_d)
+            obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
-            obj_trna_p.location = tuple(trna_p_d + jitter_trna_p_t)
-            obj_trna_p.rotation_euler = (jitter_trna_p_r[0], jitter_trna_p_r[1],
-                                         math.pi / 2 + jitter_trna_p_r[2])
+            # --- tRNA jitter + tumbling ---
+            # P-site tRNA
+            trna_p_jitter_t, trna_p_jitter_r = compute_jitter(
+                global_frame, 1, TRNA_JITTER_TRANS_AMP, TRNA_JITTER_ROT_AMP)
 
-            obj_trna_a.location = tuple(trna_a_d + jitter_trna_a_t)
-            obj_trna_a.rotation_euler = (jitter_trna_a_r[0], jitter_trna_a_r[1],
-                                         math.pi / 2 + jitter_trna_a_r[2])
+            tumble_factor_p = get_trna_tumble_factor(local_frame, "P")
+            if tumble_factor_p > 0:
+                tumble_p = compute_tumble_rotation(global_frame, 1)
+                trna_p_jitter_r = trna_p_jitter_r + tumble_factor_p * np.array(tumble_p)
 
-            obj_peptide.location = tuple(peptide_d + jitter_pep_t)
-            obj_peptide.rotation_euler = (jitter_pep_r[0], jitter_pep_r[1],
-                                          math.pi / 2 + jitter_pep_r[2])
+            obj_trna_p.location = tuple(trna_p_d + trna_p_jitter_t)
+            obj_trna_p.rotation_euler = (trna_p_jitter_r[0], trna_p_jitter_r[1],
+                                         math.pi / 2 + trna_p_jitter_r[2])
 
-            # Per-atom jitter for non-peptide objects
+            # A-site tRNA (issue 6: tumbling during approach)
+            trna_a_jitter_t, trna_a_jitter_r = compute_jitter(
+                global_frame, 2, TRNA_JITTER_TRANS_AMP, TRNA_JITTER_ROT_AMP)
+
+            tumble_factor_a = get_trna_tumble_factor(local_frame, "A")
+            if tumble_factor_a > 0:
+                tumble_a = compute_tumble_rotation(global_frame, 2)
+                trna_a_jitter_r = trna_a_jitter_r + tumble_factor_a * np.array(tumble_a)
+
+            obj_trna_a.location = tuple(trna_a_d + trna_a_jitter_t)
+            obj_trna_a.rotation_euler = (trna_a_jitter_r[0], trna_a_jitter_r[1],
+                                         math.pi / 2 + trna_a_jitter_r[2])
+
+            # --- Polypeptide: NO rigid-body jitter, NO choreographic motion (issue 8) ---
+            obj_peptide.location = (0, 0, 0)
+            obj_peptide.rotation_euler = (0, 0, math.pi / 2)
+
+            # --- Per-atom deformation ---
             for obj_idx, obj in enumerate(jitter_objects):
                 orig = orig_verts[obj.name]
+
                 if obj is obj_peptide:
-                    # Polypeptide: apply progressive reveal then jitter
+                    # Polypeptide: progressive reveal + small per-atom jitter (issue 8)
                     revealed = compute_peptide_positions(
                         orig, pep_res_ids, cycle, local_frame)
-                    displacement = compute_per_atom_jitter(global_frame, obj_idx, orig)
+                    displacement = compute_per_atom_jitter(
+                        global_frame, obj_idx, orig, ATOM_JITTER_PEPTIDE)
                     displaced = (revealed + displacement).ravel()
+
+                elif obj is obj_mrna:
+                    # mRNA: PCA deformation + reduced per-atom jitter (issues 3, 4, 7)
+                    positions = orig.copy()
+                    pca_disp = compute_pca_displacement(
+                        global_frame, mrna_modes, obj_index=0)
+                    positions = apply_pca_to_vertices(
+                        positions, mrna_mesh_res_ids, pca_disp, mrna_pca_res)
+                    displacement = compute_per_atom_jitter(
+                        global_frame, obj_idx, orig, ATOM_JITTER_MRNA)
+                    displaced = (positions + displacement).ravel()
+
+                elif obj is obj_trna_p:
+                    # P-site tRNA: PCA deformation + per-atom jitter
+                    positions = orig.copy()
+                    pca_disp = compute_pca_displacement(
+                        global_frame, trna_modes, obj_index=1)
+                    positions = apply_pca_to_vertices(
+                        positions, trna_p_mesh_res_ids, pca_disp, trna_pca_res)
+                    displacement = compute_per_atom_jitter(
+                        global_frame, obj_idx, orig, ATOM_JITTER_TRNA)
+                    displaced = (positions + displacement).ravel()
+
+                elif obj is obj_trna_a:
+                    # A-site tRNA: PCA deformation + per-atom jitter
+                    positions = orig.copy()
+                    pca_disp = compute_pca_displacement(
+                        global_frame, trna_modes, obj_index=2)
+                    positions = apply_pca_to_vertices(
+                        positions, trna_a_mesh_res_ids, pca_disp, trna_pca_res)
+                    displacement = compute_per_atom_jitter(
+                        global_frame, obj_idx, orig, ATOM_JITTER_TRNA)
+                    displaced = (positions + displacement).ravel()
+
                 else:
-                    displacement = compute_per_atom_jitter(global_frame, obj_idx, orig)
+                    displacement = compute_per_atom_jitter(
+                        global_frame, obj_idx, orig, ATOM_JITTER_TRNA)
                     displaced = (orig + displacement).ravel()
+
                 obj.data.vertices.foreach_set('co', displaced)
                 obj.data.update()
 

@@ -1,7 +1,7 @@
 """Batch composite all animation frames.
 
 Takes pass1/pass2 frame pairs from renders/frames/ and composites them
-using the same pipeline as render.py (translucent surface + edge outline).
+with translucent surface overlay (no outline — v3).
 
 Output: renders/composited/frame_NNNN.png
 
@@ -10,7 +10,7 @@ Run with: python3.11 composite.py [--debug]
 """
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 import os
 import sys
 import glob
@@ -23,49 +23,24 @@ FRAMES_DIR = "renders/frames"
 OUTPUT_DIR = "renders/composited"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Compositing parameters (same as render.py)
-OUTLINE_COLOR = (70, 120, 200)
-OUTLINE_THICKNESS = 3
-SURFACE_OPACITY = 0.20
+# Compositing parameters
+SURFACE_OPACITY = 0.35
 
 
 def composite_frame(pass1_path, pass2_path, output_path):
     """Composite a single frame from pass1 (internal) and pass2 (surface).
 
-    Same pipeline as render.py:
-    1. Layer 1: Translucent surface overlay on internal components
-    2. Layer 2: Edge outline from surface alpha channel
+    Translucent surface overlay on internal components at 35% opacity.
     """
     atoms = Image.open(pass1_path).convert("RGBA")
     surface = Image.open(pass2_path).convert("RGBA")
 
-    # Layer 1: Translucent surface overlay
+    # Translucent surface overlay
     surface_np = np.array(surface).astype(np.float32)
     surface_np[:, :, 3] = SURFACE_OPACITY * 255
     translucent = Image.fromarray(surface_np.astype(np.uint8), "RGBA")
     result = Image.alpha_composite(atoms, translucent)
 
-    # Layer 2: Outer silhouette from alpha channel
-    alpha = np.array(surface)[:, :, 3]
-    alpha_mask = (alpha > 10).astype(np.uint8) * 255
-    mask_img = Image.fromarray(alpha_mask)
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=2))
-    mask_img = Image.fromarray((np.array(mask_img) > 128).astype(np.uint8) * 255)
-    silhouette = mask_img.filter(ImageFilter.FIND_EDGES)
-    sil_np = (np.array(silhouette) > 30).astype(np.uint8) * 255
-    sil_img = Image.fromarray(sil_np)
-    for _ in range(OUTLINE_THICKNESS // 2):
-        sil_img = sil_img.filter(ImageFilter.MaxFilter(3))
-
-    edges_np = np.array(sil_img)
-    overlay = np.zeros((*edges_np.shape, 4), dtype=np.uint8)
-    mask = edges_np > 100
-    overlay[mask, 0] = OUTLINE_COLOR[0]
-    overlay[mask, 1] = OUTLINE_COLOR[1]
-    overlay[mask, 2] = OUTLINE_COLOR[2]
-    overlay[mask, 3] = 255
-
-    result = Image.alpha_composite(result, Image.fromarray(overlay, "RGBA"))
     result.save(output_path)
 
 

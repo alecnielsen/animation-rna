@@ -2,8 +2,15 @@
 
 Creates a single continuous ~170-nucleotide mRNA from 10 copies of the
 17 nt chain A4, with correct backbone spacing and sequential residue
-numbering. Then energy-minimizes with OpenMM (amber14 RNA.OL3 force field)
-to relax tile junction artifacts.
+numbering. Then runs extended MD annealing with OpenMM (amber14 RNA.OL3
+force field) to break tile symmetry and produce natural conformational
+diversity.
+
+Protocol: 200K MD steps total
+  - 0.2A random perturbation per tile before MD (seed different pathways)
+  - 150K steps at 350K (conformational sampling)
+  - 50K steps at 300K (cool to physiological)
+  - Final energy minimization (quench)
 
 Output: extended_mrna.pdb
 
@@ -66,10 +73,14 @@ def tile_mrna():
     print(f"  Residues per tile: {n_res}")
 
     # Create N_COPIES offset copies, centered so i=CENTER_INDEX is at origin
+    # Add small random perturbation per tile to seed different conformational pathways
+    rng = np.random.default_rng(42)
     copies = []
     for i in range(N_COPIES):
         tile = a4.copy()
         tile.coord += (i - CENTER_INDEX) * tile_offset
+        # 0.2A random perturbation per atom to break tile symmetry before MD
+        tile.coord += rng.normal(0, 0.2, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
         copies.append(tile)
@@ -125,12 +136,17 @@ def _load_and_prepare(input_pdb):
     return ff, modeller
 
 
-def relax_rna(input_pdb, output_pdb, md_steps=25000):
-    """Minimize then run short MD to break tile symmetry.
+def relax_rna(input_pdb, output_pdb):
+    """Extended annealing to eliminate tile periodicity.
 
-    Pipeline: minimize → heat to 400K → MD for md_steps → minimize again.
-    The elevated temperature lets each tile drift into a different conformation,
-    eliminating the periodic kink pattern from tiling.
+    Pipeline:
+      1. Energy minimization
+      2. 150K MD steps at 350K (conformational sampling)
+      3. 50K MD steps at 300K (cool to physiological temperature)
+      4. Final energy minimization (quench)
+
+    Total: 200K steps. The two-stage annealing with per-tile perturbation
+    produces diverse backbone conformations that eliminate visible tiling.
     """
     from openmm.app import (
         PDBFile as OmmPDB, Simulation, NoCutoff, HBonds,
@@ -139,14 +155,22 @@ def relax_rna(input_pdb, output_pdb, md_steps=25000):
     from openmm import LangevinMiddleIntegrator
     from openmm.unit import kelvin, picosecond, picoseconds, nanometer
 
-    print(f"\n=== Relaxation (minimize + {md_steps} MD steps @ 400K + minimize) ===")
+    PHASE1_STEPS = 150000
+    PHASE1_TEMP = 350  # K
+    PHASE2_STEPS = 50000
+    PHASE2_TEMP = 300  # K
+    TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS
+
+    print(f"\n=== Relaxation ({TOTAL_STEPS} MD steps: "
+          f"{PHASE1_STEPS}@{PHASE1_TEMP}K + {PHASE2_STEPS}@{PHASE2_TEMP}K + quench) ===")
 
     ff, modeller = _load_and_prepare(input_pdb)
 
     system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
 
-    # Langevin integrator at 400K (elevated to accelerate conformational sampling)
-    integrator = LangevinMiddleIntegrator(400 * kelvin, 1 / picosecond, 0.002 * picoseconds)
+    # Phase 1: 350K conformational sampling
+    integrator = LangevinMiddleIntegrator(
+        PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
     sim = Simulation(modeller.topology, system, integrator)
     sim.context.setPositions(modeller.positions)
 
@@ -158,15 +182,20 @@ def relax_rna(input_pdb, output_pdb, md_steps=25000):
     state1 = sim.context.getState(getEnergy=True)
     print(f"  Post-minimize energy: {state1.getPotentialEnergy()}")
 
-    # Step 2: Short MD at 400K
-    print(f"  Running {md_steps} MD steps (dt=2fs, T=400K)...")
+    # Step 2: Phase 1 — MD at 350K
+    print(f"  Phase 1: {PHASE1_STEPS} MD steps (dt=2fs, T={PHASE1_TEMP}K)...")
     sim.reporters.append(
-        StateDataReporter(sys.stdout, max(md_steps // 5, 1), step=True,
+        StateDataReporter(sys.stdout, max(PHASE1_STEPS // 5, 1), step=True,
                           potentialEnergy=True, temperature=True, speed=True)
     )
-    sim.step(md_steps)
+    sim.step(PHASE1_STEPS)
 
-    # Step 3: Final minimization (quench)
+    # Step 3: Phase 2 — cool to 300K
+    print(f"  Phase 2: {PHASE2_STEPS} MD steps (dt=2fs, T={PHASE2_TEMP}K)...")
+    integrator.setTemperature(PHASE2_TEMP * kelvin)
+    sim.step(PHASE2_STEPS)
+
+    # Step 4: Final minimization (quench)
     print("  Final minimization (quench)...")
     sim.minimizeEnergy(maxIterations=0)
     state_final = sim.context.getState(getEnergy=True, getPositions=True)
@@ -206,7 +235,7 @@ def main():
     if SKIP_MINIMIZE:
         print("\n  Skipping minimization (--skip-minimize)")
     else:
-        relax_rna(OUTPUT, OUTPUT, md_steps=25000)  # ~50ps at 400K
+        relax_rna(OUTPUT, OUTPUT)
 
     print("=== Done ===")
 
