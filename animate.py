@@ -85,6 +85,56 @@ CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 # Polypeptide progressive reveal
 INITIAL_PEPTIDE_RESIDUES = 2  # visible at start (matching C4 dipeptide)
 
+# mRNA bend — droop outside the ribosome channel
+MRNA_AXIS = CODON_SHIFT / np.linalg.norm(CODON_SHIFT)  # principal direction
+MRNA_CHANNEL_HALF_LEN = 4.0   # BU — straight zone around mRNA centroid
+MRNA_BEND_STRENGTH = 0.08     # BU per BU² beyond channel (quadratic droop)
+
+
+# ---------------------------------------------------------------------------
+# mRNA bend (organic curvature outside ribosome)
+# ---------------------------------------------------------------------------
+def apply_mrna_bend(positions, res_ids):
+    """Apply a gentle quadratic droop to mRNA vertices outside the ribosome channel.
+
+    Vertices within ±MRNA_CHANNEL_HALF_LEN of the mRNA centroid along the
+    principal axis stay straight. Beyond that, they droop quadratically
+    perpendicular to the axis, giving the mRNA an organic curved look
+    instead of a rigid rod.
+
+    Modifies positions in-place and returns them.
+    """
+    centroid = positions.mean(axis=0)
+    relative = positions - centroid
+
+    # Project onto mRNA axis
+    proj = relative @ MRNA_AXIS  # scalar projection per vertex
+
+    # Droop direction: perpendicular to MRNA_AXIS in the XY plane
+    # Use cross product with Z to get a horizontal perpendicular
+    z_up = np.array([0.0, 0.0, 1.0])
+    droop_dir = np.cross(MRNA_AXIS, z_up)
+    droop_norm = np.linalg.norm(droop_dir)
+    if droop_norm < 1e-6:
+        # MRNA_AXIS is nearly vertical, use X instead
+        droop_dir = np.cross(MRNA_AXIS, np.array([1.0, 0.0, 0.0]))
+        droop_norm = np.linalg.norm(droop_dir)
+    droop_dir = droop_dir / droop_norm
+
+    # Also add a Z component for gravity-like sag
+    droop_dir = 0.7 * droop_dir + 0.3 * np.array([0.0, 0.0, -1.0])
+    droop_dir = droop_dir / np.linalg.norm(droop_dir)
+
+    # Apply quadratic droop beyond the straight zone
+    for i in range(len(positions)):
+        d = abs(proj[i]) - MRNA_CHANNEL_HALF_LEN
+        if d > 0:
+            # Sign: both ends droop in the same direction (gravity-like)
+            droop = MRNA_BEND_STRENGTH * d * d
+            positions[i] += droop * droop_dir
+
+    return positions
+
 
 # ---------------------------------------------------------------------------
 # Material helpers
@@ -642,8 +692,17 @@ def main():
         orig_verts[obj.name] = co.reshape(-1, 3).copy()
         print(f"  Stored {n} vertices for {obj.name}")
 
-    # --- Get mesh res_ids for PCA mapping and per-residue jitter ---
+    # --- Apply mRNA bend (organic curvature outside ribosome) ---
     mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
+    print(f"  Applying mRNA bend (channel ±{MRNA_CHANNEL_HALF_LEN} BU, "
+          f"strength {MRNA_BEND_STRENGTH})...")
+    orig_verts[obj_mrna.name] = apply_mrna_bend(
+        orig_verts[obj_mrna.name], mrna_mesh_res_ids)
+    # Write bent positions back to mesh so first frame renders correctly
+    obj_mrna.data.vertices.foreach_set('co', orig_verts[obj_mrna.name].ravel())
+    obj_mrna.data.update()
+
+    # --- Get mesh res_ids for PCA mapping and per-residue jitter ---
     trna_p_mesh_res_ids = get_mesh_res_ids(obj_trna_p)
     trna_a_mesh_res_ids = get_mesh_res_ids(obj_trna_a)
 
