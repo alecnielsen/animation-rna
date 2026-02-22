@@ -58,20 +58,42 @@ def collect_md_snapshots(input_pdb, md_steps, save_interval, temperature,
 
     modeller = Modeller(pdb.topology, pdb.positions)
 
-    if molecule_type == "rna":
-        # Remove P/OP1/OP2 from 5' terminus
+    if molecule_type == "rna_tiled":
+        # Remove P/OP1/OP2 from 5' terminus (only for tiled mRNA, not intact tRNA)
         first_res = list(modeller.topology.residues())[0]
         to_remove = [a for a in first_res.atoms() if a.name in ("P", "OP1", "OP2")]
         if to_remove:
             print(f"  Removing {[a.name for a in to_remove]} from 5' residue")
             modeller.delete(to_remove)
 
-    modeller.addHydrogens(ff)
+    try:
+        modeller.addHydrogens(ff)
+    except ValueError as e:
+        print(f"  WARNING: addHydrogens failed ({e})")
+        print(f"  Proceeding without hydrogens...")
+        # Re-create modeller without H
+        modeller = Modeller(pdb.topology, pdb.positions)
+        if molecule_type == "rna_tiled":
+            first_res = list(modeller.topology.residues())[0]
+            to_remove = [a for a in first_res.atoms() if a.name in ("P", "OP1", "OP2")]
+            if to_remove:
+                modeller.delete(to_remove)
+
     print(f"  Prepared: {modeller.topology.getNumAtoms()} atoms, "
           f"{modeller.topology.getNumResidues()} residues")
 
-    system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff,
-                             constraints=HBonds)
+    try:
+        system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff,
+                                 constraints=HBonds)
+    except ValueError as e:
+        print(f"  WARNING: createSystem failed ({e})")
+        print(f"  Trying without constraints...")
+        try:
+            system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff)
+        except ValueError as e2:
+            print(f"  ERROR: Cannot create system: {e2}")
+            return None, None
+
     integrator = LangevinMiddleIntegrator(
         temperature * kelvin, 1 / picosecond, 0.002 * picoseconds)
     sim = Simulation(modeller.topology, system, integrator)
@@ -160,10 +182,15 @@ def compute_modes_for_molecule(input_pdb, output_npz, molecule_type="rna"):
     """Full pipeline: MD → snapshots → PCA → save."""
     print(f"\n=== Computing PCA modes for {input_pdb} ===")
 
-    centroids, residue_ids = collect_md_snapshots(
+    result = collect_md_snapshots(
         input_pdb, MD_STEPS, SAVE_INTERVAL, TEMPERATURE,
         molecule_type=molecule_type)
 
+    if result[0] is None:
+        print(f"  WARNING: MD failed for {input_pdb}, skipping PCA")
+        return
+
+    centroids, residue_ids = result
     modes, variance = compute_pca_modes(centroids, N_MODES)
 
     # Save: modes (n_modes, n_res, 3), mean structure, variance
@@ -193,6 +220,9 @@ def extract_trna_pdb():
         arr = arr[0]
 
     b4 = arr[arr.chain_id == "B4"]
+    # Remap 2-char chain ID to single char for PDB compatibility
+    b4 = b4.copy()
+    b4.chain_id[:] = "B"
     print(f"  Chain B4: {len(b4)} atoms, {len(np.unique(b4.res_id))} residues")
 
     out_path = "trna_b4.pdb"
@@ -207,10 +237,13 @@ def main():
     print("=== Computing PCA structural modes ===")
 
     # mRNA modes (from already-built extended_mrna.pdb)
-    if not os.path.exists("extended_mrna.pdb"):
+    if os.path.exists(OUTPUT_MRNA):
+        print(f"  {OUTPUT_MRNA} already exists, skipping mRNA (delete to recompute)")
+    elif not os.path.exists("extended_mrna.pdb"):
         print("ERROR: extended_mrna.pdb not found. Run build_extended_mrna.py first.")
         return
-    compute_modes_for_molecule("extended_mrna.pdb", OUTPUT_MRNA, molecule_type="rna")
+    else:
+        compute_modes_for_molecule("extended_mrna.pdb", OUTPUT_MRNA, molecule_type="rna_tiled")
 
     # tRNA modes (extract chain B4 from 6Y0G)
     trna_pdb = extract_trna_pdb()

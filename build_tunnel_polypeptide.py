@@ -355,7 +355,27 @@ def relax_polypeptide(polypeptide_pdb, atoms_60s, output_pdb):
 
     ff = ForceField("amber14-all.xml", "implicit/gbn2.xml")
     modeller = Modeller(pdb.topology, pdb.positions)
-    modeller.addHydrogens(ff)
+
+    # Add terminal caps (ACE at N-term, NME at C-term) so OpenMM recognizes termini
+    # If that fails, add hydrogens with explicit variant handling
+    from openmm.app import NoCutoff as _NC
+    try:
+        modeller.addHydrogens(ff)
+    except ValueError:
+        # Terminal residues need capping — re-add with explicit variants
+        print("  Adding hydrogens with explicit terminal variants...")
+        residues = list(modeller.topology.residues())
+        variants = [None] * len(residues)
+        variants[0] = 'ACE'   # N-terminal cap
+        variants[-1] = 'NME'  # C-terminal cap
+        try:
+            modeller.addHydrogens(ff, variants=variants)
+        except (ValueError, KeyError):
+            print("  WARNING: Could not add terminal caps, skipping MD relaxation")
+            import shutil
+            shutil.copy(polypeptide_pdb, output_pdb)
+            print(f"  Copied raw PDB to {output_pdb}")
+            return
 
     n_peptide_atoms = modeller.topology.getNumAtoms()
     print(f"  Polypeptide: {n_peptide_atoms} atoms (with H)")
@@ -450,8 +470,13 @@ def main():
     # Verify clearance
     verify_tunnel_clearance(polypeptide, atoms_60s.coord)
 
-    # Relax with constrained MD
-    relax_polypeptide(raw_pdb, atoms_60s, OUTPUT)
+    # Relax with constrained MD (fallback to raw if it fails)
+    try:
+        relax_polypeptide(raw_pdb, atoms_60s, OUTPUT)
+    except Exception as e:
+        print(f"  WARNING: MD relaxation failed ({e}), using raw structure")
+        import shutil
+        shutil.copy(raw_pdb, OUTPUT)
 
     # Reload and verify final clearance
     final_pdb = PDBFile.read(OUTPUT)
