@@ -1,11 +1,34 @@
 """Animate 10 elongation cycles of the 6Y0G human 80S ribosome.
 
-v5: Fix mRNA gaps, bend visibility, and ribosome opacity
-- mRNA backbone_threshold raised to 8.0 Å (fixes disconnected segments)
+v5 (WIP): Fix mRNA bend + ribosome opacity (partial)
 - mRNA bend axis computed via SVD in local space (fixes invisible bend)
 - MRNA_BEND_STRENGTH reduced to 0.015 (correct scale for local-space axis)
-- Ribosome StyleSurface quality=1 (fewer mesh layers) + 3% opacity per face
-  (was 15%), giving ~69% transmission — clearly translucent
+- Ribosome material: Principled BSDF with Alpha=0.06 (replaces mix-shader
+  approach that accumulated opacity across overlapping faces)
+- NOTE: hashed alpha creates noisy/fluffy ribosome at low sample counts;
+  needs a better transparency approach that preserves smooth surface quality
+
+Known issues / TODO:
+  Visual:
+  - mRNA backbone gaps: StyleSurface produces disconnected segments for RNA.
+    Need either a different style or a preprocessing step to close gaps.
+  - Ribosome translucency: hashed alpha destroys smooth surface texture.
+    Need translucency that preserves the solid, shadowed look of v4 while
+    allowing internal molecules to show through.
+  - mRNA bend: SVD axis fix is in place but not yet visually verified
+    (blocked by the above issues). May need higher MRNA_BEND_STRENGTH.
+  Animation:
+  - Per-residue deformation tears StyleSurface meshes: jitter and PCA
+    displace surface vertices by residue ID, creating gaps at residue
+    boundaries. Need to either skip deformation for surface meshes or
+    deform atom positions and regenerate the surface.
+  - mRNA codon translocation: mRNA must slide smoothly by one codon per
+    cycle. Logic exists but not yet verified in rendered output.
+  - Polypeptide extension: progressive reveal of new residues each cycle
+    during peptide transfer phase. Logic exists but not yet verified.
+  - Seamless looping: 10-cycle animation must loop perfectly (frame 0 ==
+    frame TOTAL). Integer-harmonic jitter frequencies ensure this
+    mathematically, but not yet verified visually.
 
 v4: Architectural overhaul
 - All molecules use StyleSurface (unified realistic look)
@@ -169,53 +192,25 @@ def make_solid_material(color):
 
 
 def make_translucent_surface_material():
-    """Shader-based translucent material for the ribosome.
+    """Translucent material for the ribosome using Principled BSDF Alpha.
 
-    Uses backface culling + front-face transparency to achieve ~3% opacity
-    per face in a single render pass. Combined with quality=1 surface
-    (~10-15 layers), gives ~69% transmission — clearly translucent while
-    still providing depth cues.
-
-    Node graph:
-      Geometry.Backfacing -> outer MixShader.Fac
-        Shader1: inner MixShader (fac=0.97, Transparent + Diffuse)
-        Shader2: Transparent BSDF (cull backfaces entirely)
-      -> Material Output
+    Uses hashed alpha transparency — each face is either fully transparent
+    or fully opaque based on a stochastic threshold. At alpha=0.06, the
+    ribosome is clearly translucent while still providing depth cues.
     """
     mat = bpy.data.materials.new(name="translucent_surface")
-    mat.use_backface_culling = False  # handled in shader
     mat.blend_method = 'HASHED'
     n = mat.node_tree.nodes
     l = mat.node_tree.links
     n.clear()
 
-    # Geometry node for backfacing detection
-    geom = n.new("ShaderNodeNewGeometry")
+    bsdf = n.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Base Color"].default_value = (0.45, 0.55, 0.75, 1.0)
+    bsdf.inputs["Roughness"].default_value = 0.5
+    bsdf.inputs["Alpha"].default_value = 0.06
 
-    # Diffuse shader (ribosome color)
-    diffuse = n.new("ShaderNodeBsdfDiffuse")
-    diffuse.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)
-    diffuse.inputs["Roughness"].default_value = 1.0
-
-    # Transparent shader
-    transparent_inner = n.new("ShaderNodeBsdfTransparent")
-    transparent_back = n.new("ShaderNodeBsdfTransparent")
-
-    # Inner mix: 97% transparent + 3% diffuse (front faces)
-    mix_inner = n.new("ShaderNodeMixShader")
-    mix_inner.inputs["Fac"].default_value = 0.97
-    l.new(transparent_inner.outputs["BSDF"], mix_inner.inputs[1])
-    l.new(diffuse.outputs["BSDF"], mix_inner.inputs[2])
-
-    # Outer mix: backfacing selects fully transparent
-    mix_outer = n.new("ShaderNodeMixShader")
-    l.new(geom.outputs["Backfacing"], mix_outer.inputs["Fac"])
-    l.new(mix_inner.outputs["Shader"], mix_outer.inputs[1])
-    l.new(transparent_back.outputs["BSDF"], mix_outer.inputs[2])
-
-    # Output
     out = n.new("ShaderNodeOutputMaterial")
-    l.new(mix_outer.outputs["Shader"], out.inputs["Surface"])
+    l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
     return mat
 
@@ -623,16 +618,16 @@ def main():
     # 1. Ribosome surface (40S + 60S) — translucent shader material
     mol_surface = mn.Molecule.fetch("6Y0G")
     mol_surface.add_style(
-        style=mn.StyleSurface(quality=1),
+        style=mn.StyleSurface(),
         selection=mol_surface.select.chain_id(RIBOSOME_CHAINS),
         material=make_translucent_surface_material(),
         name="surface",
     )
 
-    # 2. mRNA (extended, from preprocessed PDB) — StyleCartoon for continuous backbone
+    # 2. mRNA (extended, from preprocessed PDB) — StyleSurface
     mol_mrna = mn.Molecule.load("extended_mrna.pdb")
     mol_mrna.add_style(
-        style=mn.StyleCartoon(backbone_threshold=8.0),
+        style=mn.StyleSurface(),
         material=make_solid_material((0.1, 0.35, 0.95)),
         name="mRNA",
     )
@@ -655,14 +650,14 @@ def main():
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded from preprocessed PDB) — StyleCartoon for continuous backbone
+    # 5. Polypeptide (tunnel-threaded from preprocessed PDB) — StyleSurface
     peptide_pdb = "tunnel_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
-        style=mn.StyleCartoon(),
+        style=mn.StyleSurface(),
         material=make_solid_material((0.8, 0.15, 0.6)),
         name="polypeptide",
     )
