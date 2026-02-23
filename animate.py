@@ -9,14 +9,17 @@ v5 (WIP): Fix mRNA bend + ribosome opacity + disable vertex deformation
 - Ribosome material: currently Principled BSDF Alpha=0.01 (hashed).
   Translucent but fluffy/noisy — needs a non-hashed approach.
 
-Tested approaches for ribosome translucency:
+Tested approaches for ribosome translucency (none fully satisfactory):
   - Mix-shader (v4 style): smooth texture but opacity accumulates across
-    overlapping faces. Even at 1% per face (fac=0.99) the ribosome is
-    still opaque due to ~50 front-facing layers.
-  - Hashed alpha (Principled BSDF): achieves real translucency but
-    creates noisy/fluffy texture. Smoother at 32+ samples but still
-    lacks the solid surface quality of v4.
-  - Need: a non-accumulating, non-dithered transparency method.
+    ~50 overlapping front-facing layers. Even fac=0.99 is still opaque.
+  - Hashed alpha (Principled BSDF): real translucency but noisy/fluffy
+    texture. Smoother at 64+ samples. Alpha 0.06 best balance so far.
+  - Principled BSDF Transmission: dark and murky (frosted glass).
+  - Fresnel-based alpha: wireframe/mesh-net look (hashed noise at edges).
+  - Glass BSDF: extremely dark, nearly invisible internals.
+  - Mix-shader + mesh backface cull: testing (halves face count).
+  - Hashed alpha at 64 samples: testing (may smooth noise enough).
+  Best candidate: hashed alpha ~0.06 at 64+ samples, pending review.
 
 Known issues / TODO:
   Visual:
@@ -25,8 +28,8 @@ Known issues / TODO:
     (like hashed alpha). Neither approach alone works.
   - mRNA bend: SVD axis fix is in place, not yet visually verified.
     May need higher MRNA_BEND_STRENGTH.
-  - Polypeptide too short: needs to be much longer, extending out of
-    the exit channel and out of frame.
+  - Polypeptide too short: build_tunnel_polypeptide.py updated to extend
+    100 steps (200A) past exit. Rebuild in progress.
   - Per-atom jitter: disabled for now (tears surfaces). Need to
     re-enable by deforming atom positions pre-surface generation or
     applying smooth whole-object deformation.

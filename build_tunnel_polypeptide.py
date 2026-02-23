@@ -181,8 +181,8 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
             print(f"    Step {step}: clearance {best_clearance:.1f}A > {EXIT_THRESHOLD}A, "
                   f"tunnel exit reached")
             centerline.append(best_pos)
-            # Extend straight for a bit
-            for ext in range(1, 20):
+            # Extend well past tunnel exit (200A = ~20 BU, enough to go off-frame)
+            for ext in range(1, 101):
                 ext_pos = best_pos + current_dir * TRACE_STEP * ext
                 centerline.append(ext_pos)
             break
