@@ -77,7 +77,7 @@ N_CYCLES = 10
 if DEBUG:
     RES = (480, 270)
     FRAMES_PER_CYCLE = 24
-    SAMPLES = 8
+    SAMPLES = 32
 else:
     RES = (1920, 1080)
     FRAMES_PER_CYCLE = 240
@@ -125,7 +125,7 @@ RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 
 # Polypeptide progressive reveal
-INITIAL_PEPTIDE_RESIDUES = 2  # visible at start (matching C4 dipeptide)
+INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of tunnel)
 
 # mRNA bend — droop outside the ribosome channel
 MRNA_CHANNEL_HALF_LEN = 4.0   # BU — straight zone around mRNA centroid
@@ -219,7 +219,7 @@ def make_translucent_surface_material():
     bsdf = n.new("ShaderNodeBsdfPrincipled")
     bsdf.inputs["Base Color"].default_value = (0.45, 0.55, 0.75, 1.0)
     bsdf.inputs["Roughness"].default_value = 0.5
-    bsdf.inputs["Alpha"].default_value = 0.01
+    bsdf.inputs["Alpha"].default_value = 0.06
 
     out = n.new("ShaderNodeOutputMaterial")
     l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
