@@ -1,34 +1,43 @@
 """Animate 10 elongation cycles of the 6Y0G human 80S ribosome.
 
-v5 (WIP): Fix mRNA bend + ribosome opacity (partial)
+v5 (WIP): Fix mRNA bend + ribosome opacity + disable vertex deformation
 - mRNA bend axis computed via SVD in local space (fixes invisible bend)
 - MRNA_BEND_STRENGTH reduced to 0.015 (correct scale for local-space axis)
-- Ribosome material: Principled BSDF with Alpha=0.06 (replaces mix-shader
-  approach that accumulated opacity across overlapping faces)
-- NOTE: hashed alpha creates noisy/fluffy ribosome at low sample counts;
-  needs a better transparency approach that preserves smooth surface quality
+- Disabled per-residue jitter and PCA vertex deformation (was tearing
+  StyleSurface meshes at residue boundaries). Polypeptide progressive
+  reveal still active. Per-atom jitter deferred to later.
+- Ribosome material: currently Principled BSDF Alpha=0.01 (hashed).
+  Translucent but fluffy/noisy — needs a non-hashed approach.
+
+Tested approaches for ribosome translucency:
+  - Mix-shader (v4 style): smooth texture but opacity accumulates across
+    overlapping faces. Even at 1% per face (fac=0.99) the ribosome is
+    still opaque due to ~50 front-facing layers.
+  - Hashed alpha (Principled BSDF): achieves real translucency but
+    creates noisy/fluffy texture. Smoother at 32+ samples but still
+    lacks the solid surface quality of v4.
+  - Need: a non-accumulating, non-dithered transparency method.
 
 Known issues / TODO:
   Visual:
-  - mRNA backbone gaps: StyleSurface produces disconnected segments for RNA.
-    Need either a different style or a preprocessing step to close gaps.
-  - Ribosome translucency: hashed alpha destroys smooth surface texture.
-    Need translucency that preserves the solid, shadowed look of v4 while
-    allowing internal molecules to show through.
-  - mRNA bend: SVD axis fix is in place but not yet visually verified
-    (blocked by the above issues). May need higher MRNA_BEND_STRENGTH.
+  - Ribosome translucency: need an approach that gives smooth surface
+    quality (like v4 mix-shader) AND actual see-through transparency
+    (like hashed alpha). Neither approach alone works.
+  - mRNA bend: SVD axis fix is in place, not yet visually verified.
+    May need higher MRNA_BEND_STRENGTH.
+  - Polypeptide too short: needs to be much longer, extending out of
+    the exit channel and out of frame.
+  - Per-atom jitter: disabled for now (tears surfaces). Need to
+    re-enable by deforming atom positions pre-surface generation or
+    applying smooth whole-object deformation.
   Animation:
-  - Per-residue deformation tears StyleSurface meshes: jitter and PCA
-    displace surface vertices by residue ID, creating gaps at residue
-    boundaries. Need to either skip deformation for surface meshes or
-    deform atom positions and regenerate the surface.
-  - mRNA codon translocation: mRNA must slide smoothly by one codon per
+  - mRNA codon translocation: must slide smoothly by one codon per
     cycle. Logic exists but not yet verified in rendered output.
-  - Polypeptide extension: progressive reveal of new residues each cycle
-    during peptide transfer phase. Logic exists but not yet verified.
-  - Seamless looping: 10-cycle animation must loop perfectly (frame 0 ==
-    frame TOTAL). Integer-harmonic jitter frequencies ensure this
-    mathematically, but not yet verified visually.
+  - Polypeptide extension: progressive reveal of new residues each
+    cycle during peptide transfer. Logic exists but not yet verified.
+  - Seamless looping: 10-cycle animation must loop. Integer-harmonic
+    jitter frequencies ensure this mathematically, but not yet
+    verified visually.
 
 v4: Architectural overhaul
 - All molecules use StyleSurface (unified realistic look)
@@ -194,9 +203,9 @@ def make_solid_material(color):
 def make_translucent_surface_material():
     """Translucent material for the ribosome using Principled BSDF Alpha.
 
-    Uses hashed alpha transparency — each face is either fully transparent
-    or fully opaque based on a stochastic threshold. At alpha=0.06, the
-    ribosome is clearly translucent while still providing depth cues.
+    Uses Principled BSDF with low alpha for true per-face transparency.
+    At alpha=0.15 with 32+ samples, the stochastic dithering is smooth
+    enough to preserve surface detail while being clearly translucent.
     """
     mat = bpy.data.materials.new(name="translucent_surface")
     mat.blend_method = 'HASHED'
@@ -207,7 +216,7 @@ def make_translucent_surface_material():
     bsdf = n.new("ShaderNodeBsdfPrincipled")
     bsdf.inputs["Base Color"].default_value = (0.45, 0.55, 0.75, 1.0)
     bsdf.inputs["Roughness"].default_value = 0.5
-    bsdf.inputs["Alpha"].default_value = 0.06
+    bsdf.inputs["Alpha"].default_value = 0.01
 
     out = n.new("ShaderNodeOutputMaterial")
     l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
@@ -607,6 +616,7 @@ def main():
     scene.render.film_transparent = False
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
     scene.cycles.max_bounces = 12
+    scene.cycles.transparent_max_bounces = 64  # allow rays through many transparent layers
 
     # --- Load PCA modes ---
     mrna_modes, mrna_pca_res = load_pca_modes("mrna_modes.npz")
@@ -799,63 +809,16 @@ def main():
             obj_peptide.location = (0, 0, 0)
             obj_peptide.rotation_euler = (0, 0, math.pi / 2)
 
-            # --- Per-residue deformation (replaces per-atom jitter) ---
-            for obj_idx, obj in enumerate(deform_objects):
-                orig = orig_verts[obj.name]
-
-                if obj is obj_peptide:
-                    # Polypeptide: progressive reveal + per-residue jitter
-                    revealed = compute_peptide_positions(
-                        orig, pep_res_ids, cycle, local_frame)
-                    displacement = compute_per_residue_jitter(
-                        global_frame, obj_idx, orig, pep_res_ids,
-                        RESIDUE_JITTER_PEPTIDE)
-                    displaced = (revealed + displacement).ravel()
-
-                elif obj is obj_mrna:
-                    # mRNA: PCA deformation + per-residue jitter
-                    positions = orig.copy()
-                    pca_disp = compute_pca_displacement(
-                        global_frame, mrna_modes, obj_index=0)
-                    positions = apply_pca_to_vertices(
-                        positions, mrna_mesh_res_ids, pca_disp, mrna_pca_res)
-                    displacement = compute_per_residue_jitter(
-                        global_frame, obj_idx, orig, mrna_mesh_res_ids,
-                        RESIDUE_JITTER_MRNA)
-                    displaced = (positions + displacement).ravel()
-
-                elif obj is obj_trna_p:
-                    # P-site tRNA: PCA deformation + per-residue jitter
-                    positions = orig.copy()
-                    pca_disp = compute_pca_displacement(
-                        global_frame, trna_modes, obj_index=1)
-                    positions = apply_pca_to_vertices(
-                        positions, trna_p_mesh_res_ids, pca_disp, trna_pca_res)
-                    displacement = compute_per_residue_jitter(
-                        global_frame, obj_idx, orig, trna_p_mesh_res_ids,
-                        RESIDUE_JITTER_TRNA)
-                    displaced = (positions + displacement).ravel()
-
-                elif obj is obj_trna_a:
-                    # A-site tRNA: PCA deformation + per-residue jitter
-                    positions = orig.copy()
-                    pca_disp = compute_pca_displacement(
-                        global_frame, trna_modes, obj_index=2)
-                    positions = apply_pca_to_vertices(
-                        positions, trna_a_mesh_res_ids, pca_disp, trna_pca_res)
-                    displacement = compute_per_residue_jitter(
-                        global_frame, obj_idx, orig, trna_a_mesh_res_ids,
-                        RESIDUE_JITTER_TRNA)
-                    displaced = (positions + displacement).ravel()
-
-                else:
-                    displacement = compute_per_residue_jitter(
-                        global_frame, obj_idx, orig, None,
-                        RESIDUE_JITTER_TRNA)
-                    displaced = (orig + displacement).ravel()
-
-                obj.data.vertices.foreach_set('co', displaced)
-                obj.data.update()
+            # --- Polypeptide progressive reveal ---
+            # (Per-residue jitter and PCA deformation disabled for now:
+            # they tear StyleSurface meshes at residue boundaries.
+            # TODO: re-enable by deforming atom positions pre-surface
+            # generation, or by applying smooth whole-object deformation.)
+            pep_orig = orig_verts[obj_peptide.name]
+            revealed = compute_peptide_positions(
+                pep_orig, pep_res_ids, cycle, local_frame)
+            obj_peptide.data.vertices.foreach_set('co', revealed.ravel())
+            obj_peptide.data.update()
 
             # Camera orbit
             orbit_t = global_frame / max(TOTAL_FRAMES - 1, 1)
