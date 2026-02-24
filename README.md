@@ -32,6 +32,24 @@ python3.11 render.py
 
 Output goes to `renders/`.
 
+## Single-frame render
+
+Quick validation of all molecule placements before running the full animation.
+
+```bash
+source mn_env/bin/activate
+
+# Build structures first (see Preprocessing below)
+python3.11 build_tunnel_polypeptide.py   # ~15-30 min (100K MD steps)
+python3.11 build_extended_mrna.py        # ~40-60 min (500K MD steps)
+
+# Render single frame
+python3.11 render_single_frame.py --debug  # 960x540, 32 samples (~2-5 min)
+python3.11 render_single_frame.py          # 1920x1080, 128 samples (~10-20 min)
+```
+
+Output: `renders/single_frame.png`
+
 ## Animation
 
 Multi-step pipeline: build extended structures → compute modes → render frames → encode video.
@@ -39,12 +57,13 @@ Multi-step pipeline: build extended structures → compute modes → render fram
 ```bash
 source mn_env/bin/activate
 
-# 0a. Build extended mRNA (tiles chain A4 x10, 500K-step 3-stage annealing)
+# 0a. Build extended mRNA (tiles chain A4 x10, 500K-step 3-stage annealing + wall repulsion)
 #     Writes extended_mrna.pdb (~40-60 min on CPU)
 python3.11 build_extended_mrna.py
 
-# 0b. Build tunnel-threaded polypeptide (traces exit tunnel, builds helix)
-#     Writes tunnel_polypeptide.pdb (~5-10 min)
+# 0b. Build tunnel-threaded polypeptide (traces exit tunnel, extended backbone in tunnel,
+#     geometric de-clash, 100K-step 3-stage MD with wall repulsion)
+#     Writes tunnel_polypeptide.pdb (~15-30 min)
 python3.11 build_tunnel_polypeptide.py
 
 # 0c. Compute PCA structural modes from MD trajectories
@@ -69,8 +88,9 @@ Output:
 
 | Script | Output | Purpose |
 |--------|--------|---------|
-| `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x10, randomize sequence, 500K-step 3-stage MD annealing |
-| `build_tunnel_polypeptide.py` | `tunnel_polypeptide.pdb` | Trace exit tunnel, build helix along centerline |
+| `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x10, randomize sequence, 500K-step 3-stage MD annealing with ribosome wall repulsion |
+| `build_tunnel_polypeptide.py` | `tunnel_polypeptide.pdb` | Trace exit tunnel, extended backbone in tunnel, helix after exit, geometric de-clash, 100K-step 3-stage MD with wall repulsion |
+| `render_single_frame.py` | `renders/single_frame.png` | Single-frame render of full translation complex (ribosome, mRNA, tRNAs, polypeptide) |
 | `compute_md_modes.py` | `mrna_modes.npz`, `trna_modes.npz` | PCA modes from MD for structural deformation |
 | `build_extended_polypeptide.py` | `extended_polypeptide.pdb` | (legacy) Simple ideal helix aligned to C4 |
 

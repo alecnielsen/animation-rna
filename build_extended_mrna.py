@@ -6,13 +6,19 @@ numbering. Randomizes nucleotide sequence per tile to produce genuinely
 different backbone conformations. Then runs extended 3-stage MD annealing
 with OpenMM (amber14 RNA.OL3 force field) to break tile symmetry.
 
+Ribosome-aware: loads nearby ribosome atoms, runs geometric de-clash
+after tiling, and adds wall-repulsion forces during MD to prevent the
+mRNA from clipping through ribosome walls.
+
 Protocol: 500K MD steps total
   - 0.5A random perturbation per tile before MD (seed different pathways)
   - Randomized nucleotide sequence per tile (ACGU mix)
+  - Geometric de-clash against ribosome walls
   - 300K steps at 400K (high-temperature conformational sampling)
   - 100K steps at 350K (intermediate cooling)
   - 100K steps at 310K (physiological temperature)
   - Final energy minimization (quench)
+  - Wall repulsion force active during all MD phases
 
 Output: extended_mrna.pdb
 
@@ -25,6 +31,7 @@ import numpy as np
 import sys
 import os
 import tempfile
+from scipy.spatial import KDTree
 from biotite.structure import AtomArrayStack, concatenate, connect_via_residue_names
 from biotite.structure.io.pdb import PDBFile
 
@@ -33,9 +40,95 @@ CENTER_INDEX = 5  # copy index that stays at crystallographic position
 OUTPUT = "extended_mrna.pdb"
 SKIP_MINIMIZE = "--skip-minimize" in sys.argv
 
+# All ribosome chain IDs (40S + 60S) for wall detection
+CHAINS_40S = [
+    "S2", "SA", "SB", "SC", "SD", "SE", "SF", "SG", "SH", "SI", "SJ", "SK",
+    "SL", "SM", "SN", "SO", "SP", "SQ", "SR", "SS", "ST", "SU", "SV", "SW",
+    "SX", "SY", "SZ", "Sa", "Sb", "Sc", "Sd", "Se", "Sf", "Sg",
+]
+CHAINS_60S = [
+    "L5", "L7", "L8", "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI",
+    "LJ", "LL", "LM", "LN", "LO", "LP", "LQ", "LR", "LS", "LT", "LU", "LV",
+    "LW", "LX", "LY", "LZ", "La", "Lb", "Lc", "Ld", "Le", "Lg", "Lh",
+    "Li", "Lj", "Lk", "Ll", "Lm", "Ln", "Lo", "Lp", "Lr",
+]
+RIBOSOME_CHAINS = CHAINS_40S + CHAINS_60S
+
+
+def get_nearby_ribosome_atoms(mrna_coords, full_arr, cutoff=15.0):
+    """Load ribosome atoms within cutoff of any mRNA atom.
+
+    Returns: (N, 3) array of nearby ribosome atom coordinates.
+    """
+    mask_ribo = np.isin(full_arr.chain_id, RIBOSOME_CHAINS)
+    ribo_atoms = full_arr[mask_ribo]
+    ribo_coords = ribo_atoms.coord
+    print(f"  Ribosome: {len(ribo_coords)} atoms total")
+
+    # Find ribosome atoms within cutoff of any mRNA atom
+    mrna_tree = KDTree(mrna_coords)
+    dists, _ = mrna_tree.query(ribo_coords)
+    nearby_mask = dists < cutoff
+    nearby_coords = ribo_coords[nearby_mask]
+    print(f"  Nearby ribosome atoms (within {cutoff}A of mRNA): {len(nearby_coords)}")
+
+    return nearby_coords
+
+
+def declash_structure(coords, ribosome_tree, ribo_coords, min_dist=3.0, max_iter=100):
+    """Push atoms away from ribosome walls.
+
+    Iteratively displaces any atom closer than min_dist to the nearest
+    ribosome atom, pushing it radially outward.
+
+    Returns: modified coords (in-place).
+    """
+    print(f"  Geometric de-clash (min_dist={min_dist}A, max_iter={max_iter})...")
+    for iteration in range(max_iter):
+        dists, idxs = ribosome_tree.query(coords)
+        clashing = dists < min_dist
+        n_clash = clashing.sum()
+        if n_clash == 0:
+            print(f"    Converged at iteration {iteration}: no clashes")
+            break
+        push_dir = coords[clashing] - ribo_coords[idxs[clashing]]
+        norms = np.linalg.norm(push_dir, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-6)
+        push_dir = push_dir / norms
+        deficit = min_dist - dists[clashing]
+        coords[clashing] += push_dir * deficit[:, None]
+        if iteration % 20 == 0:
+            print(f"    Iteration {iteration}: {n_clash} clashing atoms, "
+                  f"min dist={dists.min():.2f}A")
+    return coords
+
+
+def verify_clearance(label, coords, ribosome_tree):
+    """Verify and print clearance stats for ALL atoms against ribosome."""
+    distances, _ = ribosome_tree.query(coords)
+    min_dist = distances.min()
+    max_dist = distances.max()
+    mean_dist = distances.mean()
+    n_below_25 = (distances < 2.5).sum()
+    n_below_30 = (distances < 3.0).sum()
+    pct_below_30 = 100.0 * n_below_30 / len(distances)
+
+    print(f"\n=== Clearance: {label} ({len(coords)} atoms) ===")
+    print(f"  Min: {min_dist:.2f}A  Max: {max_dist:.1f}A  Mean: {mean_dist:.1f}A")
+    print(f"  Atoms < 2.5A: {n_below_25}  Atoms < 3.0A: {n_below_30} ({pct_below_30:.1f}%)")
+    if n_below_25 == 0 and pct_below_30 < 5.0:
+        print(f"  PASS: zero atoms < 2.5A, {pct_below_30:.1f}% < 3.0A")
+    else:
+        print(f"  WARN: acceptance criteria not met")
+    return distances
+
 
 def tile_mrna():
-    """Fetch 6Y0G chain A4, tile it N_COPIES times, write raw PDB."""
+    """Fetch 6Y0G chain A4, tile it N_COPIES times, write raw PDB.
+
+    Returns: (extended, n_res, full_arr) where full_arr is the complete 6Y0G
+    structure for ribosome context loading.
+    """
     mn.register()
     mn.Canvas(mn.scene.Cycles(samples=1), resolution=(320, 240))
 
@@ -48,7 +141,7 @@ def tile_mrna():
         arr = arr[0]
 
     a4_raw = arr[arr.chain_id == "A4"]
-    # Filter out non-nucleotide heteroatoms (e.g. MG²⁺ ion at res 101)
+    # Filter out non-nucleotide heteroatoms (e.g. MG ion at res 101)
     nuc_names = {"A", "C", "G", "U", "DA", "DC", "DG", "DT"}
     nuc_mask = np.isin(a4_raw.res_name, list(nuc_names))
     a4 = a4_raw[nuc_mask]
@@ -60,7 +153,7 @@ def tile_mrna():
     p_first = a4.coord[(a4.res_id == unique_res[0]) & (a4.atom_name == "P")][0]
     o3_res0 = a4.coord[(a4.res_id == unique_res[0]) & (a4.atom_name == "O3'")][0]
     p_res1 = a4.coord[(a4.res_id == unique_res[1]) & (a4.atom_name == "P")][0]
-    bond_vec = p_res1 - o3_res0  # internal O3'→P step (~1.6 Å)
+    bond_vec = p_res1 - o3_res0  # internal O3'->P step (~1.6 A)
     tile_offset = o3_last + bond_vec - p_first
 
     p_coords = a4.coord[a4.atom_name == "P"]
@@ -86,8 +179,7 @@ def tile_mrna():
         tile.coord += rng.normal(0, 0.5, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
-        # Randomize nucleotide sequence per tile — different force field
-        # interactions produce genuinely different backbone conformations
+        # Randomize nucleotide sequence per tile
         tile_unique_res = np.unique(tile.res_id)
         for res in tile_unique_res:
             new_name = rng.choice(nuc_choices)
@@ -107,7 +199,7 @@ def tile_mrna():
     pdb.write(OUTPUT)
     print(f"  Written: {OUTPUT}")
 
-    return extended, n_res
+    return extended, n_res, arr
 
 
 def _load_and_prepare(input_pdb):
@@ -145,8 +237,8 @@ def _load_and_prepare(input_pdb):
     return ff, modeller
 
 
-def relax_rna(input_pdb, output_pdb):
-    """3-stage annealing to eliminate tile periodicity.
+def relax_rna(input_pdb, output_pdb, ribo_coords=None):
+    """3-stage annealing with wall repulsion to eliminate tile periodicity.
 
     Pipeline:
       1. Energy minimization
@@ -155,15 +247,14 @@ def relax_rna(input_pdb, output_pdb):
       4. 100K MD steps at 310K (physiological temperature)
       5. Final energy minimization (quench)
 
-    Total: 500K steps. The 3-stage annealing with per-tile sequence
-    randomization and 0.5A perturbation produces diverse backbone
-    conformations that eliminate visible tiling patterns.
+    If ribo_coords is provided, adds a wall repulsion force that prevents
+    mRNA atoms from clipping through ribosome walls.
     """
     from openmm.app import (
         PDBFile as OmmPDB, Simulation, NoCutoff, HBonds,
         StateDataReporter,
     )
-    from openmm import LangevinMiddleIntegrator
+    from openmm import LangevinMiddleIntegrator, CustomExternalForce
     from openmm.unit import kelvin, picosecond, picoseconds, nanometer
 
     PHASE1_STEPS = 300000
@@ -182,6 +273,38 @@ def relax_rna(input_pdb, output_pdb):
 
     system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
 
+    # Wall repulsion force (if ribosome context provided)
+    if ribo_coords is not None:
+        print(f"  Adding wall repulsion force ({len(ribo_coords)} ribosome atoms)...")
+        ribo_tree = KDTree(ribo_coords)
+        n_atoms = modeller.topology.getNumAtoms()
+        positions = modeller.positions
+
+        # Get mRNA atom positions in Angstroms for KDTree query
+        mrna_coords_nm = np.array([positions[i].value_in_unit(nanometer)
+                                    for i in range(n_atoms)])
+        mrna_coords_A = mrna_coords_nm * 10.0
+
+        _, nearest_idx = ribo_tree.query(mrna_coords_A)
+        nearest_ribo_A = ribo_coords[nearest_idx]
+        nearest_ribo_nm = nearest_ribo_A * 0.1  # -> nm
+
+        wall_force = CustomExternalForce(
+            "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
+            "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
+            "r_min=0.3"
+        )
+        wall_force.addGlobalParameter("k_wall", 1000.0)
+        wall_force.addPerParticleParameter("wx")
+        wall_force.addPerParticleParameter("wy")
+        wall_force.addPerParticleParameter("wz")
+
+        for i in range(n_atoms):
+            wall_force.addParticle(i, [
+                nearest_ribo_nm[i, 0], nearest_ribo_nm[i, 1], nearest_ribo_nm[i, 2]
+            ])
+        system.addForce(wall_force)
+
     # Phase 1: 400K high-temperature conformational sampling
     integrator = LangevinMiddleIntegrator(
         PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
@@ -196,7 +319,7 @@ def relax_rna(input_pdb, output_pdb):
     state1 = sim.context.getState(getEnergy=True)
     print(f"  Post-minimize energy: {state1.getPotentialEnergy()}")
 
-    # Step 2: Phase 1 — MD at 400K
+    # Step 2: Phase 1 -- MD at 400K
     print(f"  Phase 1: {PHASE1_STEPS} MD steps (dt=2fs, T={PHASE1_TEMP}K)...")
     sim.reporters.append(
         StateDataReporter(sys.stdout, max(PHASE1_STEPS // 5, 1), step=True,
@@ -204,12 +327,12 @@ def relax_rna(input_pdb, output_pdb):
     )
     sim.step(PHASE1_STEPS)
 
-    # Step 3: Phase 2 — cool to 350K
+    # Step 3: Phase 2 -- cool to 350K
     print(f"  Phase 2: {PHASE2_STEPS} MD steps (dt=2fs, T={PHASE2_TEMP}K)...")
     integrator.setTemperature(PHASE2_TEMP * kelvin)
     sim.step(PHASE2_STEPS)
 
-    # Step 4: Phase 3 — cool to 310K (physiological)
+    # Step 4: Phase 3 -- cool to 310K (physiological)
     print(f"  Phase 3: {PHASE3_STEPS} MD steps (dt=2fs, T={PHASE3_TEMP}K)...")
     integrator.setTemperature(PHASE3_TEMP * kelvin)
     sim.step(PHASE3_STEPS)
@@ -248,13 +371,36 @@ def verify(extended, n_res):
 
 
 def main():
-    extended, n_res = tile_mrna()
+    extended, n_res, full_arr = tile_mrna()
     verify(extended, n_res)
+
+    # Load nearby ribosome atoms for de-clash and wall repulsion
+    nearby_ribo = get_nearby_ribosome_atoms(extended.coord, full_arr, cutoff=15.0)
+    ribo_tree = KDTree(nearby_ribo)
+
+    # Geometric de-clash after tiling
+    verify_clearance("before de-clash", extended.coord, ribo_tree)
+    extended.coord = declash_structure(
+        extended.coord, ribo_tree, nearby_ribo, min_dist=3.0)
+    verify_clearance("after de-clash", extended.coord, ribo_tree)
+
+    # Re-write PDB after de-clash
+    pdb = PDBFile()
+    pdb.set_structure(extended)
+    pdb.write(OUTPUT)
+    print(f"  Re-written after de-clash: {OUTPUT}")
 
     if SKIP_MINIMIZE:
         print("\n  Skipping minimization (--skip-minimize)")
     else:
-        relax_rna(OUTPUT, OUTPUT)
+        relax_rna(OUTPUT, OUTPUT, ribo_coords=nearby_ribo)
+
+        # Verify final clearance
+        final_pdb = PDBFile.read(OUTPUT)
+        final_arr = final_pdb.get_structure()
+        if isinstance(final_arr, AtomArrayStack):
+            final_arr = final_arr[0]
+        verify_clearance("final structure", final_arr.coord, ribo_tree)
 
     print("=== Done ===")
 

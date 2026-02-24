@@ -1,17 +1,23 @@
 """Build a polypeptide threaded through the ribosome exit tunnel.
 
 Traces the exit tunnel void space from the peptidyl transferase center (PTC)
-through the 60S subunit, then builds a polyalanine alpha helix along the
-centerline. The polypeptide is relaxed with constrained MD (ribosome frozen,
-polypeptide flexible).
+through the 60S subunit, then builds a polyalanine chain along the centerline.
+Uses extended conformation inside the tunnel (~3.3 A/residue, fits the ~10 A
+L4-L22 constriction) and alpha helix after the exit (~1.5 A/residue).
+
+After backbone construction, a geometric de-clash pushes atoms away from
+ribosome walls, then 3-stage MD annealing with wall-repulsion forces relaxes
+the structure while preventing clipping.
 
 Algorithm:
   1. Build KDTree of all 60S ribosome atoms
   2. From C4 position (PTC), trace through void space by picking points
      with maximum clearance from ribosome walls
-  3. Smooth centerline with cubic spline
-  4. Build polyalanine backbone along spline at 1.5A intervals
-  5. Constrained MD relaxation
+  3. Smooth centerline with variable-rate resampling (extended in tunnel,
+     helix after exit)
+  4. Build polyalanine backbone along spline with geometry switching
+  5. Geometric de-clash against ribosome walls
+  6. 3-stage constrained MD with wall repulsion (100K steps total)
 
 Output: tunnel_polypeptide.pdb
 
@@ -30,11 +36,12 @@ import os
 import tempfile
 
 OUTPUT = "tunnel_polypeptide.pdb"
-HELIX_RISE_PER_RESIDUE = 1.5  # Angstroms
+EXTENDED_RISE_PER_RESIDUE = 3.3  # Angstroms (extended conformation in tunnel)
+HELIX_RISE_PER_RESIDUE = 1.5    # Angstroms (alpha helix after exit)
 TRACE_STEP = 2.0  # Angstroms per tracing step
 MIN_CLEARANCE = 4.0  # minimum distance from tunnel wall (A)
 EXIT_THRESHOLD = 15.0  # distance at which we consider having exited
-N_EXTENSION_BEYOND_EXIT = 10  # extra residues past tunnel exit
+N_EXTENSION_STEPS = 150  # extension steps past tunnel exit (300 A)
 
 # 60S chain IDs
 CHAINS_60S = [
@@ -125,7 +132,9 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
     Starting from PTC, find the path through the tunnel by following
     maximum-clearance points at each step.
 
-    Returns: (N, 3) array of tunnel centerline points.
+    Returns: (centerline, exit_arc_length)
+        centerline: (N, 3) array of tunnel centerline points
+        exit_arc_length: arc length at which tunnel exit was detected
     """
     tree = KDTree(atoms_60s_coords)
 
@@ -141,6 +150,7 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
 
     max_steps = 200
     n_candidates = 36  # sample points on disc
+    exit_arc_length = None
 
     print(f"  Tracing tunnel (step={TRACE_STEP}A, "
           f"min_clearance={MIN_CLEARANCE}A, exit={EXIT_THRESHOLD}A)...")
@@ -177,12 +187,18 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
             break
 
         if best_clearance > EXIT_THRESHOLD:
-            # Exited the tunnel — add a few extension points
+            # Exited the tunnel — record exit point and extend
             print(f"    Step {step}: clearance {best_clearance:.1f}A > {EXIT_THRESHOLD}A, "
                   f"tunnel exit reached")
             centerline.append(best_pos)
-            # Extend well past tunnel exit (200A = ~20 BU, enough to go off-frame)
-            for ext in range(1, 101):
+
+            # Compute arc length up to exit point
+            cl_arr = np.array(centerline)
+            exit_arc_length = sum(np.linalg.norm(cl_arr[i+1] - cl_arr[i])
+                                  for i in range(len(cl_arr) - 1))
+
+            # Extend 300A past tunnel exit (150 steps * 2A)
+            for ext in range(1, N_EXTENSION_STEPS + 1):
                 ext_pos = best_pos + current_dir * TRACE_STEP * ext
                 centerline.append(ext_pos)
             break
@@ -203,43 +219,81 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
     total_length = sum(np.linalg.norm(centerline[i+1] - centerline[i])
                        for i in range(len(centerline) - 1))
     print(f"  Tunnel centerline: {len(centerline)} points, {total_length:.1f}A total length")
-    return centerline
+    if exit_arc_length is not None:
+        print(f"  Tunnel exit at arc length: {exit_arc_length:.1f}A")
+    return centerline, exit_arc_length
 
 
-def smooth_centerline(centerline):
-    """Smooth the centerline with cubic spline interpolation."""
+def smooth_centerline(centerline, exit_arc_length):
+    """Smooth the centerline with cubic spline and variable-rate resampling.
+
+    Inside the tunnel (before exit_arc_length): resample at EXTENDED_RISE_PER_RESIDUE
+    (3.3 A) for extended conformation.
+    After the tunnel exit: resample at HELIX_RISE_PER_RESIDUE (1.5 A) for alpha helix.
+
+    Returns: (spline_points, tunnel_exit_residue, spline_fn, total_len)
+    """
     # Parameterize by arc length
     diffs = np.diff(centerline, axis=0)
     seg_lengths = np.linalg.norm(diffs, axis=1)
     t = np.zeros(len(centerline))
     t[1:] = np.cumsum(seg_lengths)
+    total_len = t[-1]
 
     # Fit cubic spline
     cs = CubicSpline(t, centerline)
 
-    # Resample at uniform HELIX_RISE_PER_RESIDUE intervals
-    total_len = t[-1]
-    n_points = int(total_len / HELIX_RISE_PER_RESIDUE)
-    t_uniform = np.linspace(0, total_len, n_points)
-    smooth = cs(t_uniform)
+    # Build variable-rate sample points
+    if exit_arc_length is None:
+        # No exit found — all extended conformation
+        exit_arc_length = total_len
 
-    print(f"  Smoothed centerline: {n_points} points at {HELIX_RISE_PER_RESIDUE}A intervals")
-    return smooth, cs, total_len
+    # Tunnel portion: extended conformation (3.3 A per residue)
+    tunnel_t = np.arange(0, exit_arc_length, EXTENDED_RISE_PER_RESIDUE)
+    tunnel_exit_residue = len(tunnel_t)
+
+    # Post-exit portion: alpha helix (1.5 A per residue)
+    remaining = total_len - exit_arc_length
+    if remaining > 0:
+        post_exit_t = np.arange(
+            exit_arc_length, total_len, HELIX_RISE_PER_RESIDUE)
+        # Don't duplicate the exit point
+        if len(post_exit_t) > 0 and len(tunnel_t) > 0:
+            if abs(post_exit_t[0] - tunnel_t[-1]) < 0.1:
+                post_exit_t = post_exit_t[1:]
+        all_t = np.concatenate([tunnel_t, post_exit_t])
+    else:
+        all_t = tunnel_t
+
+    smooth = cs(all_t)
+    n_tunnel = tunnel_exit_residue
+    n_helix = len(smooth) - n_tunnel
+
+    print(f"  Smoothed centerline: {len(smooth)} points "
+          f"({n_tunnel} extended @{EXTENDED_RISE_PER_RESIDUE}A + "
+          f"{n_helix} helix @{HELIX_RISE_PER_RESIDUE}A)")
+    print(f"  Tunnel exit at residue index: {tunnel_exit_residue}")
+
+    return smooth, tunnel_exit_residue, cs, total_len
 
 
-def build_helix_along_spline(spline_points):
+def build_backbone_along_spline(spline_points, tunnel_exit_residue):
     """Build polyalanine backbone atoms along the spline centerline.
 
-    Places backbone atoms (N, CA, C, O, CB) using ideal helix geometry
-    rotated into the local coordinate frame defined by the spline tangent.
+    Uses extended conformation geometry for residues inside the tunnel
+    (before tunnel_exit_residue) and alpha helix geometry after the exit.
+
+    Extended conformation: flatter offsets, 180 deg twist per residue
+    Alpha helix: standard helix offsets, 100 deg twist per residue
 
     Returns: AtomArray
     """
     n_res = len(spline_points)
     print(f"  Building {n_res}-residue polyalanine along tunnel spline...")
+    print(f"    Residues 1-{tunnel_exit_residue}: extended conformation (tunnel)")
+    print(f"    Residues {tunnel_exit_residue+1}-{n_res}: alpha helix (post-exit)")
 
     # Compute local coordinate frames along the spline
-    # tangent = forward direction, then build orthonormal basis
     tangents = np.zeros_like(spline_points)
     tangents[0] = spline_points[1] - spline_points[0]
     tangents[-1] = spline_points[-1] - spline_points[-2]
@@ -247,21 +301,29 @@ def build_helix_along_spline(spline_points):
         tangents[i] = spline_points[i + 1] - spline_points[i - 1]
     tangents = tangents / np.linalg.norm(tangents, axis=1, keepdims=True)
 
-    # Build ideal helix backbone in local frame
-    # For each residue, place atoms relative to CA at the spline point
     atoms_per_res = 5  # N, CA, C, O, CB
     total_atoms = n_res * atoms_per_res
     arr = AtomArray(total_atoms)
 
-    # Ideal atom offsets relative to CA in a standard frame (helix axis along z)
-    # These are approximate but sufficient for visualization
-    offsets = {
-        "N": np.array([-0.53, -0.84, -0.75]),
+    # Extended conformation offsets — flatter, more elongated
+    # Diameter ~6 A (fits ~10 A L4-L22 constriction with clearance)
+    offsets_extended = {
+        "N":  np.array([-0.40, -0.30, -1.65]),
         "CA": np.array([0.0, 0.0, 0.0]),
-        "C": np.array([0.53, 0.84, 0.75]),
-        "O": np.array([0.25, 1.96, 0.92]),
+        "C":  np.array([0.40, 0.30, 1.65]),
+        "O":  np.array([0.20, 1.20, 2.00]),
         "CB": np.array([-1.52, 0.0, 0.22]),
     }
+
+    # Alpha helix offsets — standard helix geometry
+    offsets_helix = {
+        "N":  np.array([-0.53, -0.84, -0.75]),
+        "CA": np.array([0.0, 0.0, 0.0]),
+        "C":  np.array([0.53, 0.84, 0.75]),
+        "O":  np.array([0.25, 1.96, 0.92]),
+        "CB": np.array([-1.52, 0.0, 0.22]),
+    }
+
     atom_names = ["N", "CA", "C", "O", "CB"]
     elements = ["N", "C", "C", "O", "C"]
 
@@ -270,7 +332,7 @@ def build_helix_along_spline(spline_points):
         ca_pos = spline_points[i]
         t = tangents[i]
 
-        # Build local frame: t is forward, compute normal and binormal
+        # Build local frame
         if abs(t[0]) < 0.9:
             n_vec = np.cross(t, np.array([1, 0, 0]))
         else:
@@ -278,13 +340,20 @@ def build_helix_along_spline(spline_points):
         n_vec = n_vec / np.linalg.norm(n_vec)
         b_vec = np.cross(t, n_vec)
 
-        # Rotation for helix twist: 100 degrees per residue (alpha helix)
-        twist_angle = np.radians(100) * i
+        # Switch geometry based on tunnel position
+        if i < tunnel_exit_residue:
+            # Extended conformation: 180 deg twist per residue
+            offsets = offsets_extended
+            twist_angle = np.radians(180) * i
+        else:
+            # Alpha helix: 100 deg twist per residue
+            offsets = offsets_helix
+            twist_angle = np.radians(100) * i
+
         cos_tw, sin_tw = np.cos(twist_angle), np.sin(twist_angle)
         n_rot = cos_tw * n_vec + sin_tw * b_vec
         b_rot = -sin_tw * n_vec + cos_tw * b_vec
 
-        # Rotation matrix: columns are [n_rot, b_rot, t]
         R = np.column_stack([n_rot, b_rot, t])
 
         for j, (aname, elem) in enumerate(zip(atom_names, elements)):
@@ -301,36 +370,61 @@ def build_helix_along_spline(spline_points):
     return arr
 
 
-def verify_tunnel_clearance(polypeptide, atoms_60s_coords):
-    """Verify all CA atoms have sufficient clearance from ribosome."""
-    tree = KDTree(atoms_60s_coords)
-    ca_coords = polypeptide.coord[polypeptide.atom_name == "CA"]
+def declash_structure(coords, ribosome_tree, ribo_coords, min_dist=3.0, max_iter=100):
+    """Push polypeptide atoms away from ribosome walls.
 
-    distances, _ = tree.query(ca_coords)
+    Iteratively displaces any atom closer than min_dist to the nearest
+    ribosome atom, pushing it radially outward until clearance is achieved.
+
+    Returns: modified coords (in-place).
+    """
+    print(f"  Geometric de-clash (min_dist={min_dist}A, max_iter={max_iter})...")
+    for iteration in range(max_iter):
+        dists, idxs = ribosome_tree.query(coords)
+        clashing = dists < min_dist
+        n_clash = clashing.sum()
+        if n_clash == 0:
+            print(f"    Converged at iteration {iteration}: no clashes")
+            break
+        push_dir = coords[clashing] - ribo_coords[idxs[clashing]]
+        norms = np.linalg.norm(push_dir, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-6)  # avoid division by zero
+        push_dir = push_dir / norms
+        deficit = min_dist - dists[clashing]
+        coords[clashing] += push_dir * deficit[:, None]
+        if iteration % 20 == 0:
+            print(f"    Iteration {iteration}: {n_clash} clashing atoms, "
+                  f"min dist={dists.min():.2f}A")
+    return coords
+
+
+def verify_clearance(label, coords, ribosome_tree):
+    """Verify and print clearance stats for ALL atoms against ribosome."""
+    distances, _ = ribosome_tree.query(coords)
     min_dist = distances.min()
     max_dist = distances.max()
     mean_dist = distances.mean()
+    n_below_25 = (distances < 2.5).sum()
+    n_below_30 = (distances < 3.0).sum()
+    pct_below_30 = 100.0 * n_below_30 / len(distances)
 
-    print(f"\n=== Tunnel clearance verification ===")
-    print(f"  CA atoms: {len(ca_coords)}")
-    print(f"  Min clearance: {min_dist:.1f}A")
-    print(f"  Max clearance: {max_dist:.1f}A")
-    print(f"  Mean clearance: {mean_dist:.1f}A")
-
-    n_close = (distances < 3.0).sum()
-    if n_close > 0:
-        print(f"  WARNING: {n_close} CA atoms closer than 3A to ribosome")
+    print(f"\n=== Clearance: {label} ({len(coords)} atoms) ===")
+    print(f"  Min: {min_dist:.2f}A  Max: {max_dist:.1f}A  Mean: {mean_dist:.1f}A")
+    print(f"  Atoms < 2.5A: {n_below_25}  Atoms < 3.0A: {n_below_30} ({pct_below_30:.1f}%)")
+    if n_below_25 == 0 and pct_below_30 < 5.0:
+        print(f"  PASS: zero atoms < 2.5A, {pct_below_30:.1f}% < 3.0A")
     else:
-        print(f"  OK: all CA atoms > 3A from ribosome")
-
+        print(f"  WARN: acceptance criteria not met")
     return distances
 
 
-def relax_polypeptide(polypeptide_pdb, atoms_60s, output_pdb):
-    """Constrained MD: freeze ribosome, relax polypeptide.
+def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
+    """3-stage constrained MD with wall repulsion.
 
-    Loads polypeptide + nearby 60S atoms (within 10A), freezes ribosome,
-    runs short annealing + minimize.
+    Phase 1: 50K steps at 400K (k_restraint=50, k_wall=1000)
+    Phase 2: 30K steps at 350K (k_restraint=20, k_wall=3000)
+    Phase 3: 20K steps at 310K (k_restraint=10, k_wall=5000)
+    Final energy minimization.
     """
     from openmm.app import (
         PDBFile as OmmPDB, ForceField, Modeller, Simulation,
@@ -339,7 +433,15 @@ def relax_polypeptide(polypeptide_pdb, atoms_60s, output_pdb):
     from openmm import LangevinMiddleIntegrator, CustomExternalForce
     from openmm.unit import kelvin, picosecond, picoseconds, kilojoule_per_mole, nanometer
 
-    print(f"\n=== Constrained MD relaxation ===")
+    PHASE1_STEPS = 50000
+    PHASE1_TEMP = 400
+    PHASE2_STEPS = 30000
+    PHASE2_TEMP = 350
+    PHASE3_STEPS = 20000
+    PHASE3_TEMP = 310
+    TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS + PHASE3_STEPS
+
+    print(f"\n=== 3-stage MD relaxation with wall repulsion ({TOTAL_STEPS} steps) ===")
 
     # Load polypeptide
     with open(polypeptide_pdb) as f:
@@ -356,18 +458,14 @@ def relax_polypeptide(polypeptide_pdb, atoms_60s, output_pdb):
     ff = ForceField("amber14-all.xml", "implicit/gbn2.xml")
     modeller = Modeller(pdb.topology, pdb.positions)
 
-    # Add terminal caps (ACE at N-term, NME at C-term) so OpenMM recognizes termini
-    # If that fails, add hydrogens with explicit variant handling
-    from openmm.app import NoCutoff as _NC
     try:
         modeller.addHydrogens(ff)
     except ValueError:
-        # Terminal residues need capping — re-add with explicit variants
         print("  Adding hydrogens with explicit terminal variants...")
         residues = list(modeller.topology.residues())
         variants = [None] * len(residues)
-        variants[0] = 'ACE'   # N-terminal cap
-        variants[-1] = 'NME'  # C-terminal cap
+        variants[0] = 'ACE'
+        variants[-1] = 'NME'
         try:
             modeller.addHydrogens(ff, variants=variants)
         except (ValueError, KeyError):
@@ -383,10 +481,9 @@ def relax_polypeptide(polypeptide_pdb, atoms_60s, output_pdb):
     system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff,
                              constraints=HBonds)
 
-    # Add position restraints to keep polypeptide near initial positions
-    # (gentle: 10 kJ/mol/nm^2) to prevent it from flying apart
-    restraint = CustomExternalForce("0.5*k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
-    restraint.addGlobalParameter("k", 10.0)
+    # Position restraints (ramped via global parameter)
+    restraint = CustomExternalForce("0.5*k_restraint*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    restraint.addGlobalParameter("k_restraint", 50.0)
     restraint.addPerParticleParameter("x0")
     restraint.addPerParticleParameter("y0")
     restraint.addPerParticleParameter("z0")
@@ -397,23 +494,68 @@ def relax_polypeptide(polypeptide_pdb, atoms_60s, output_pdb):
         restraint.addParticle(i, [pos[0], pos[1], pos[2]])
     system.addForce(restraint)
 
+    # Wall repulsion force: penalizes atoms closer than 3 A to nearest ribosome atom.
+    # Pre-compute nearest ribosome wall point per peptide atom.
+    ribo_tree = KDTree(ribo_coords)
+    pep_coords_nm = np.array([positions[i].value_in_unit(nanometer)
+                               for i in range(n_peptide_atoms)])
+    pep_coords_A = pep_coords_nm * 10.0  # nm -> Angstroms for KDTree query
+
+    _, nearest_idx = ribo_tree.query(pep_coords_A)
+    nearest_ribo_A = ribo_coords[nearest_idx]  # in Angstroms
+    nearest_ribo_nm = nearest_ribo_A * 0.1  # -> nm
+
+    # Wall force: quadratic repulsion from pre-computed wall points
+    # r_min = 0.3 nm (3 A), distance measured from wall point
+    wall_force = CustomExternalForce(
+        "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
+        "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
+        "r_min=0.3"
+    )
+    wall_force.addGlobalParameter("k_wall", 1000.0)
+    wall_force.addPerParticleParameter("wx")
+    wall_force.addPerParticleParameter("wy")
+    wall_force.addPerParticleParameter("wz")
+
+    for i in range(n_peptide_atoms):
+        wall_force.addParticle(i, [
+            nearest_ribo_nm[i, 0], nearest_ribo_nm[i, 1], nearest_ribo_nm[i, 2]
+        ])
+    system.addForce(wall_force)
+
     integrator = LangevinMiddleIntegrator(
-        300 * kelvin, 1 / picosecond, 0.002 * picoseconds)
+        PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
     sim = Simulation(modeller.topology, system, integrator)
     sim.context.setPositions(modeller.positions)
 
-    # Minimize
+    # Initial minimize
     print("  Minimizing...")
     sim.minimizeEnergy(maxIterations=0)
 
-    # Short MD
-    md_steps = 5000
-    print(f"  Running {md_steps} MD steps at 300K...")
+    # Phase 1: 400K, k_restraint=50, k_wall=1000
+    print(f"  Phase 1: {PHASE1_STEPS} steps at {PHASE1_TEMP}K "
+          f"(k_restraint=50, k_wall=1000)...")
     sim.reporters.append(
-        StateDataReporter(sys.stdout, max(md_steps // 5, 1), step=True,
+        StateDataReporter(sys.stdout, max(PHASE1_STEPS // 5, 1), step=True,
                           potentialEnergy=True, temperature=True, speed=True)
     )
-    sim.step(md_steps)
+    sim.step(PHASE1_STEPS)
+
+    # Phase 2: 350K, k_restraint=20, k_wall=3000
+    print(f"  Phase 2: {PHASE2_STEPS} steps at {PHASE2_TEMP}K "
+          f"(k_restraint=20, k_wall=3000)...")
+    integrator.setTemperature(PHASE2_TEMP * kelvin)
+    sim.context.setParameter("k_restraint", 20.0)
+    sim.context.setParameter("k_wall", 3000.0)
+    sim.step(PHASE2_STEPS)
+
+    # Phase 3: 310K, k_restraint=10, k_wall=5000
+    print(f"  Phase 3: {PHASE3_STEPS} steps at {PHASE3_TEMP}K "
+          f"(k_restraint=10, k_wall=5000)...")
+    integrator.setTemperature(PHASE3_TEMP * kelvin)
+    sim.context.setParameter("k_restraint", 10.0)
+    sim.context.setParameter("k_wall", 5000.0)
+    sim.step(PHASE3_STEPS)
 
     # Final minimize
     print("  Final minimization...")
@@ -431,17 +573,17 @@ def main():
 
     # Load ribosome
     atoms_60s, c4, full_arr = load_ribosome()
+    ribo_coords = atoms_60s.coord
+    ribo_tree = KDTree(ribo_coords)
 
     # Find PTC position
     ptc_pos = find_ptc_position(c4)
 
     # Get the initial direction from C4 backbone
-    # Direction from first CA to last CA points into the tunnel
     ca_mask = c4.atom_name == "CA"
     ca_coords = c4.coord[ca_mask]
     ca_res = c4.res_id[ca_mask]
     if len(ca_coords) >= 2:
-        # Direction from last to first residue = into tunnel
         sort_idx = np.argsort(ca_res)
         initial_dir = ca_coords[sort_idx[0]] - ca_coords[sort_idx[-1]]
         initial_dir = initial_dir / np.linalg.norm(initial_dir)
@@ -450,14 +592,21 @@ def main():
     else:
         initial_dir = None
 
-    # Trace tunnel
-    centerline = trace_tunnel(atoms_60s.coord, ptc_pos, initial_dir)
+    # Trace tunnel (now returns exit arc length)
+    centerline, exit_arc_length = trace_tunnel(ribo_coords, ptc_pos, initial_dir)
 
-    # Smooth centerline and resample
-    spline_points, spline_fn, total_len = smooth_centerline(centerline)
+    # Smooth centerline with variable-rate resampling
+    spline_points, tunnel_exit_residue, spline_fn, total_len = smooth_centerline(
+        centerline, exit_arc_length)
 
-    # Build polypeptide along spline
-    polypeptide = build_helix_along_spline(spline_points)
+    # Build polypeptide with geometry switching
+    polypeptide = build_backbone_along_spline(spline_points, tunnel_exit_residue)
+
+    # Geometric de-clash against ribosome walls
+    verify_clearance("before de-clash", polypeptide.coord, ribo_tree)
+    polypeptide.coord = declash_structure(
+        polypeptide.coord, ribo_tree, ribo_coords, min_dist=3.0)
+    verify_clearance("after de-clash", polypeptide.coord, ribo_tree)
 
     # Write raw PDB
     raw_pdb = "tunnel_polypeptide_raw.pdb"
@@ -467,12 +616,9 @@ def main():
     print(f"  Raw polypeptide: {raw_pdb} ({len(polypeptide)} atoms, "
           f"{len(np.unique(polypeptide.res_id))} residues)")
 
-    # Verify clearance
-    verify_tunnel_clearance(polypeptide, atoms_60s.coord)
-
-    # Relax with constrained MD (fallback to raw if it fails)
+    # Relax with 3-stage MD + wall repulsion (fallback to raw if it fails)
     try:
-        relax_polypeptide(raw_pdb, atoms_60s, OUTPUT)
+        relax_polypeptide(raw_pdb, ribo_coords, OUTPUT)
     except Exception as e:
         print(f"  WARNING: MD relaxation failed ({e}), using raw structure")
         import shutil
@@ -483,6 +629,8 @@ def main():
     final_arr = final_pdb.get_structure()
     if isinstance(final_arr, AtomArrayStack):
         final_arr = final_arr[0]
+
+    verify_clearance("final structure", final_arr.coord, ribo_tree)
 
     # Compute extent
     ca_coords = final_arr.coord[final_arr.atom_name == "CA"]
