@@ -113,6 +113,7 @@ def main():
 
     canvas = mn.Canvas(mn.scene.Cycles(samples=SAMPLES), resolution=RES)
     scene = bpy.context.scene
+    scene.cycles.device = 'CPU'  # avoid GPU hang on macOS
     scene.render.film_transparent = False
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
     scene.cycles.max_bounces = 12

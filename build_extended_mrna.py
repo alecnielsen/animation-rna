@@ -170,7 +170,6 @@ def tile_mrna():
     # Create N_COPIES offset copies, centered so i=CENTER_INDEX is at origin
     # Randomize sequence per tile and add perturbation to seed different pathways
     rng = np.random.default_rng(42)
-    nuc_choices = ["A", "C", "G", "U"]
     copies = []
     for i in range(N_COPIES):
         tile = a4.copy()
@@ -179,11 +178,10 @@ def tile_mrna():
         tile.coord += rng.normal(0, 0.5, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
-        # Randomize nucleotide sequence per tile
-        tile_unique_res = np.unique(tile.res_id)
-        for res in tile_unique_res:
-            new_name = rng.choice(nuc_choices)
-            tile.res_name[tile.res_id == res] = new_name
+        # Note: nucleotide names are NOT randomized — OpenMM template matching
+        # requires atom names to match residue names (U has O4, C has N4, etc).
+        # The 0.5A perturbation + high-T annealing is sufficient for symmetry
+        # breaking across tiles.
         copies.append(tile)
 
     extended = concatenate(copies)
@@ -251,7 +249,7 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
     mRNA atoms from clipping through ribosome walls.
     """
     from openmm.app import (
-        PDBFile as OmmPDB, Simulation, NoCutoff, HBonds,
+        PDBFile as OmmPDB, Simulation, NoCutoff, CutoffNonPeriodic, HBonds,
         StateDataReporter,
     )
     from openmm import LangevinMiddleIntegrator, CustomExternalForce
@@ -271,7 +269,8 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
 
     ff, modeller = _load_and_prepare(input_pdb)
 
-    system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
+    system = ff.createSystem(modeller.topology, nonbondedMethod=CutoffNonPeriodic,
+                             nonbondedCutoff=1.0 * nanometer, constraints=HBonds)
 
     # Wall repulsion force (if ribosome context provided)
     if ribo_coords is not None:
@@ -306,16 +305,19 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
         system.addForce(wall_force)
 
     # Phase 1: 400K high-temperature conformational sampling
+    # Force CPU platform (OpenCL can hang on Apple Silicon)
+    from openmm import Platform
+    platform = Platform.getPlatformByName('CPU')
     integrator = LangevinMiddleIntegrator(
         PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
-    sim = Simulation(modeller.topology, system, integrator)
+    sim = Simulation(modeller.topology, system, integrator, platform)
     sim.context.setPositions(modeller.positions)
 
     # Step 1: Initial minimization
     state0 = sim.context.getState(getEnergy=True)
     print(f"  Initial energy: {state0.getPotentialEnergy()}")
     print("  Minimizing...")
-    sim.minimizeEnergy(maxIterations=0)
+    sim.minimizeEnergy(maxIterations=1000)
     state1 = sim.context.getState(getEnergy=True)
     print(f"  Post-minimize energy: {state1.getPotentialEnergy()}")
 
@@ -339,7 +341,7 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
 
     # Step 5: Final minimization (quench)
     print("  Final minimization (quench)...")
-    sim.minimizeEnergy(maxIterations=0)
+    sim.minimizeEnergy(maxIterations=1000)
     state_final = sim.context.getState(getEnergy=True, getPositions=True)
     print(f"  Final energy: {state_final.getPotentialEnergy()}")
 
@@ -374,21 +376,14 @@ def main():
     extended, n_res, full_arr = tile_mrna()
     verify(extended, n_res)
 
-    # Load nearby ribosome atoms for de-clash and wall repulsion
+    # Load nearby ribosome atoms for wall repulsion during MD
     nearby_ribo = get_nearby_ribosome_atoms(extended.coord, full_arr, cutoff=15.0)
     ribo_tree = KDTree(nearby_ribo)
 
-    # Geometric de-clash after tiling
-    verify_clearance("before de-clash", extended.coord, ribo_tree)
-    extended.coord = declash_structure(
-        extended.coord, ribo_tree, nearby_ribo, min_dist=3.0)
-    verify_clearance("after de-clash", extended.coord, ribo_tree)
-
-    # Re-write PDB after de-clash
-    pdb = PDBFile()
-    pdb.set_structure(extended)
-    pdb.write(OUTPUT)
-    print(f"  Re-written after de-clash: {OUTPUT}")
+    # Report pre-MD clearance (no geometric de-clash — it creates atom
+    # coincidences that break OpenMM addHydrogens; the wall repulsion
+    # force during MD handles clash resolution properly)
+    verify_clearance("before MD", extended.coord, ribo_tree)
 
     if SKIP_MINIMIZE:
         print("\n  Skipping minimization (--skip-minimize)")

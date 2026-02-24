@@ -525,7 +525,10 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
 
     integrator = LangevinMiddleIntegrator(
         PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
-    sim = Simulation(modeller.topology, system, integrator)
+    # Force CPU platform (OpenCL can hang on Apple Silicon)
+    from openmm import Platform
+    platform = Platform.getPlatformByName('CPU')
+    sim = Simulation(modeller.topology, system, integrator, platform)
     sim.context.setPositions(modeller.positions)
 
     # Initial minimize
