@@ -8,10 +8,11 @@ All molecules rendered as atomic surface meshes (StyleSurface) for a unified, ph
 
 Single Cycles render pass. All objects render simultaneously with correct depth.
 
-Ribosome translucency is achieved via a backface-culling shader:
-- Front-facing faces: 35% opacity (MixShader: 65% Transparent + 35% Diffuse)
-- Back-facing faces: fully transparent (culled in shader)
-- This prevents opacity accumulation on dense surface meshes
+Ribosome translucency is achieved via Principled BSDF Alpha with HASHED blend mode:
+- Alpha = 0.06 on Principled BSDF (stochastic transparency)
+- HASHED blend mode provides real translucency without opacity accumulation
+- Higher sample counts (64+) smooth out the stochastic noise
+- Previous approaches tested and rejected: mix-shader (opacity accumulates over ~50 overlapping layers), Transmission (dark/murky), Fresnel alpha (wireframe look), Glass BSDF (too dark)
 
 No compositing step needed — `animate.py` outputs final frames directly.
 
@@ -19,7 +20,7 @@ No compositing step needed — `animate.py` outputs final frames directly.
 
 - **Representation:** Surface mesh (StyleSurface)
 - **Color:** Uniform pale blue-gray, flat diffuse (roughness=1.0)
-- **Translucency:** ~35% opacity via shader (backface culling + front-face transparency)
+- **Translucency:** 6% alpha via Principled BSDF (HASHED blend mode, stochastic transparency)
 - **Jitter:** Visible rigid-body motion (0.15 BU translation, 5.0deg rotation) via integer-harmonic sum-of-sines
 - **No per-chain coloring** — uniform across all subunits
 

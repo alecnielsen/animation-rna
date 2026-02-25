@@ -206,13 +206,12 @@ def main():
     cam = scene.camera
     print(f"  Camera (auto): loc={tuple(cam.location)}, lens={cam.data.lens}")
 
-    # Zoom in by scaling camera distance to 70% (ribosome fills ~70% of frame,
-    # molecules extend off-screen)
+    # Zoom in slightly (85% of auto-frame distance) so ribosome fills more
+    # of the frame while polypeptide and mRNA tails remain visible
     cam_loc = np.array(cam.location)
-    # Compute direction from scene origin to camera
     cam_target = np.zeros(3)  # approximate scene center
     cam_dir = cam_loc - cam_target
-    cam.location = tuple(cam_target + cam_dir * 0.7)
+    cam.location = tuple(cam_target + cam_dir * 0.85)
     print(f"  Camera (zoomed): loc={tuple(cam.location)}, lens={cam.data.lens}")
 
     bpy.context.view_layer.update()

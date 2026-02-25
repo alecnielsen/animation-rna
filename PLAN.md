@@ -22,7 +22,7 @@ Human 80S ribosome (PDB 6Y0G) with extended mRNA, tRNAs cycling, and visible pol
 
 Single-pass Cycles rendering with shader-based transparency (see STYLE.md):
 - All molecules render simultaneously with correct depth occlusion
-- Ribosome: translucent via backface-culling shader (~35% opacity)
+- Ribosome: translucent via Principled BSDF Alpha=0.06 (HASHED blend mode)
 - Internal molecules: opaque StyleSurface with emission
 - No compositing step needed
 
@@ -155,7 +155,7 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Tunnel-threaded polypeptide (void-tracing through 60S)
 - [x] PCA modes for tRNA structural deformation
 
-### v4 (current)
+### v4 (complete)
 - [x] All molecules use StyleSurface (unified realistic look)
 - [x] Single-pass rendering with shader transparency (proper depth occlusion)
 - [x] Per-residue deformation (replaces broken per-atom jitter on surface meshes)
@@ -164,6 +164,17 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Extended tRNA tumbling windows + 5% residual tumble when bound
 - [x] Enhanced mRNA MD: 500K steps, 3-stage anneal, sequence randomization
 - [x] Eliminate composite.py from pipeline (single-pass handles occlusion)
+
+### v5 (current)
+- [x] Ribosome translucency: switch to Principled BSDF Alpha=0.06 (HASHED blend mode)
+- [x] Tested and rejected alternative translucency approaches (mix-shader, Transmission, Fresnel, Glass BSDF)
+- [x] Tunnel-threaded polypeptide: C4 path + forward-biased scoring, extended 100 steps (200 A) past exit
+- [x] Single-frame renderer (`render_single_frame.py`) for validating molecule placements
+- [x] Camera zoom tuned to 85% auto-frame distance
+- [ ] Per-residue jitter + PCA vertex deformation (disabled — tears StyleSurface meshes at residue boundaries)
+- [ ] mRNA codon translocation: logic exists, not yet verified in rendered output
+- [ ] Polypeptide progressive reveal: logic exists, not yet verified in rendered output
+- [ ] Seamless loop verification (integer-harmonic math correct, visual verification pending)
 - [ ] Debug render validation
 - [ ] Full production render
 
