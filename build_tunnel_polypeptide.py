@@ -17,15 +17,17 @@ checks span and wall clearance at the end.
 
 Algorithm:
   1. Build KDTree of all 60S ribosome atoms
-  2. From C4 position (PTC), trace through void space by picking points
-     with maximum clearance from ribosome walls
-  3. Extend past exit with random-walk curvature (400 steps, 800 A)
-  4. Smooth centerline with variable-rate resampling (extended in tunnel,
+  2. Follow chain C4 backbone from 6Y0G as the tunnel centerline
+     (crystallographic ground truth — no greedy tracing artifacts)
+  3. If C4 doesn't reach exit, continue with greedy void-space tracer
+     (high directional momentum 0.9 to avoid side cavities)
+  4. Extend past exit with random-walk curvature (400 steps, 800 A)
+  5. Smooth centerline with variable-rate resampling (extended in tunnel,
      helix after exit)
-  5. Build polyalanine backbone along spline with geometry switching
-  6. Geometric de-clash against ribosome walls
-  7. 3-stage constrained MD with wall repulsion (100K steps total)
-  8. Channel threading verification (PASS/FAIL)
+  6. Build polyalanine backbone along spline with geometry switching
+  7. Geometric de-clash against ribosome walls
+  8. 3-stage constrained MD with wall repulsion (100K steps total)
+  9. Channel threading verification (PASS/FAIL)
 
 Output: tunnel_polypeptide.pdb
 
@@ -135,11 +137,23 @@ def find_ptc_position(c4):
     return ptc
 
 
-def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
+def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
+                 initial_direction=None):
     """Trace the exit tunnel through the 60S subunit.
 
-    Starting from PTC, find the path through the tunnel by following
-    maximum-clearance points at each step.
+    Uses the crystallographic C4 nascent chain backbone (if provided) as the
+    ground-truth tunnel path. This avoids greedy void-space tracing, which
+    can wander into side cavities and produce biologically inaccurate kinks.
+
+    Falls back to greedy maximum-clearance tracing only if C4 doesn't reach
+    the tunnel exit. After exit, extends with a curving random walk.
+
+    Args:
+        atoms_60s_coords: (N, 3) array of 60S ribosome atom coordinates
+        ptc_pos: (3,) PTC position (C-terminal end of C4)
+        c4_ca_coords: (M, 3) C4 CA coordinates sorted PTC → exit (descending
+            res_id). If None, falls back to greedy tracing entirely.
+        initial_direction: (3,) initial tracing direction (PTC → exit)
 
     Returns: (centerline, exit_arc_length)
         centerline: (N, 3) array of tunnel centerline points
@@ -156,91 +170,140 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
     centerline = [ptc_pos.copy()]
     current_pos = ptc_pos.copy()
     current_dir = initial_direction.copy()
+    exited = False
 
-    max_steps = 200
-    n_candidates = 36  # sample points on disc
-    exit_arc_length = None
+    # --- Phase 1: Follow crystallographic C4 backbone (ground truth) ---
+    if c4_ca_coords is not None and len(c4_ca_coords) >= 2:
+        print(f"  Phase 1: Following C4 crystallographic path "
+              f"({len(c4_ca_coords)} CAs, PTC → exit)...")
+        for i in range(1, len(c4_ca_coords)):
+            pt = c4_ca_coords[i]
+            centerline.append(pt.copy())
+            dist, _ = tree.query(pt)
 
-    print(f"  Tracing tunnel (step={TRACE_STEP}A, "
-          f"min_clearance={MIN_CLEARANCE}A, exit={EXIT_THRESHOLD}A)...")
+            if i % 5 == 0 or i == len(c4_ca_coords) - 1:
+                print(f"    C4 CA {i}/{len(c4_ca_coords)-1}: clearance={dist:.1f}A, "
+                      f"pos=({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f})")
 
-    for step in range(max_steps):
-        # Sample candidate points on a disc perpendicular to current direction
-        # at distance TRACE_STEP ahead
-        ahead = current_pos + current_dir * TRACE_STEP
+            if dist > EXIT_THRESHOLD:
+                print(f"    C4 CA {i}: clearance {dist:.1f}A > {EXIT_THRESHOLD}A "
+                      f"— tunnel exit reached via C4 path")
+                exited = True
+                break
 
-        # Build orthonormal basis for the disc
-        if abs(current_dir[0]) < 0.9:
-            u = np.cross(current_dir, np.array([1, 0, 0]))
-        else:
-            u = np.cross(current_dir, np.array([0, 1, 0]))
-        u = u / np.linalg.norm(u)
-        v = np.cross(current_dir, u)
+        # Update current position/direction from end of C4 path
+        current_pos = centerline[-1].copy()
+        if len(centerline) >= 2:
+            current_dir = centerline[-1] - centerline[-2]
+            current_dir = current_dir / np.linalg.norm(current_dir)
 
-        best_pos = None
-        best_clearance = -1
+        if not exited:
+            print(f"  C4 path ended inside tunnel after {len(c4_ca_coords)} CAs, "
+                  f"continuing with greedy tracer...")
 
-        # Sample on disc with varying radii (0 to MIN_CLEARANCE)
-        for i in range(n_candidates):
-            angle = 2 * np.pi * i / n_candidates
-            for radius_frac in [0.0, 0.3, 0.6, 1.0]:
-                r = MIN_CLEARANCE * radius_frac
-                candidate = ahead + r * (np.cos(angle) * u + np.sin(angle) * v)
-                dist, _ = tree.query(candidate)
-                if dist > best_clearance:
-                    best_clearance = dist
-                    best_pos = candidate
+    # --- Phase 2: Greedy void-space tracer (only if C4 didn't reach exit) ---
+    # Uses forward-biased scoring: score = clearance + FORWARD_BIAS * alignment
+    # This prevents the tracer from being lured into side cavities that happen
+    # to be wider but are off the tunnel axis.
+    FORWARD_BIAS = 3.0  # weight for forward alignment vs clearance
+    if not exited:
+        max_steps = 200
+        n_candidates = 36
+        print(f"  Phase 2: Greedy void-space tracer (step={TRACE_STEP}A, "
+              f"forward_bias={FORWARD_BIAS}, exit={EXIT_THRESHOLD}A)...")
 
-        if best_clearance < MIN_CLEARANCE * 0.5:
-            print(f"    Step {step}: clearance {best_clearance:.1f}A < threshold, stopping")
-            break
+        for step in range(max_steps):
+            ahead = current_pos + current_dir * TRACE_STEP
 
-        if best_clearance > EXIT_THRESHOLD:
-            # Exited the tunnel — record exit point and extend
-            print(f"    Step {step}: clearance {best_clearance:.1f}A > {EXIT_THRESHOLD}A, "
-                  f"tunnel exit reached")
+            if abs(current_dir[0]) < 0.9:
+                u = np.cross(current_dir, np.array([1, 0, 0]))
+            else:
+                u = np.cross(current_dir, np.array([0, 1, 0]))
+            u = u / np.linalg.norm(u)
+            v = np.cross(current_dir, u)
+
+            best_pos = None
+            best_score = -1
+            best_clearance = -1
+
+            for i in range(n_candidates):
+                angle = 2 * np.pi * i / n_candidates
+                for radius_frac in [0.0, 0.3, 0.6, 1.0]:
+                    r = MIN_CLEARANCE * radius_frac
+                    candidate = ahead + r * (np.cos(angle) * u + np.sin(angle) * v)
+                    dist, _ = tree.query(candidate)
+                    if dist < MIN_CLEARANCE * 0.5:
+                        continue  # skip candidates too close to walls
+                    # Forward alignment: how much does this candidate continue
+                    # in the current direction? (1.0 = perfectly forward)
+                    disp = candidate - current_pos
+                    disp_norm = np.linalg.norm(disp)
+                    if disp_norm > 0:
+                        alignment = np.dot(disp / disp_norm, current_dir)
+                    else:
+                        alignment = 0.0
+                    score = dist + FORWARD_BIAS * alignment * dist
+                    if score > best_score:
+                        best_score = score
+                        best_clearance = dist
+                        best_pos = candidate
+
+            if best_pos is None or best_clearance < MIN_CLEARANCE * 0.5:
+                print(f"    Step {step}: no viable candidate, stopping")
+                break
+
+            if best_clearance > EXIT_THRESHOLD:
+                print(f"    Step {step}: clearance {best_clearance:.1f}A "
+                      f"> {EXIT_THRESHOLD}A, tunnel exit reached")
+                centerline.append(best_pos)
+                current_pos = best_pos
+                new_dir = best_pos - centerline[-2]
+                current_dir = new_dir / np.linalg.norm(new_dir)
+                exited = True
+                break
+
             centerline.append(best_pos)
+            new_dir = best_pos - current_pos
+            new_dir = new_dir / np.linalg.norm(new_dir)
+            # High momentum (0.9) to keep direction and avoid side cavities
+            current_dir = 0.9 * current_dir + 0.1 * new_dir
+            current_dir = current_dir / np.linalg.norm(current_dir)
+            current_pos = best_pos
 
-            # Compute arc length up to exit point
-            cl_arr = np.array(centerline)
-            exit_arc_length = sum(np.linalg.norm(cl_arr[i+1] - cl_arr[i])
-                                  for i in range(len(cl_arr) - 1))
+            if step % 20 == 0:
+                print(f"    Step {step}: clearance={best_clearance:.1f}A, "
+                      f"pos=({current_pos[0]:.1f}, {current_pos[1]:.1f}, "
+                      f"{current_pos[2]:.1f})")
 
-            # Extend past tunnel exit with curving random walk
-            rng = np.random.default_rng(42)
-            ext_pos = best_pos.copy()
-            ext_dir = current_dir.copy()
-            for ext in range(1, N_EXTENSION_STEPS + 1):
-                # Perturb direction by small random angular deflection
-                # Build perpendicular basis for the current direction
-                if abs(ext_dir[0]) < 0.9:
-                    perp1 = np.cross(ext_dir, np.array([1, 0, 0]))
-                else:
-                    perp1 = np.cross(ext_dir, np.array([0, 1, 0]))
-                perp1 = perp1 / np.linalg.norm(perp1)
-                perp2 = np.cross(ext_dir, perp1)
-                # Random angular perturbation
-                dtheta = rng.normal(0, EXTENSION_ANGULAR_STD)
-                dphi = rng.uniform(0, 2 * np.pi)
-                ext_dir = (ext_dir * np.cos(dtheta)
-                           + perp1 * np.sin(dtheta) * np.cos(dphi)
-                           + perp2 * np.sin(dtheta) * np.sin(dphi))
-                ext_dir = ext_dir / np.linalg.norm(ext_dir)
-                ext_pos = ext_pos + ext_dir * TRACE_STEP
-                centerline.append(ext_pos.copy())
-            break
+    # Compute exit arc length
+    exit_arc_length = None
+    if exited:
+        cl_arr = np.array(centerline)
+        exit_arc_length = sum(np.linalg.norm(cl_arr[i+1] - cl_arr[i])
+                              for i in range(len(cl_arr) - 1))
 
-        centerline.append(best_pos)
-        new_dir = best_pos - current_pos
-        new_dir = new_dir / np.linalg.norm(new_dir)
-        # Smooth direction update (momentum)
-        current_dir = 0.7 * current_dir + 0.3 * new_dir
-        current_dir = current_dir / np.linalg.norm(current_dir)
-        current_pos = best_pos
-
-        if step % 20 == 0:
-            print(f"    Step {step}: clearance={best_clearance:.1f}A, "
-                  f"pos=({current_pos[0]:.1f}, {current_pos[1]:.1f}, {current_pos[2]:.1f})")
+    # --- Phase 3: Random-walk extension past tunnel exit ---
+    if exited:
+        print(f"  Phase 3: Random-walk extension ({N_EXTENSION_STEPS} steps, "
+              f"{N_EXTENSION_STEPS * TRACE_STEP:.0f}A)...")
+        rng = np.random.default_rng(42)
+        ext_pos = current_pos.copy()
+        ext_dir = current_dir.copy()
+        for ext in range(1, N_EXTENSION_STEPS + 1):
+            if abs(ext_dir[0]) < 0.9:
+                perp1 = np.cross(ext_dir, np.array([1, 0, 0]))
+            else:
+                perp1 = np.cross(ext_dir, np.array([0, 1, 0]))
+            perp1 = perp1 / np.linalg.norm(perp1)
+            perp2 = np.cross(ext_dir, perp1)
+            dtheta = rng.normal(0, EXTENSION_ANGULAR_STD)
+            dphi = rng.uniform(0, 2 * np.pi)
+            ext_dir = (ext_dir * np.cos(dtheta)
+                       + perp1 * np.sin(dtheta) * np.cos(dphi)
+                       + perp2 * np.sin(dtheta) * np.sin(dphi))
+            ext_dir = ext_dir / np.linalg.norm(ext_dir)
+            ext_pos = ext_pos + ext_dir * TRACE_STEP
+            centerline.append(ext_pos.copy())
 
     centerline = np.array(centerline)
     total_length = sum(np.linalg.norm(centerline[i+1] - centerline[i])
@@ -665,21 +728,27 @@ def main():
     # Find PTC position
     ptc_pos = find_ptc_position(c4)
 
-    # Get the initial direction from C4 backbone
+    # Get C4 CA coordinates sorted PTC → exit (descending res_id)
+    # C4 is the crystallographic nascent chain — its backbone IS the tunnel path
     ca_mask = c4.atom_name == "CA"
     ca_coords = c4.coord[ca_mask]
     ca_res = c4.res_id[ca_mask]
     if len(ca_coords) >= 2:
-        sort_idx = np.argsort(ca_res)
-        initial_dir = ca_coords[sort_idx[0]] - ca_coords[sort_idx[-1]]
+        sort_idx_desc = np.argsort(ca_res)[::-1]  # PTC (highest res_id) first
+        c4_cas = ca_coords[sort_idx_desc]
+        # Initial direction: PTC → N-terminus (toward exit)
+        initial_dir = c4_cas[-1] - c4_cas[0]
         initial_dir = initial_dir / np.linalg.norm(initial_dir)
+        print(f"  C4 chain: {len(c4_cas)} CAs, PTC → exit")
         print(f"  Initial direction from C4: ({initial_dir[0]:.2f}, "
               f"{initial_dir[1]:.2f}, {initial_dir[2]:.2f})")
     else:
+        c4_cas = None
         initial_dir = None
 
-    # Trace tunnel (now returns exit arc length)
-    centerline, exit_arc_length = trace_tunnel(ribo_coords, ptc_pos, initial_dir)
+    # Trace tunnel using C4 crystallographic path, then extend
+    centerline, exit_arc_length = trace_tunnel(
+        ribo_coords, ptc_pos, c4_ca_coords=c4_cas, initial_direction=initial_dir)
 
     # Smooth centerline with variable-rate resampling
     spline_points, tunnel_exit_residue, spline_fn, total_len = smooth_centerline(
