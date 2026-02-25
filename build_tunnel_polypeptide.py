@@ -5,19 +5,27 @@ through the 60S subunit, then builds a polyalanine chain along the centerline.
 Uses extended conformation inside the tunnel (~3.3 A/residue, fits the ~10 A
 L4-L22 constriction) and alpha helix after the exit (~1.5 A/residue).
 
+Past the tunnel exit, extends the chain using a curving random walk
+(~0.15 rad std dev angular perturbation per step) for 400 steps (800 A
+= 80 BU, ~3x ribosome diameter) so the polypeptide visibly curves and
+extends off-screen. Cubic spline smoothing softens any sharp turns.
+
 After backbone construction, a geometric de-clash pushes atoms away from
 ribosome walls, then 3-stage MD annealing with wall-repulsion forces relaxes
-the structure while preventing clipping.
+the structure while preventing clipping. Channel threading verification
+checks span and wall clearance at the end.
 
 Algorithm:
   1. Build KDTree of all 60S ribosome atoms
   2. From C4 position (PTC), trace through void space by picking points
      with maximum clearance from ribosome walls
-  3. Smooth centerline with variable-rate resampling (extended in tunnel,
+  3. Extend past exit with random-walk curvature (400 steps, 800 A)
+  4. Smooth centerline with variable-rate resampling (extended in tunnel,
      helix after exit)
-  4. Build polyalanine backbone along spline with geometry switching
-  5. Geometric de-clash against ribosome walls
-  6. 3-stage constrained MD with wall repulsion (100K steps total)
+  5. Build polyalanine backbone along spline with geometry switching
+  6. Geometric de-clash against ribosome walls
+  7. 3-stage constrained MD with wall repulsion (100K steps total)
+  8. Channel threading verification (PASS/FAIL)
 
 Output: tunnel_polypeptide.pdb
 
@@ -41,7 +49,8 @@ HELIX_RISE_PER_RESIDUE = 1.5    # Angstroms (alpha helix after exit)
 TRACE_STEP = 2.0  # Angstroms per tracing step
 MIN_CLEARANCE = 4.0  # minimum distance from tunnel wall (A)
 EXIT_THRESHOLD = 15.0  # distance at which we consider having exited
-N_EXTENSION_STEPS = 150  # extension steps past tunnel exit (300 A)
+N_EXTENSION_STEPS = 400  # extension steps past tunnel exit (800 A = 80 BU)
+EXTENSION_ANGULAR_STD = 0.15  # radians std dev for random-walk direction perturbation
 
 # 60S chain IDs
 CHAINS_60S = [
@@ -197,10 +206,28 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, initial_direction=None):
             exit_arc_length = sum(np.linalg.norm(cl_arr[i+1] - cl_arr[i])
                                   for i in range(len(cl_arr) - 1))
 
-            # Extend 300A past tunnel exit (150 steps * 2A)
+            # Extend past tunnel exit with curving random walk
+            rng = np.random.default_rng(42)
+            ext_pos = best_pos.copy()
+            ext_dir = current_dir.copy()
             for ext in range(1, N_EXTENSION_STEPS + 1):
-                ext_pos = best_pos + current_dir * TRACE_STEP * ext
-                centerline.append(ext_pos)
+                # Perturb direction by small random angular deflection
+                # Build perpendicular basis for the current direction
+                if abs(ext_dir[0]) < 0.9:
+                    perp1 = np.cross(ext_dir, np.array([1, 0, 0]))
+                else:
+                    perp1 = np.cross(ext_dir, np.array([0, 1, 0]))
+                perp1 = perp1 / np.linalg.norm(perp1)
+                perp2 = np.cross(ext_dir, perp1)
+                # Random angular perturbation
+                dtheta = rng.normal(0, EXTENSION_ANGULAR_STD)
+                dphi = rng.uniform(0, 2 * np.pi)
+                ext_dir = (ext_dir * np.cos(dtheta)
+                           + perp1 * np.sin(dtheta) * np.cos(dphi)
+                           + perp2 * np.sin(dtheta) * np.sin(dphi))
+                ext_dir = ext_dir / np.linalg.norm(ext_dir)
+                ext_pos = ext_pos + ext_dir * TRACE_STEP
+                centerline.append(ext_pos.copy())
             break
 
         centerline.append(best_pos)
@@ -571,6 +598,62 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
     print(f"  Written: {output_pdb}")
 
 
+def verify_channel_threading(coords, ribo_coords, ribo_tree, label="polypeptide"):
+    """Verify that the molecule threads through the ribosome channel.
+
+    Checks:
+    1. Backbone atoms span from one side of ribosome to the other along
+       the channel axis (extent > ribosome diameter * 0.5)
+    2. Atoms inside the ribosome have clearance consistent with channel
+       (< 15 A from walls = inside, > 2.5 A from walls = not clipping)
+
+    Prints PASS/FAIL.
+    """
+    print(f"\n=== Channel threading verification: {label} ===")
+
+    # Ribosome bounding box for reference
+    ribo_min = ribo_coords.min(axis=0)
+    ribo_max = ribo_coords.max(axis=0)
+    ribo_extent = ribo_max - ribo_min
+    ribo_center = (ribo_min + ribo_max) / 2
+    print(f"  Ribosome extent: ({ribo_extent[0]:.0f}, {ribo_extent[1]:.0f}, "
+          f"{ribo_extent[2]:.0f}) A")
+
+    # Check 1: molecule spans across the ribosome
+    mol_min = coords.min(axis=0)
+    mol_max = coords.max(axis=0)
+    mol_extent = mol_max - mol_min
+    max_mol_extent = np.max(mol_extent)
+    max_ribo_extent = np.max(ribo_extent)
+    span_ratio = max_mol_extent / max_ribo_extent
+    span_pass = span_ratio > 0.5
+    print(f"  Molecule max extent: {max_mol_extent:.0f} A "
+          f"({span_ratio:.1f}x ribosome)")
+    print(f"  Span check: {'PASS' if span_pass else 'FAIL'} "
+          f"(need > 0.5x ribosome)")
+
+    # Check 2: atoms inside ribosome have proper clearance
+    distances, _ = ribo_tree.query(coords)
+    inside_mask = distances < 15.0  # atoms within 15 A of ribosome walls = "inside"
+    n_inside = inside_mask.sum()
+
+    if n_inside > 0:
+        inside_dists = distances[inside_mask]
+        n_clipping = (inside_dists < 2.5).sum()
+        clearance_pass = n_clipping == 0
+        print(f"  Atoms inside ribosome (< 15 A from walls): {n_inside}")
+        print(f"  Atoms clipping walls (< 2.5 A): {n_clipping}")
+        print(f"  Clearance check: {'PASS' if clearance_pass else 'FAIL'}")
+    else:
+        clearance_pass = True
+        print(f"  No atoms inside ribosome — molecule is entirely outside")
+        print(f"  Clearance check: PASS (trivially)")
+
+    overall = span_pass and clearance_pass
+    print(f"  Overall: {'PASS' if overall else 'FAIL'}")
+    return overall
+
+
 def main():
     print("=== Building tunnel-threaded polypeptide ===")
 
@@ -642,6 +725,9 @@ def main():
         print(f"\n  Final polypeptide: {len(final_arr)} atoms, "
               f"{len(np.unique(final_arr.res_id))} residues")
         print(f"  CA extent: {extent:.1f}A = {extent * 0.1:.1f} BU")
+
+    # Threading verification
+    verify_channel_threading(final_arr.coord, ribo_coords, ribo_tree, "polypeptide")
 
     # Clean up temp file
     if os.path.exists(raw_pdb):

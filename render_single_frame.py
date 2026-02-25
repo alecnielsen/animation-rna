@@ -4,9 +4,13 @@ Loads all molecules at their crystallographic/built coordinates and renders
 a single static frame. No animation logic, no jitter, no PCA, no progressive
 reveal.
 
+Applies mRNA bend (quadratic droop outside ribosome channel, copied from
+animate.py) for organic curvature. Camera zooms in ~30% past auto-framing
+so the ribosome fills ~70% of the frame and molecules extend off-screen.
+
 Components:
   1. Ribosome (40S + 60S): translucent surface from 6Y0G
-  2. Extended mRNA: blue surface from extended_mrna.pdb
+  2. Extended mRNA: blue surface from extended_mrna.pdb (with droop bend)
   3. P-site tRNA: orange surface, chain B4 from 6Y0G
   4. A-site tRNA: orange surface, chain D4 from 6Y0G (not B4!)
   5. Polypeptide: magenta surface from tunnel_polypeptide.pdb
@@ -53,6 +57,72 @@ CHAINS_60S = [
     "Li", "Lj", "Lk", "Ll", "Lm", "Ln", "Lo", "Lp", "Lr",
 ]
 RIBOSOME_CHAINS = CHAINS_40S + CHAINS_60S
+
+
+# ---------------------------------------------------------------------------
+# mRNA bend constants + function (from animate.py)
+# ---------------------------------------------------------------------------
+MRNA_CHANNEL_HALF_LEN = 4.0   # BU — straight zone around mRNA centroid
+MRNA_BEND_STRENGTH = 0.015    # BU per BU² beyond channel (quadratic droop)
+
+
+def get_mesh_res_ids(obj):
+    """Read per-vertex res_id from MN mesh attributes."""
+    mesh = obj.data
+    n = len(mesh.vertices)
+    for attr_name in ['res_id', 'residue_id']:
+        if attr_name in mesh.attributes:
+            res_ids = np.zeros(n, dtype=np.int32)
+            mesh.attributes[attr_name].data.foreach_get('value', res_ids)
+            return res_ids
+    return None
+
+
+def apply_mrna_bend(positions, res_ids):
+    """Apply a gentle quadratic droop to mRNA vertices outside the ribosome channel.
+
+    Vertices within +/-MRNA_CHANNEL_HALF_LEN of the mRNA centroid along the
+    principal axis stay straight. Beyond that, they droop quadratically
+    perpendicular to the axis, giving the mRNA an organic curved look
+    instead of a rigid rod.
+
+    The principal axis is computed via SVD on the actual vertex positions
+    (local/object space), avoiding coordinate-space mismatches with any
+    world-space constants.
+
+    Modifies positions in-place and returns them.
+    """
+    centroid = positions.mean(axis=0)
+    relative = positions - centroid
+
+    # Compute principal axis from vertex positions via SVD (local space)
+    _, _, vt = np.linalg.svd(relative, full_matrices=False)
+    local_axis = vt[0]  # first principal component = mRNA long axis
+
+    # Project onto mRNA axis
+    proj = relative @ local_axis  # scalar projection per vertex
+
+    # Droop direction: perpendicular to local_axis in the XY plane
+    z_up = np.array([0.0, 0.0, 1.0])
+    droop_dir = np.cross(local_axis, z_up)
+    droop_norm = np.linalg.norm(droop_dir)
+    if droop_norm < 1e-6:
+        droop_dir = np.cross(local_axis, np.array([1.0, 0.0, 0.0]))
+        droop_norm = np.linalg.norm(droop_dir)
+    droop_dir = droop_dir / droop_norm
+
+    # Also add a Z component for gravity-like sag
+    droop_dir = 0.7 * droop_dir + 0.3 * np.array([0.0, 0.0, -1.0])
+    droop_dir = droop_dir / np.linalg.norm(droop_dir)
+
+    # Apply quadratic droop beyond the straight zone
+    for i in range(len(positions)):
+        d = abs(proj[i]) - MRNA_CHANNEL_HALF_LEN
+        if d > 0:
+            droop = MRNA_BEND_STRENGTH * d * d
+            positions[i] += droop * droop_dir
+
+    return positions
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +267,32 @@ def main():
     for o in [obj_surface, obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]:
         o.rotation_euler.z = math.pi / 2
 
+    # --- Apply mRNA bend (organic curvature outside ribosome) ---
+    mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
+    n_mrna_verts = len(obj_mrna.data.vertices)
+    mrna_co = np.empty(n_mrna_verts * 3, dtype=np.float64)
+    obj_mrna.data.vertices.foreach_get('co', mrna_co)
+    mrna_positions = mrna_co.reshape(-1, 3).copy()
+    print(f"  Applying mRNA bend (channel +/-{MRNA_CHANNEL_HALF_LEN} BU, "
+          f"strength {MRNA_BEND_STRENGTH})...")
+    mrna_positions = apply_mrna_bend(mrna_positions, mrna_mesh_res_ids)
+    obj_mrna.data.vertices.foreach_set('co', mrna_positions.ravel())
+    obj_mrna.data.update()
+
     # --- Camera setup ---
+    # Use frame_object to get initial framing, then zoom in ~30%
     canvas.frame_object(mol_surface)
-    print(f"  Camera: loc={tuple(scene.camera.location)}, lens={scene.camera.data.lens}")
+    cam = scene.camera
+    print(f"  Camera (auto): loc={tuple(cam.location)}, lens={cam.data.lens}")
+
+    # Zoom in by scaling camera distance to 70% (ribosome fills ~70% of frame,
+    # molecules extend off-screen)
+    cam_loc = np.array(cam.location)
+    # Compute direction from scene origin to camera
+    cam_target = np.zeros(3)  # approximate scene center
+    cam_dir = cam_loc - cam_target
+    cam.location = tuple(cam_target + cam_dir * 0.7)
+    print(f"  Camera (zoomed): loc={tuple(cam.location)}, lens={cam.data.lens}")
 
     bpy.context.view_layer.update()
 

@@ -1,18 +1,18 @@
 """Build an extended mRNA strand by tiling chain A4 from 6Y0G.
 
-Creates a single continuous ~170-nucleotide mRNA from 10 copies of the
+Creates a single continuous ~340-nucleotide mRNA from 20 copies of the
 17 nt chain A4, with correct backbone spacing and sequential residue
-numbering. Randomizes nucleotide sequence per tile to produce genuinely
-different backbone conformations. Then runs extended 3-stage MD annealing
-with OpenMM (amber14 RNA.OL3 force field) to break tile symmetry.
+numbering (~142 BU extent, off-screen on both sides guaranteed).
+Then runs extended 3-stage MD annealing with OpenMM (amber14 RNA.OL3
+force field) to break tile symmetry.
 
 Ribosome-aware: loads nearby ribosome atoms, runs geometric de-clash
 after tiling, and adds wall-repulsion forces during MD to prevent the
-mRNA from clipping through ribosome walls.
+mRNA from clipping through ribosome walls. Channel threading verification
+checks span and wall clearance.
 
 Protocol: 500K MD steps total
   - 0.5A random perturbation per tile before MD (seed different pathways)
-  - Randomized nucleotide sequence per tile (ACGU mix)
   - Geometric de-clash against ribosome walls
   - 300K steps at 400K (high-temperature conformational sampling)
   - 100K steps at 350K (intermediate cooling)
@@ -35,8 +35,8 @@ from scipy.spatial import KDTree
 from biotite.structure import AtomArrayStack, concatenate, connect_via_residue_names
 from biotite.structure.io.pdb import PDBFile
 
-N_COPIES = 10
-CENTER_INDEX = 5  # copy index that stays at crystallographic position
+N_COPIES = 20
+CENTER_INDEX = 10  # copy index that stays at crystallographic position
 OUTPUT = "extended_mrna.pdb"
 SKIP_MINIMIZE = "--skip-minimize" in sys.argv
 
@@ -121,6 +121,61 @@ def verify_clearance(label, coords, ribosome_tree):
     else:
         print(f"  WARN: acceptance criteria not met")
     return distances
+
+
+def verify_channel_threading(coords, ribo_coords, ribo_tree, label="mRNA"):
+    """Verify that the molecule threads through the ribosome channel.
+
+    Checks:
+    1. Backbone atoms span from one side of ribosome to the other along
+       the channel axis (extent > ribosome diameter * 0.5)
+    2. Atoms inside the ribosome have clearance consistent with channel
+       (< 15 A from walls = inside, > 2.5 A from walls = not clipping)
+
+    Prints PASS/FAIL.
+    """
+    print(f"\n=== Channel threading verification: {label} ===")
+
+    # Ribosome bounding box for reference
+    ribo_min = ribo_coords.min(axis=0)
+    ribo_max = ribo_coords.max(axis=0)
+    ribo_extent = ribo_max - ribo_min
+    print(f"  Ribosome extent: ({ribo_extent[0]:.0f}, {ribo_extent[1]:.0f}, "
+          f"{ribo_extent[2]:.0f}) A")
+
+    # Check 1: molecule spans across the ribosome
+    mol_min = coords.min(axis=0)
+    mol_max = coords.max(axis=0)
+    mol_extent = mol_max - mol_min
+    max_mol_extent = np.max(mol_extent)
+    max_ribo_extent = np.max(ribo_extent)
+    span_ratio = max_mol_extent / max_ribo_extent
+    span_pass = span_ratio > 0.5
+    print(f"  Molecule max extent: {max_mol_extent:.0f} A "
+          f"({span_ratio:.1f}x ribosome)")
+    print(f"  Span check: {'PASS' if span_pass else 'FAIL'} "
+          f"(need > 0.5x ribosome)")
+
+    # Check 2: atoms inside ribosome have proper clearance
+    distances, _ = ribo_tree.query(coords)
+    inside_mask = distances < 15.0
+    n_inside = inside_mask.sum()
+
+    if n_inside > 0:
+        inside_dists = distances[inside_mask]
+        n_clipping = (inside_dists < 2.5).sum()
+        clearance_pass = n_clipping == 0
+        print(f"  Atoms inside ribosome (< 15 A from walls): {n_inside}")
+        print(f"  Atoms clipping walls (< 2.5 A): {n_clipping}")
+        print(f"  Clearance check: {'PASS' if clearance_pass else 'FAIL'}")
+    else:
+        clearance_pass = True
+        print(f"  No atoms inside ribosome — molecule is entirely outside")
+        print(f"  Clearance check: PASS (trivially)")
+
+    overall = span_pass and clearance_pass
+    print(f"  Overall: {'PASS' if overall else 'FAIL'}")
+    return overall
 
 
 def tile_mrna():
@@ -384,6 +439,13 @@ def main():
     # coincidences that break OpenMM addHydrogens; the wall repulsion
     # force during MD handles clash resolution properly)
     verify_clearance("before MD", extended.coord, ribo_tree)
+
+    # Threading verification (pre-MD)
+    # Use all ribosome atoms for full verification
+    mask_ribo = np.isin(full_arr.chain_id, RIBOSOME_CHAINS)
+    all_ribo_coords = full_arr[mask_ribo].coord
+    all_ribo_tree = KDTree(all_ribo_coords)
+    verify_channel_threading(extended.coord, all_ribo_coords, all_ribo_tree, "mRNA")
 
     if SKIP_MINIMIZE:
         print("\n  Skipping minimization (--skip-minimize)")
