@@ -32,6 +32,7 @@ import numpy as np
 import os
 import sys
 import math
+from PIL import Image, ImageFilter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -156,7 +157,7 @@ def make_solid_material(color):
     bsdf.inputs["Base Color"].default_value = (*color, 1.0)
     bsdf.inputs["Roughness"].default_value = 0.25
     bsdf.inputs["Emission Color"].default_value = (*color, 1.0)
-    bsdf.inputs["Emission Strength"].default_value = 0.8
+    bsdf.inputs["Emission Strength"].default_value = 1.2
     out = n.new("ShaderNodeOutputMaterial")
     l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
     return mat
@@ -221,6 +222,32 @@ def set_bg(scene, color, strength):
     if bg:
         bg.inputs["Color"].default_value = (*color, 1.0)
         bg.inputs["Strength"].default_value = strength
+
+
+def _write_backbone(in_pdb, out_pdb, mol_type="rna"):
+    """Write a backbone-only PDB for cleaner visualization.
+
+    RNA backbone: P, O5', C5', C4', C3', O3'
+    Protein backbone: N, CA, C, O
+    """
+    from biotite.structure.io.pdb import PDBFile as BiotitePDB
+    from biotite.structure import AtomArrayStack
+
+    pdb = BiotitePDB.read(in_pdb)
+    arr = pdb.get_structure(model=1)
+    if isinstance(arr, AtomArrayStack):
+        arr = arr[0]
+
+    if mol_type == "rna":
+        bb_names = {"P", "O5'", "C5'", "C4'", "C3'", "O3'"}
+    else:
+        bb_names = {"N", "CA", "C", "O"}
+
+    bb = arr[np.isin(arr.atom_name, list(bb_names))]
+    out = BiotitePDB()
+    out.set_structure(bb)
+    out.write(out_pdb)
+    print(f"  Backbone: {in_pdb} ({len(arr)} atoms) -> {out_pdb} ({len(bb)} atoms)")
 
 
 def _extract_trna_pdbs():
@@ -308,57 +335,78 @@ def main():
     # atoms of 6Y0G three times — tRNAs are only ~2K atoms each)
     _extract_trna_pdbs()
 
-    # Style helper: cartoon (fast) or StyleSurface (production)
-    def mol_style():
+    # Style helpers
+    def ribo_style():
         if MOL_STYLE == "surface":
             return mn.StyleSurface()
-        return MOL_STYLE  # string style name: 'cartoon', 'spheres', etc.
+        return "cartoon"  # ribosome always cartoon (fast for 210K atoms)
 
-    # 1. Ribosome (40S + 60S) -- translucent surface or lightweight cartoon
+    def detail_style():
+        if MOL_STYLE == "surface":
+            return mn.StyleSurface()
+        return "ribbon"  # mRNA/tRNA/peptide: ribbon style
+
+    # Flat opaque material for ribosome silhouette pass (rendered with
+    # film_transparent=True, then PIL edge-detects the alpha channel)
+    def make_ribo_material():
+        if MOL_STYLE == "surface":
+            return make_translucent_surface_material()
+        mat = bpy.data.materials.new(name="ribo_flat")
+        n = mat.node_tree.nodes
+        l = mat.node_tree.links
+        n.clear()
+        bsdf = n.new("ShaderNodeBsdfDiffuse")
+        bsdf.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)
+        bsdf.inputs["Roughness"].default_value = 1.0
+        out = n.new("ShaderNodeOutputMaterial")
+        l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        return mat
+
+    # 1. Ribosome (40S + 60S) — cartoon with transparency
     mol_surface = mn.Molecule.fetch("6Y0G")
-    ribo_material = (make_translucent_surface_material()
-                     if MOL_STYLE == "surface"
-                     else make_solid_material((0.45, 0.55, 0.75)))
     mol_surface.add_style(
-        style=mol_style(),
+        style=ribo_style(),
         selection=mol_surface.select.chain_id(RIBOSOME_CHAINS),
-        material=ribo_material,
+        material=make_ribo_material(),
         name="surface",
     )
 
-    # 2. mRNA (extended, from preprocessed PDB)
-    mol_mrna = mn.Molecule.load("extended_mrna.pdb")
+    # 2. mRNA (extended, from preprocessed PDB) — backbone cartoon (gaps = breaks)
+    _write_backbone("extended_mrna.pdb", "extended_mrna_bb.pdb", mol_type="rna")
+    mol_mrna = mn.Molecule.load("extended_mrna_bb.pdb")
     mol_mrna.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.1, 0.35, 0.95)),
+        style="cartoon" if MOL_STYLE != "surface" else mn.StyleSurface(),
+        material=make_solid_material((0.05, 0.25, 0.95)),
         name="mRNA",
     )
 
     # 3. P-site tRNA (chain B4 — extracted PDB, ~2K atoms)
     mol_trna_p = mn.Molecule.load("trna_b4.pdb")
     mol_trna_p.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.95, 0.5, 0.1)),
+        style=detail_style(),
+        material=make_solid_material((0.95, 0.4, 0.0)),
         name="tRNA_P",
     )
 
     # 4. A-site tRNA (chain D4 — extracted PDB, ~2K atoms)
     mol_trna_a = mn.Molecule.load("trna_d4.pdb")
     mol_trna_a.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.95, 0.5, 0.1)),
+        style=detail_style(),
+        material=make_solid_material((0.95, 0.4, 0.0)),
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded)
+    # 5. Polypeptide (tunnel-threaded) — backbone only
     peptide_pdb = "tunnel_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
-    mol_peptide = mn.Molecule.load(peptide_pdb)
+    peptide_bb = peptide_pdb.replace(".pdb", "_bb.pdb")
+    _write_backbone(peptide_pdb, peptide_bb, mol_type="protein")
+    mol_peptide = mn.Molecule.load(peptide_bb)
     mol_peptide.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.8, 0.15, 0.6)),
+        style="cartoon" if MOL_STYLE != "surface" else mn.StyleSurface(),
+        material=make_solid_material((0.85, 0.05, 0.55)),
         name="polypeptide",
     )
 
@@ -431,12 +479,63 @@ def main():
         print("=== Done (scene saved, no render) ===")
         return
 
-    # --- Render ---
-    print(f"  Rendering to {OUTPUT_FILE}...")
-    canvas.snapshot(OUTPUT_FILE)
-    print(f"  Saved: {OUTPUT_FILE}")
+    # --- Two-pass render + composite (outline ribosome) ---
+    import time
+    internal_objs = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
 
-    print("=== Done ===")
+    # Pass 1: Ribosome silhouette (transparent bg → alpha = shape mask)
+    print("  Pass 1: Ribosome silhouette...")
+    t0 = time.time()
+    for o in internal_objs:
+        o.hide_render = True
+    scene.render.film_transparent = True
+    canvas.snapshot("renders/_pass_ribo.png")
+    t1 = time.time()
+    print(f"    [{t1 - t0:.1f}s]")
+
+    # Pass 2: Internal components (no ribosome)
+    print("  Pass 2: Internal components...")
+    obj_surface.hide_render = True
+    for o in internal_objs:
+        o.hide_render = False
+    scene.render.film_transparent = False
+    canvas.snapshot("renders/_pass_internal.png")
+    t2 = time.time()
+    print(f"    [{t2 - t1:.1f}s]")
+
+    # Composite: edge-detect ribosome alpha → outline overlay
+    print("  Compositing...")
+    OUTLINE_COLOR = (70, 120, 200)
+    OUTLINE_THICKNESS = 3
+
+    internal = Image.open("renders/_pass_internal.png").convert("RGBA")
+    ribo = Image.open("renders/_pass_ribo.png").convert("RGBA")
+
+    # Extract alpha channel → binary mask → edge detect
+    alpha = np.array(ribo)[:, :, 3]
+    mask = (alpha > 10).astype(np.uint8) * 255
+    mask_img = Image.fromarray(mask).filter(ImageFilter.GaussianBlur(radius=2))
+    mask_img = Image.fromarray((np.array(mask_img) > 128).astype(np.uint8) * 255)
+    edges = mask_img.filter(ImageFilter.FIND_EDGES)
+    sil = Image.fromarray((np.array(edges) > 30).astype(np.uint8) * 255)
+    for _ in range(OUTLINE_THICKNESS // 2):
+        sil = sil.filter(ImageFilter.MaxFilter(3))
+
+    # Build outline overlay
+    edges_np = np.array(sil)
+    overlay = np.zeros((*edges_np.shape, 4), dtype=np.uint8)
+    mask = edges_np > 100
+    overlay[mask, 0] = OUTLINE_COLOR[0]
+    overlay[mask, 1] = OUTLINE_COLOR[1]
+    overlay[mask, 2] = OUTLINE_COLOR[2]
+    overlay[mask, 3] = 255
+
+    result = Image.alpha_composite(internal, Image.fromarray(overlay, "RGBA"))
+    result.save(OUTPUT_FILE)
+    t3 = time.time()
+    print(f"    [{t3 - t2:.1f}s]")
+    print(f"  Saved: {OUTPUT_FILE}")
+    print(f"=== Done (total render: {t3 - t0:.1f}s) ===")
 
 
 if __name__ == "__main__":
