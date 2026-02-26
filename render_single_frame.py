@@ -18,8 +18,9 @@ Components:
 Output: renders/single_frame.png
 
 Run with:
-  python3.11 render_single_frame.py          # 1920x1080, 128 samples
-  python3.11 render_single_frame.py --debug   # 960x540, 32 samples
+  python3.11 render_single_frame.py          # 1920x1080, 128 samples (CPU)
+  python3.11 render_single_frame.py --debug   # 960x540, 32 samples (CPU)
+  python3.11 render_single_frame.py --gpu     # 1920x1080, 128 samples (CUDA GPU)
 """
 
 import molecularnodes as mn
@@ -33,6 +34,7 @@ import math
 # Configuration
 # ---------------------------------------------------------------------------
 DEBUG = "--debug" in sys.argv
+GPU = "--gpu" in sys.argv
 
 if DEBUG:
     RES = (960, 540)
@@ -183,11 +185,23 @@ def main():
 
     canvas = mn.Canvas(mn.scene.Cycles(samples=SAMPLES), resolution=RES)
     scene = bpy.context.scene
-    scene.cycles.device = 'CPU'  # avoid GPU hang on macOS
+
+    if GPU:
+        # Enable CUDA GPU rendering
+        prefs = bpy.context.preferences
+        cycles_prefs = prefs.addons['cycles'].preferences
+        cycles_prefs.compute_device_type = 'CUDA'
+        cycles_prefs.get_devices()
+        for device in cycles_prefs.devices:
+            device.use = True
+        scene.cycles.device = 'GPU'
+        print(f"  GPU rendering enabled (CUDA)")
+    else:
+        scene.cycles.device = 'CPU'  # avoid GPU hang on macOS
     scene.render.film_transparent = False
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
     scene.cycles.max_bounces = 12
-    scene.cycles.transparent_max_bounces = 64
+    scene.cycles.transparent_max_bounces = 8
 
     # --- Load molecules ---
     print("  Loading molecules...")
