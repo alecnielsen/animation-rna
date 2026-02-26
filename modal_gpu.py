@@ -1,14 +1,15 @@
 """GPU-accelerated mRNA relaxation and rendering via Modal.
 
-Two GPU functions:
-  relax_on_gpu  — 500K-step MD annealing on T4 (~2 min vs ~50 min CPU)
-  render_on_gpu — Blender Cycles render on T4 with CUDA
+GPU functions:
+  relax_on_gpu    — MD annealing on T4 (configurable steps/temps)
+  render_on_gpu   — Blender Cycles render from pre-baked .blend file
+  animate_on_gpu  — Render frame range from pre-baked .blend file
 
 Usage:
   # Full pipeline: relax + render (debug)
   modal run modal_gpu.py
 
-  # Render only (skip relaxation, use existing extended_mrna.pdb)
+  # Render only (skip relaxation, use existing scene.blend)
   modal run modal_gpu.py --skip-relax
 
   # Relax only (no render)
@@ -17,10 +18,13 @@ Usage:
   # Production render (1920x1080, 128 samples)
   modal run modal_gpu.py --skip-relax --production
 
+  # Render animation frames (requires scene.blend with animation setup)
+  modal run modal_gpu.py --skip-relax --animate --frame-start 0 --frame-end 239
+
 Prerequisites:
   pip install modal
   modal setup  # one-time auth
-  python3.11 build_extended_mrna.py --skip-minimize  # raw tiled mRNA
+  python3.11 render_single_frame.py --save-blend  # create scene.blend
 """
 
 import modal
@@ -99,8 +103,16 @@ def _load_and_prepare(input_pdb):
     return ff, modeller
 
 
-def _relax_rna(input_pdb, output_pdb, ribo_coords=None):
-    """3-stage annealing with wall repulsion — GPU-accelerated."""
+def _relax_rna(input_pdb, output_pdb, ribo_coords=None,
+               phase1_steps=3000000, phase1_temp=500,
+               phase2_steps=1000000, phase2_temp=400,
+               phase3_steps=1000000, phase3_temp=310):
+    """3-stage annealing with wall repulsion — GPU-accelerated.
+
+    Default parameters are aggressive (5M total steps, 500K peak) to
+    break tile periodicity in the extended mRNA. For quick tests, pass
+    lower values (e.g., phase1_steps=300000, phase1_temp=400).
+    """
     import sys
     import numpy as np
     from scipy.spatial import KDTree
@@ -111,12 +123,12 @@ def _relax_rna(input_pdb, output_pdb, ribo_coords=None):
     from openmm import LangevinMiddleIntegrator, CustomExternalForce, Platform
     from openmm.unit import kelvin, picosecond, picoseconds, nanometer
 
-    PHASE1_STEPS = 300000
-    PHASE1_TEMP = 400
-    PHASE2_STEPS = 100000
-    PHASE2_TEMP = 350
-    PHASE3_STEPS = 100000
-    PHASE3_TEMP = 310
+    PHASE1_STEPS = phase1_steps
+    PHASE1_TEMP = phase1_temp
+    PHASE2_STEPS = phase2_steps
+    PHASE2_TEMP = phase2_temp
+    PHASE3_STEPS = phase3_steps
+    PHASE3_TEMP = phase3_temp
     TOTAL = PHASE1_STEPS + PHASE2_STEPS + PHASE3_STEPS
 
     print(f"\n=== Relaxation ({TOTAL} steps: "
@@ -202,9 +214,21 @@ def _relax_rna(input_pdb, output_pdb, ribo_coords=None):
     print(f"  Written: {output_pdb}")
 
 
-@app.function(gpu="T4", image=md_image, timeout=600)
-def relax_on_gpu(raw_pdb_content: str) -> str:
-    """Run 500K-step MD annealing on GPU with ribosome wall repulsion."""
+@app.function(gpu="T4", image=md_image, timeout=1800)
+def relax_on_gpu(
+    raw_pdb_content: str,
+    phase1_steps: int = 3000000,
+    phase1_temp: int = 500,
+    phase2_steps: int = 1000000,
+    phase2_temp: int = 400,
+    phase3_steps: int = 1000000,
+    phase3_temp: int = 310,
+) -> str:
+    """Run MD annealing on GPU with ribosome wall repulsion.
+
+    Default: 5M steps (3M@500K + 1M@400K + 1M@310K) for aggressive
+    symmetry breaking. Pass lower values for quick tests.
+    """
     import numpy as np
     from scipy.spatial import KDTree
     from biotite.structure import AtomArrayStack
@@ -240,7 +264,10 @@ def relax_on_gpu(raw_pdb_content: str) -> str:
     nearby_ribo = ribo_coords[dists < 15.0]
     print(f"  Nearby ribosome atoms (within 15A): {len(nearby_ribo)}")
 
-    _relax_rna(input_path, output_path, ribo_coords=nearby_ribo)
+    _relax_rna(input_path, output_path, ribo_coords=nearby_ribo,
+               phase1_steps=phase1_steps, phase1_temp=phase1_temp,
+               phase2_steps=phase2_steps, phase2_temp=phase2_temp,
+               phase3_steps=phase3_steps, phase3_temp=phase3_temp)
 
     with open(output_path) as f:
         return f.read()
@@ -250,42 +277,114 @@ def relax_on_gpu(raw_pdb_content: str) -> str:
 # Blender Rendering
 # ---------------------------------------------------------------------------
 
-@app.function(gpu="T4", image=render_image, timeout=1800)
+@app.function(gpu="T4", image=render_image, timeout=600)
 def render_on_gpu(
-    render_script: str,
-    mrna_pdb: str,
-    peptide_pdb: str,
+    blend_data: bytes,
     debug: bool = True,
 ) -> bytes:
-    """Run render_single_frame.py on GPU via Blender Cycles CUDA."""
-    import subprocess
+    """Render a single frame from a pre-baked .blend file on GPU.
+
+    The .blend file contains the fully set-up scene (molecules, styles,
+    materials, camera). We just open it, configure CUDA, and render.
+    This takes ~1-2 minutes vs 10+ minutes for full scene setup.
+    """
     import os
 
-    workdir = "/app"
+    workdir = "/tmp/render"
     os.makedirs(f"{workdir}/renders", exist_ok=True)
 
-    with open(f"{workdir}/extended_mrna.pdb", "w") as f:
-        f.write(mrna_pdb)
-    with open(f"{workdir}/tunnel_polypeptide.pdb", "w") as f:
-        f.write(peptide_pdb)
-    with open(f"{workdir}/render_single_frame.py", "w") as f:
-        f.write(render_script)
+    blend_path = f"{workdir}/scene.blend"
+    with open(blend_path, "wb") as f:
+        f.write(blend_data)
+    print(f"=== Loaded .blend file ({len(blend_data) / 1024 / 1024:.1f} MB) ===")
 
-    args = ["python3", f"{workdir}/render_single_frame.py", "--gpu"]
+    import bpy
+
+    bpy.ops.wm.open_mainfile(filepath=blend_path)
+    scene = bpy.context.scene
+
+    # Configure CUDA GPU rendering
+    prefs = bpy.context.preferences
+    cycles_prefs = prefs.addons['cycles'].preferences
+    cycles_prefs.compute_device_type = 'CUDA'
+    cycles_prefs.get_devices()
+    for device in cycles_prefs.devices:
+        device.use = True
+    scene.cycles.device = 'GPU'
+    print(f"  GPU rendering enabled (CUDA)")
+
+    # Override samples for debug mode
     if debug:
-        args.append("--debug")
+        scene.cycles.samples = 32
+        scene.render.resolution_x = 960
+        scene.render.resolution_y = 540
 
-    print(f"=== Running: {' '.join(args)} ===")
-    result = subprocess.run(args, cwd=workdir, capture_output=True, text=True)
-    print(result.stdout)
-    if result.stderr:
-        print(f"STDERR:\n{result.stderr}")
-    if result.returncode != 0:
-        raise RuntimeError(f"Render failed (exit {result.returncode})")
+    # Enable denoising for cleaner output
+    scene.cycles.use_denoising = True
 
     output_path = f"{workdir}/renders/single_frame.png"
+    scene.render.filepath = output_path
+    scene.render.image_settings.file_format = 'PNG'
+
+    print(f"  Rendering ({scene.render.resolution_x}x{scene.render.resolution_y}, "
+          f"{scene.cycles.samples} samples)...")
+    bpy.ops.render.render(write_still=True)
+    print(f"  Render complete: {output_path}")
+
     with open(output_path, "rb") as f:
         return f.read()
+
+
+@app.function(gpu="T4", image=render_image, timeout=3600)
+def animate_on_gpu(
+    blend_data: bytes,
+    frame_start: int = 0,
+    frame_end: int = 239,
+) -> list[bytes]:
+    """Render a range of animation frames from a pre-baked .blend file on GPU.
+
+    Returns a list of PNG bytes, one per frame.
+    """
+    import os
+
+    workdir = "/tmp/render"
+    os.makedirs(f"{workdir}/frames", exist_ok=True)
+
+    blend_path = f"{workdir}/scene.blend"
+    with open(blend_path, "wb") as f:
+        f.write(blend_data)
+    print(f"=== Loaded .blend file ({len(blend_data) / 1024 / 1024:.1f} MB) ===")
+
+    import bpy
+
+    bpy.ops.wm.open_mainfile(filepath=blend_path)
+    scene = bpy.context.scene
+
+    # Configure CUDA GPU rendering
+    prefs = bpy.context.preferences
+    cycles_prefs = prefs.addons['cycles'].preferences
+    cycles_prefs.compute_device_type = 'CUDA'
+    cycles_prefs.get_devices()
+    for device in cycles_prefs.devices:
+        device.use = True
+    scene.cycles.device = 'GPU'
+    scene.cycles.use_denoising = True
+    print(f"  GPU rendering enabled (CUDA)")
+
+    scene.render.image_settings.file_format = 'PNG'
+    frames_data = []
+
+    for frame_num in range(frame_start, frame_end + 1):
+        scene.frame_set(frame_num)
+        frame_path = f"{workdir}/frames/frame_{frame_num:04d}.png"
+        scene.render.filepath = frame_path
+        print(f"  Rendering frame {frame_num}/{frame_end}...")
+        bpy.ops.render.render(write_still=True)
+        with open(frame_path, "rb") as f:
+            frames_data.append(f.read())
+
+    print(f"  Rendered {len(frames_data)} frames")
+    return frames_data
 
 
 # ---------------------------------------------------------------------------
@@ -297,11 +396,14 @@ def main(
     skip_relax: bool = False,
     skip_render: bool = False,
     production: bool = False,
+    animate: bool = False,
+    frame_start: int = 0,
+    frame_end: int = 239,
 ):
     import os
 
     mrna_pdb_path = "extended_mrna.pdb"
-    peptide_pdb_path = "tunnel_polypeptide.pdb"
+    blend_path = "scene.blend"
     output_png = "renders/single_frame.png"
 
     # --- Relax ---
@@ -323,28 +425,35 @@ def main(
 
     # --- Render ---
     if not skip_render:
-        for path in [mrna_pdb_path, peptide_pdb_path]:
-            if not os.path.exists(path):
-                print(f"ERROR: {path} not found.")
-                return
+        if not os.path.exists(blend_path):
+            print(f"ERROR: {blend_path} not found.")
+            print("Run: python3.11 render_single_frame.py --save-blend")
+            return
 
-        with open("render_single_frame.py") as f:
-            render_script = f.read()
-        with open(mrna_pdb_path) as f:
-            mrna_content = f.read()
-        with open(peptide_pdb_path) as f:
-            peptide_content = f.read()
+        with open(blend_path, "rb") as f:
+            blend_data = f.read()
+        print(f"Loaded {blend_path} ({len(blend_data) / 1024 / 1024:.1f} MB)")
 
-        debug = not production
-        mode = "production (1920x1080)" if production else "debug (960x540)"
-        print(f"=== Rendering single frame on GPU ({mode})... ===")
-        png_data = render_on_gpu.remote(
-            render_script, mrna_content, peptide_content, debug=debug,
-        )
+        if animate:
+            print(f"=== Rendering animation frames {frame_start}-{frame_end} on GPU... ===")
+            frames_data = animate_on_gpu.remote(blend_data, frame_start, frame_end)
 
-        os.makedirs("renders", exist_ok=True)
-        with open(output_png, "wb") as f:
-            f.write(png_data)
-        print(f"Render saved to {output_png}")
+            os.makedirs("renders/frames", exist_ok=True)
+            for i, png_data in enumerate(frames_data):
+                frame_num = frame_start + i
+                frame_path = f"renders/frames/frame_{frame_num:04d}.png"
+                with open(frame_path, "wb") as f:
+                    f.write(png_data)
+            print(f"Saved {len(frames_data)} frames to renders/frames/")
+        else:
+            debug = not production
+            mode = "production (1920x1080)" if production else "debug (960x540)"
+            print(f"=== Rendering single frame on GPU ({mode})... ===")
+            png_data = render_on_gpu.remote(blend_data, debug=debug)
+
+            os.makedirs("renders", exist_ok=True)
+            with open(output_png, "wb") as f:
+                f.write(png_data)
+            print(f"Render saved to {output_png}")
 
     print("=== Done ===")

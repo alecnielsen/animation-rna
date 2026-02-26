@@ -11,12 +11,11 @@ after tiling, and adds wall-repulsion forces during MD to prevent the
 mRNA from clipping through ribosome walls. Channel threading verification
 checks span and wall clearance.
 
-Protocol: 500K MD steps total
-  - 0.5A random perturbation per tile before MD (seed different pathways)
+Protocol: 5M MD steps total (via Modal GPU), 500K locally
+  - 1.5A random perturbation per tile before MD (seed divergent conformations)
   - Geometric de-clash against ribosome walls
-  - 300K steps at 400K (high-temperature conformational sampling)
-  - 100K steps at 350K (intermediate cooling)
-  - 100K steps at 310K (physiological temperature)
+  - Local: 300K@400K + 100K@350K + 100K@310K (500K total)
+  - Modal GPU: 3M@500K + 1M@400K + 1M@310K (5M total, aggressive)
   - Final energy minimization (quench)
   - Wall repulsion force active during all MD phases
 
@@ -229,8 +228,9 @@ def tile_mrna():
     for i in range(N_COPIES):
         tile = a4.copy()
         tile.coord += (i - CENTER_INDEX) * tile_offset
-        # 0.5A random perturbation per atom (was 0.2A) for stronger symmetry breaking
-        tile.coord += rng.normal(0, 0.5, tile.coord.shape)
+        # 1.5A random perturbation per atom to seed divergent tile conformations
+        # (larger perturbation + high-T annealing breaks tile periodicity)
+        tile.coord += rng.normal(0, 1.5, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
         # Note: nucleotide names are NOT randomized — OpenMM template matching

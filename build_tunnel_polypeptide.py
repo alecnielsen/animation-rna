@@ -1,11 +1,13 @@
 """Build a polypeptide threaded through the ribosome exit tunnel.
 
 Traces the exit tunnel void space from the peptidyl transferase center (PTC)
-through the 60S subunit, then builds a polyalanine chain along the centerline.
+through the 60S subunit, then builds a polypeptide chain along the centerline.
 Uses extended conformation inside the tunnel (~3.3 A/residue, fits the ~10 A
-L4-L22 constriction) and alpha helix after the exit (~1.5 A/residue).
+L4-L22 constriction). After the tunnel exit, inserts a real folded protein
+domain (1UBQ ubiquitin, 76 residues) for visible secondary structure, then
+continues with a random-walk extension off-screen.
 
-Past the tunnel exit, extends the chain using a curving random walk
+Past the folded domain, extends the chain using a curving random walk
 (~0.15 rad std dev angular perturbation per step) for 400 steps (800 A
 = 80 BU, ~3x ribosome diameter) so the polypeptide visibly curves and
 extends off-screen. Cubic spline smoothing softens any sharp turns.
@@ -23,8 +25,9 @@ Algorithm:
      (high directional momentum 0.9 to avoid side cavities)
   4. Extend past exit with random-walk curvature (400 steps, 800 A)
   5. Smooth centerline with variable-rate resampling (extended in tunnel,
-     helix after exit)
-  6. Build polyalanine backbone along spline with geometry switching
+     folded domain after exit, helix for extension)
+  6. Build backbone: extended in tunnel, real ubiquitin fold after exit,
+     polyalanine random walk extension
   7. Geometric de-clash against ribosome walls
   8. 3-stage constrained MD with wall repulsion (100K steps total)
   9. Channel threading verification (PASS/FAIL)
@@ -39,8 +42,10 @@ import bpy
 import numpy as np
 from scipy.spatial import KDTree
 from scipy.interpolate import CubicSpline
-from biotite.structure import AtomArrayStack, AtomArray, BondList, superimpose
+from biotite.structure import AtomArrayStack, AtomArray, BondList, superimpose, concatenate
 from biotite.structure.io.pdb import PDBFile
+import biotite.database.rcsb as rcsb_db
+import biotite.structure.io.pdbx as pdbx
 import sys
 import os
 import tempfile
@@ -460,6 +465,156 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
     return arr
 
 
+def fetch_folded_domain(pdb_id="1UBQ"):
+    """Fetch a small globular protein to use as the folded domain.
+
+    Returns: AtomArray with backbone+CB atoms for the folded domain.
+    """
+    print(f"  Fetching {pdb_id} for folded domain...")
+    cif_path = rcsb_db.fetch(pdb_id, "cif", target_path="/tmp")
+    cif = pdbx.CIFFile.read(cif_path)
+    full_arr = pdbx.get_structure(cif, model=1)
+    if isinstance(full_arr, AtomArrayStack):
+        full_arr = full_arr[0]
+
+    # Keep only protein atoms (first chain, exclude water/heteroatoms)
+    chains = np.unique(full_arr.chain_id)
+    domain = full_arr[full_arr.chain_id == chains[0]]
+    domain = domain[~domain.hetero]  # remove water (HOH) and other heteroatoms
+
+    # Keep backbone + CB atoms only (N, CA, C, O, CB)
+    backbone_names = {"N", "CA", "C", "O", "CB"}
+    domain = domain[np.isin(domain.atom_name, list(backbone_names))]
+
+    n_res = len(np.unique(domain.res_id))
+    print(f"  Folded domain: {pdb_id} chain {chains[0]}, "
+          f"{n_res} residues, {len(domain)} backbone atoms")
+    return domain
+
+
+def align_folded_domain(domain, exit_pos, exit_dir):
+    """Align a folded protein domain so its N-terminus is at exit_pos,
+    oriented along exit_dir.
+
+    The domain's first CA atom is placed at exit_pos. The domain is
+    rotated so that its N->C axis aligns with exit_dir (the tunnel
+    exit trajectory).
+
+    Returns: modified domain AtomArray (copy).
+    """
+    domain = domain.copy()
+    ca_mask = domain.atom_name == "CA"
+    ca_coords = domain.coord[ca_mask]
+    ca_res = domain.res_id[ca_mask]
+
+    if len(ca_coords) < 2:
+        return domain
+
+    # Domain's N->C axis (from first to last CA)
+    sort_idx = np.argsort(ca_res)
+    n_term_ca = ca_coords[sort_idx[0]]
+    c_term_ca = ca_coords[sort_idx[-1]]
+    domain_axis = c_term_ca - n_term_ca
+    domain_axis = domain_axis / np.linalg.norm(domain_axis)
+
+    # Center the domain on its N-terminal CA
+    domain.coord -= n_term_ca
+
+    # Compute rotation from domain_axis to exit_dir
+    exit_dir = exit_dir / np.linalg.norm(exit_dir)
+    cross = np.cross(domain_axis, exit_dir)
+    cross_norm = np.linalg.norm(cross)
+    dot = np.dot(domain_axis, exit_dir)
+
+    if cross_norm > 1e-6:
+        # Rodrigues rotation
+        R = rotation_matrix(cross / cross_norm, np.arccos(np.clip(dot, -1, 1)))
+        domain.coord = (R @ domain.coord.T).T
+    elif dot < 0:
+        # 180 degree rotation — pick an arbitrary perpendicular axis
+        if abs(exit_dir[0]) < 0.9:
+            perp = np.cross(exit_dir, np.array([1, 0, 0]))
+        else:
+            perp = np.cross(exit_dir, np.array([0, 1, 0]))
+        perp = perp / np.linalg.norm(perp)
+        R = rotation_matrix(perp, np.pi)
+        domain.coord = (R @ domain.coord.T).T
+
+    # Translate so N-terminal CA is at exit_pos
+    domain.coord += exit_pos
+
+    return domain
+
+
+def build_hybrid_polypeptide(spline_points, tunnel_exit_residue,
+                             exit_pos, exit_dir):
+    """Build a polypeptide with three zones:
+    1. Extended conformation in tunnel (polyalanine)
+    2. Real folded domain after exit (ubiquitin)
+    3. Polyalanine random-walk extension off-screen
+
+    Returns: AtomArray
+    """
+    # Build tunnel portion (extended polyalanine)
+    tunnel_points = spline_points[:tunnel_exit_residue]
+    tunnel_poly = build_backbone_along_spline(
+        spline_points[:tunnel_exit_residue + 10],  # include transition zone
+        tunnel_exit_residue)
+
+    # Fetch and align the folded domain
+    domain = fetch_folded_domain("1UBQ")
+    domain = align_folded_domain(domain, exit_pos, exit_dir)
+
+    # Renumber domain residues to continue after tunnel
+    tunnel_res = np.unique(tunnel_poly.res_id)
+    n_tunnel_res = len(tunnel_res)
+    domain_res = np.unique(domain.res_id)
+    res_remap = {int(old): n_tunnel_res + i + 1
+                 for i, old in enumerate(domain_res)}
+    for i in range(len(domain)):
+        domain.res_id[i] = res_remap[int(domain.res_id[i])]
+    domain.chain_id[:] = "A"
+
+    # Build extension portion (polyalanine after folded domain)
+    # Use spline points past the folded domain region
+    domain_ca = domain.coord[domain.atom_name == "CA"]
+    if len(domain_ca) > 0:
+        domain_extent_A = np.linalg.norm(domain_ca[-1] - domain_ca[0])
+        # Estimate how many spline points the domain occupies
+        domain_spline_pts = int(domain_extent_A / HELIX_RISE_PER_RESIDUE)
+    else:
+        domain_spline_pts = 50
+
+    ext_start_idx = tunnel_exit_residue + domain_spline_pts
+    if ext_start_idx < len(spline_points):
+        ext_points = spline_points[ext_start_idx:]
+        ext_poly = build_backbone_along_spline(
+            ext_points, 0)  # all helix conformation
+
+        # Renumber extension residues
+        n_domain_res = len(np.unique(domain.res_id))
+        ext_poly.res_id += n_tunnel_res + n_domain_res
+    else:
+        ext_poly = None
+
+    # Concatenate all parts
+    parts = [tunnel_poly, domain]
+    if ext_poly is not None:
+        parts.append(ext_poly)
+
+    combined = concatenate(parts)
+    n_total_res = len(np.unique(combined.res_id))
+    n_domain_res = len(np.unique(domain.res_id))
+    print(f"  Hybrid polypeptide: {n_total_res} residues total")
+    print(f"    Tunnel: {n_tunnel_res} residues (extended)")
+    print(f"    Folded domain: {n_domain_res} residues (ubiquitin)")
+    if ext_poly is not None:
+        n_ext = len(np.unique(ext_poly.res_id))
+        print(f"    Extension: {n_ext} residues (helix)")
+
+    return combined
+
+
 def declash_structure(coords, ribosome_tree, ribo_coords, min_dist=3.0, max_iter=100):
     """Push polypeptide atoms away from ribosome walls.
 
@@ -754,8 +909,19 @@ def main():
     spline_points, tunnel_exit_residue, spline_fn, total_len = smooth_centerline(
         centerline, exit_arc_length)
 
-    # Build polypeptide with geometry switching
-    polypeptide = build_backbone_along_spline(spline_points, tunnel_exit_residue)
+    # Compute exit position and direction for folded domain alignment
+    exit_pos = spline_points[tunnel_exit_residue]
+    if tunnel_exit_residue + 1 < len(spline_points):
+        exit_dir = spline_points[tunnel_exit_residue + 1] - spline_points[tunnel_exit_residue]
+    elif tunnel_exit_residue > 0:
+        exit_dir = spline_points[tunnel_exit_residue] - spline_points[tunnel_exit_residue - 1]
+    else:
+        exit_dir = np.array([0, 0, -1])
+    exit_dir = exit_dir / np.linalg.norm(exit_dir)
+
+    # Build hybrid polypeptide: tunnel (extended) + folded domain + extension (helix)
+    polypeptide = build_hybrid_polypeptide(
+        spline_points, tunnel_exit_residue, exit_pos, exit_dir)
 
     # Geometric de-clash against ribosome walls
     verify_clearance("before de-clash", polypeptide.coord, ribo_tree)
