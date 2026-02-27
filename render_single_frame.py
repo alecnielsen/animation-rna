@@ -5,15 +5,35 @@ a single static frame. No animation logic, no jitter, no PCA, no progressive
 reveal.
 
 Applies mRNA bend (quadratic droop outside ribosome channel, copied from
-animate.py) for organic curvature. Camera zooms in ~30% past auto-framing
-so the ribosome fills ~70% of the frame and molecules extend off-screen.
+animate.py) for organic curvature.
+
+Camera angle
+------------
+Orthographic, manually found in Blender and exported via View > Align Active
+Camera to View. The rotation is euler XYZ (2.2480, 0.0, 0.0489) rad — this
+gives a slightly-below-horizontal view looking up at the ribosome, rotated
+~2.8° around Z. The orbit center (camera target) is (-2.66, 1.71, 1.72) BU.
+
+Key property: the nascent polypeptide exits the ribosome tunnel *parallel*
+to the viewing plane (left-right in the frame, not into/out of screen).
+
+To find a new angle:
+  1. python3.11 render_single_frame.py --save-blend
+  2. Open scene.blend in Blender, orbit to desired angle
+  3. View > Align Active Camera to View, then Cmd+S
+  4. Read camera params:
+       python3.11 -c "import bpy; bpy.ops.wm.open_mainfile(filepath='scene.blend'); \\
+         c=bpy.context.scene.camera; print(f'rot={tuple(c.rotation_euler)}'); \\
+         r=[a.spaces[0].region_3d for a in bpy.context.screen.areas if a.type=='VIEW_3D'][0]; \\
+         print(f'target={tuple(r.view_location)}')"
+  5. Update cam_rot and target in the Camera setup section below.
 
 Components:
-  1. Ribosome (40S + 60S): translucent surface from 6Y0G
-  2. Extended mRNA: blue surface from extended_mrna.pdb (with droop bend)
-  3. P-site tRNA: orange surface, chain B4 from 6Y0G
-  4. A-site tRNA: orange surface, chain D4 from 6Y0G (not B4!)
-  5. Polypeptide: magenta surface from tunnel_polypeptide.pdb
+  1. Ribosome (40S + 60S): cartoon outline (2-pass composite) from 6Y0G
+  2. Extended mRNA: blue cartoon from extended_mrna.pdb (with droop bend)
+  3. P-site tRNA: orange ribbon, chain B4 from 6Y0G
+  4. A-site tRNA: orange ribbon, chain D4 from 6Y0G (not B4!)
+  5. Polypeptide: magenta spheres from tunnel_polypeptide.pdb
 
 Output: renders/single_frame.png (or scene.blend with --save-blend)
 
@@ -396,16 +416,14 @@ def main():
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded) — backbone only
+    # 5. Polypeptide (tunnel-threaded) — spheres so folded domain is visible
     peptide_pdb = "tunnel_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
-    peptide_bb = peptide_pdb.replace(".pdb", "_bb.pdb")
-    _write_backbone(peptide_pdb, peptide_bb, mol_type="protein")
-    mol_peptide = mn.Molecule.load(peptide_bb)
+    mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
-        style="cartoon" if MOL_STYLE != "surface" else mn.StyleSurface(),
+        style="spheres" if MOL_STYLE != "surface" else mn.StyleSurface(),
         material=make_solid_material((0.85, 0.05, 0.55)),
         name="polypeptide",
     )
@@ -454,18 +472,31 @@ def main():
     obj_mrna.data.update()
 
     # --- Camera setup ---
-    # Use frame_object to get initial framing, then zoom in ~30%
+    # Use exact camera angle from Blender (aligned via View > Align Active
+    # Camera to View). Rotation and target from scene.blend, pushed back
+    # for ortho rendering.
+    import mathutils
     canvas.frame_object(mol_surface)
     cam = scene.camera
     print(f"  Camera (auto): loc={tuple(cam.location)}, lens={cam.data.lens}")
 
-    # Zoom in slightly (85% of auto-frame distance) so ribosome fills more
-    # of the frame while polypeptide and mRNA tails remain visible
-    cam_loc = np.array(cam.location)
-    cam_target = np.zeros(3)  # approximate scene center
-    cam_dir = cam_loc - cam_target
-    cam.location = tuple(cam_target + cam_dir * 0.85)
-    print(f"  Camera (zoomed): loc={tuple(cam.location)}, lens={cam.data.lens}")
+    # Rotation from scene.blend (View > Align Active Camera to View)
+    cam_rot = mathutils.Euler((2.2480, 0.0, 0.0489), 'XYZ')
+    # Orbit center from Blender viewport
+    target = mathutils.Vector((-2.66, 1.71, 1.72))
+    # Camera forward = local -Z rotated by cam_rot
+    forward = mathutils.Vector((0, 0, -1))
+    forward.rotate(cam_rot)
+    # Push camera 50 BU back from target (ortho — distance doesn't affect size)
+    cam.location = target - forward * 50.0
+    cam.rotation_euler = cam_rot
+
+    cam.data.type = 'ORTHO'
+    cam.data.ortho_scale = 9.0    # BU visible — ribosome fills frame
+    cam.data.shift_x = 0.0
+    cam.data.shift_y = 0.0
+    print(f"  Camera (Blender-matched ortho): loc={tuple(cam.location)}, "
+          f"rot={tuple(cam.rotation_euler)}, ortho_scale={cam.data.ortho_scale}")
 
     bpy.context.view_layer.update()
 
