@@ -416,10 +416,12 @@ def main():
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded) — spheres so folded domain is visible
-    peptide_pdb = "tunnel_polypeptide.pdb"
+    # 5. Polypeptide (tunnel-threaded, repeating domains) — spheres
+    peptide_pdb = "repeating_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
-        print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
+        peptide_pdb = "tunnel_polypeptide.pdb"
+    if not os.path.exists(peptide_pdb):
+        print(f"  WARNING: no polypeptide PDB found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(

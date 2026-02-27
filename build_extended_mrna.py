@@ -427,9 +427,109 @@ def verify(extended, n_res):
     print(f"  Total atoms: {len(extended)}")
 
 
+def compute_decoding_center(full_arr):
+    """Compute the decoding center from tRNA anticodon loops.
+
+    The decoding center is the midpoint of the B4 and D4 anticodon loops
+    (residues 34-36). This is where the mRNA codons should be positioned
+    for base pairing.
+
+    Returns: (3,) decoding center position in Angstroms.
+    """
+    anticodon_res = [34, 35, 36]
+    positions = []
+    for chain_id in ["B4", "D4"]:
+        chain = full_arr[full_arr.chain_id == chain_id]
+        for res in anticodon_res:
+            res_atoms = chain[(chain.res_id == res)]
+            if len(res_atoms) > 0:
+                positions.append(res_atoms.coord.mean(axis=0))
+    if len(positions) == 0:
+        print("  WARNING: Could not find anticodon loop atoms")
+        return None
+    center = np.mean(positions, axis=0)
+    print(f"  Decoding center (B4+D4 anticodon loops, res 34-36): "
+          f"({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
+    return center
+
+
+def shift_mrna_to_decoding_center(extended, n_res, full_arr):
+    """Shift the entire mRNA so center codons align with the decoding center.
+
+    Computes the position of the center tile (tile CENTER_INDEX) mRNA atoms
+    and shifts the entire mRNA by the vector needed to place these codons
+    at the decoding center (midpoint of B4/D4 anticodon loops).
+
+    Modifies extended.coord in-place. Returns the shift vector.
+    """
+    decoding_center = compute_decoding_center(full_arr)
+    if decoding_center is None:
+        return np.zeros(3)
+
+    # Center tile residues (tile CENTER_INDEX)
+    center_res_start = CENTER_INDEX * n_res + 1
+    center_res_end = center_res_start + n_res
+    center_mask = (extended.res_id >= center_res_start) & (extended.res_id < center_res_end)
+    center_coords = extended.coord[center_mask]
+
+    if len(center_coords) == 0:
+        print(f"  WARNING: No atoms found for center tile (res {center_res_start}-{center_res_end})")
+        return np.zeros(3)
+
+    mrna_center = center_coords.mean(axis=0)
+    shift = decoding_center - mrna_center
+    print(f"  mRNA center tile centroid: ({mrna_center[0]:.1f}, {mrna_center[1]:.1f}, {mrna_center[2]:.1f})")
+    print(f"  Shift vector: ({shift[0]:.1f}, {shift[1]:.1f}, {shift[2]:.1f})")
+    print(f"  |shift| = {np.linalg.norm(shift):.1f} A")
+
+    extended.coord += shift
+    return shift
+
+
+def verify_mrna_trna_distance(extended, n_res, full_arr):
+    """Verify mRNA-tRNA distance at the decoding center after repositioning.
+
+    Measures minimum distance between center tile mRNA nucleotides and
+    B4/D4 anticodon atoms (res 34-36). Should be < 5A for proper base pairing.
+    """
+    print("\n=== mRNA-tRNA distance verification ===")
+    center_res_start = CENTER_INDEX * n_res + 1
+    center_res_end = center_res_start + n_res
+    center_mask = (extended.res_id >= center_res_start) & (extended.res_id < center_res_end)
+    mrna_coords = extended.coord[center_mask]
+
+    anticodon_res = [34, 35, 36]
+    for chain_id in ["B4", "D4"]:
+        chain = full_arr[full_arr.chain_id == chain_id]
+        ac_mask = np.isin(chain.res_id, anticodon_res)
+        ac_coords = chain.coord[ac_mask]
+        if len(ac_coords) == 0:
+            print(f"  WARNING: No anticodon atoms for chain {chain_id}")
+            continue
+
+        # Min distance between any mRNA atom and any anticodon atom
+        mrna_tree = KDTree(mrna_coords)
+        dists, _ = mrna_tree.query(ac_coords)
+        min_dist = dists.min()
+        mean_dist = dists.mean()
+        print(f"  {chain_id} anticodon -> mRNA: min={min_dist:.1f}A, mean={mean_dist:.1f}A "
+              f"({'PASS' if min_dist < 5.0 else 'FAIL: > 5A'})")
+
+
 def main():
     extended, n_res, full_arr = tile_mrna()
     verify(extended, n_res)
+
+    # Shift mRNA to decoding center (align with tRNA anticodon loops)
+    shift = shift_mrna_to_decoding_center(extended, n_res, full_arr)
+    verify_mrna_trna_distance(extended, n_res, full_arr)
+
+    # Re-write PDB with shifted coordinates
+    if np.linalg.norm(shift) > 0.1:
+        pdb = PDBFile()
+        pdb.set_structure(extended)
+        pdb.write(OUTPUT)
+        print(f"  Re-written shifted mRNA: {OUTPUT}")
 
     # Load nearby ribosome atoms for wall repulsion during MD
     nearby_ribo = get_nearby_ribosome_atoms(extended.coord, full_arr, cutoff=15.0)

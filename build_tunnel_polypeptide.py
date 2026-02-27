@@ -1,38 +1,19 @@
-"""Build a polypeptide threaded through the ribosome exit tunnel.
+"""Build a polypeptide threaded through the ribosome exit tunnel with repeating domains.
 
 Traces the exit tunnel void space from the peptidyl transferase center (PTC)
 through the 60S subunit, then builds a polypeptide chain along the centerline.
 Uses extended conformation inside the tunnel (~3.3 A/residue, fits the ~10 A
-L4-L22 constriction). After the tunnel exit, inserts a real folded protein
-domain (1UBQ ubiquitin, 76 residues) for visible secondary structure, then
-continues with a random-walk extension off-screen.
+L4-L22 constriction). After the tunnel exit, places repeating Villin HP35
+(1YRF) folded domains with 3-residue GSG linkers for visible folding animation.
 
-Past the folded domain, extends the chain using a curving random walk
-(~0.15 rad std dev angular perturbation per step) for 400 steps (800 A
-= 80 BU, ~3x ribosome diameter) so the polypeptide visibly curves and
-extends off-screen. Cubic spline smoothing softens any sharp turns.
+Chain layout:
+  [tunnel: ~30 res extended] [domain_0: 35 res] [GSG linker] [domain_1: 35 res]
+  [GSG linker] [domain_2: 35 res] [GSG linker] [domain_3: 35 res] [tail: ~10 res]
+  Total: ~192 residues
 
-After backbone construction, a geometric de-clash pushes atoms away from
-ribosome walls, then 3-stage MD annealing with wall-repulsion forces relaxes
-the structure while preventing clipping. Channel threading verification
-checks span and wall clearance at the end.
-
-Algorithm:
-  1. Build KDTree of all 60S ribosome atoms
-  2. Follow chain C4 backbone from 6Y0G as the tunnel centerline
-     (crystallographic ground truth — no greedy tracing artifacts)
-  3. If C4 doesn't reach exit, continue with greedy void-space tracer
-     (high directional momentum 0.9 to avoid side cavities)
-  4. Extend past exit with random-walk curvature (400 steps, 800 A)
-  5. Smooth centerline with variable-rate resampling (extended in tunnel,
-     folded domain after exit, helix for extension)
-  6. Build backbone: extended in tunnel, real ubiquitin fold after exit,
-     polyalanine random walk extension
-  7. Geometric de-clash against ribosome walls
-  8. 3-stage constrained MD with wall repulsion (100K steps total)
-  9. Channel threading verification (PASS/FAIL)
-
-Output: tunnel_polypeptide.pdb
+Outputs:
+  - repeating_polypeptide.pdb — full chain in extended conformation
+  - repeating_polypeptide_folds.npz — per-domain folded coordinates + metadata
 
 Run with: python3.11 build_tunnel_polypeptide.py
 """
@@ -50,7 +31,11 @@ import sys
 import os
 import tempfile
 
-OUTPUT = "tunnel_polypeptide.pdb"
+OUTPUT_PDB = "repeating_polypeptide.pdb"
+OUTPUT_NPZ = "repeating_polypeptide_folds.npz"
+# Also write legacy name for backward compat with render_single_frame.py
+OUTPUT_LEGACY = "tunnel_polypeptide.pdb"
+
 EXTENDED_RISE_PER_RESIDUE = 3.3  # Angstroms (extended conformation in tunnel)
 HELIX_RISE_PER_RESIDUE = 1.5    # Angstroms (alpha helix after exit)
 TRACE_STEP = 2.0  # Angstroms per tracing step
@@ -58,6 +43,16 @@ MIN_CLEARANCE = 4.0  # minimum distance from tunnel wall (A)
 EXIT_THRESHOLD = 15.0  # distance at which we consider having exited
 N_EXTENSION_STEPS = 400  # extension steps past tunnel exit (800 A = 80 BU)
 EXTENSION_ANGULAR_STD = 0.15  # radians std dev for random-walk direction perturbation
+
+# HP35 domain parameters
+HP35_PDB = "1YRF"
+DOMAIN_RESIDUES = 35
+LINKER_RESIDUES = 3
+REPEAT_UNIT = DOMAIN_RESIDUES + LINKER_RESIDUES  # 38 residues
+N_DOMAINS = 8
+TAIL_RESIDUES = 10
+
+CA_CA_DIST = 3.8  # standard protein CA-CA distance (Angstroms)
 
 # 60S chain IDs
 CHAINS_60S = [
@@ -147,26 +142,13 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
     """Trace the exit tunnel through the 60S subunit.
 
     Uses the crystallographic C4 nascent chain backbone (if provided) as the
-    ground-truth tunnel path. This avoids greedy void-space tracing, which
-    can wander into side cavities and produce biologically inaccurate kinks.
-
-    Falls back to greedy maximum-clearance tracing only if C4 doesn't reach
-    the tunnel exit. After exit, extends with a curving random walk.
-
-    Args:
-        atoms_60s_coords: (N, 3) array of 60S ribosome atom coordinates
-        ptc_pos: (3,) PTC position (C-terminal end of C4)
-        c4_ca_coords: (M, 3) C4 CA coordinates sorted PTC → exit (descending
-            res_id). If None, falls back to greedy tracing entirely.
-        initial_direction: (3,) initial tracing direction (PTC → exit)
+    ground-truth tunnel path. Falls back to greedy void-space tracing if C4
+    doesn't reach exit. After exit, extends with a curving random walk.
 
     Returns: (centerline, exit_arc_length)
-        centerline: (N, 3) array of tunnel centerline points
-        exit_arc_length: arc length at which tunnel exit was detected
     """
     tree = KDTree(atoms_60s_coords)
 
-    # Estimate initial direction: away from ribosome center of mass
     com = atoms_60s_coords.mean(axis=0)
     if initial_direction is None:
         initial_direction = ptc_pos - com
@@ -177,10 +159,10 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
     current_dir = initial_direction.copy()
     exited = False
 
-    # --- Phase 1: Follow crystallographic C4 backbone (ground truth) ---
+    # Phase 1: Follow crystallographic C4 backbone
     if c4_ca_coords is not None and len(c4_ca_coords) >= 2:
         print(f"  Phase 1: Following C4 crystallographic path "
-              f"({len(c4_ca_coords)} CAs, PTC → exit)...")
+              f"({len(c4_ca_coords)} CAs, PTC -> exit)...")
         for i in range(1, len(c4_ca_coords)):
             pt = c4_ca_coords[i]
             centerline.append(pt.copy())
@@ -192,11 +174,10 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
 
             if dist > EXIT_THRESHOLD:
                 print(f"    C4 CA {i}: clearance {dist:.1f}A > {EXIT_THRESHOLD}A "
-                      f"— tunnel exit reached via C4 path")
+                      f"-- tunnel exit reached via C4 path")
                 exited = True
                 break
 
-        # Update current position/direction from end of C4 path
         current_pos = centerline[-1].copy()
         if len(centerline) >= 2:
             current_dir = centerline[-1] - centerline[-2]
@@ -206,11 +187,8 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
             print(f"  C4 path ended inside tunnel after {len(c4_ca_coords)} CAs, "
                   f"continuing with greedy tracer...")
 
-    # --- Phase 2: Greedy void-space tracer (only if C4 didn't reach exit) ---
-    # Uses forward-biased scoring: score = clearance + FORWARD_BIAS * alignment
-    # This prevents the tracer from being lured into side cavities that happen
-    # to be wider but are off the tunnel axis.
-    FORWARD_BIAS = 3.0  # weight for forward alignment vs clearance
+    # Phase 2: Greedy void-space tracer
+    FORWARD_BIAS = 3.0
     if not exited:
         max_steps = 200
         n_candidates = 36
@@ -238,9 +216,7 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
                     candidate = ahead + r * (np.cos(angle) * u + np.sin(angle) * v)
                     dist, _ = tree.query(candidate)
                     if dist < MIN_CLEARANCE * 0.5:
-                        continue  # skip candidates too close to walls
-                    # Forward alignment: how much does this candidate continue
-                    # in the current direction? (1.0 = perfectly forward)
+                        continue
                     disp = candidate - current_pos
                     disp_norm = np.linalg.norm(disp)
                     if disp_norm > 0:
@@ -270,7 +246,6 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
             centerline.append(best_pos)
             new_dir = best_pos - current_pos
             new_dir = new_dir / np.linalg.norm(new_dir)
-            # High momentum (0.9) to keep direction and avoid side cavities
             current_dir = 0.9 * current_dir + 0.1 * new_dir
             current_dir = current_dir / np.linalg.norm(current_dir)
             current_pos = best_pos
@@ -280,14 +255,13 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
                       f"pos=({current_pos[0]:.1f}, {current_pos[1]:.1f}, "
                       f"{current_pos[2]:.1f})")
 
-    # Compute exit arc length
     exit_arc_length = None
     if exited:
         cl_arr = np.array(centerline)
         exit_arc_length = sum(np.linalg.norm(cl_arr[i+1] - cl_arr[i])
                               for i in range(len(cl_arr) - 1))
 
-    # --- Phase 3: Random-walk extension past tunnel exit ---
+    # Phase 3: Random-walk extension past tunnel exit
     if exited:
         print(f"  Phase 3: Random-walk extension ({N_EXTENSION_STEPS} steps, "
               f"{N_EXTENSION_STEPS * TRACE_STEP:.0f}A)...")
@@ -322,37 +296,28 @@ def trace_tunnel(atoms_60s_coords, ptc_pos, c4_ca_coords=None,
 def smooth_centerline(centerline, exit_arc_length):
     """Smooth the centerline with cubic spline and variable-rate resampling.
 
-    Inside the tunnel (before exit_arc_length): resample at EXTENDED_RISE_PER_RESIDUE
-    (3.3 A) for extended conformation.
-    After the tunnel exit: resample at HELIX_RISE_PER_RESIDUE (1.5 A) for alpha helix.
+    Inside tunnel: resample at EXTENDED_RISE_PER_RESIDUE (3.3 A).
+    After exit: resample at HELIX_RISE_PER_RESIDUE (1.5 A).
 
     Returns: (spline_points, tunnel_exit_residue, spline_fn, total_len)
     """
-    # Parameterize by arc length
     diffs = np.diff(centerline, axis=0)
     seg_lengths = np.linalg.norm(diffs, axis=1)
     t = np.zeros(len(centerline))
     t[1:] = np.cumsum(seg_lengths)
     total_len = t[-1]
 
-    # Fit cubic spline
     cs = CubicSpline(t, centerline)
 
-    # Build variable-rate sample points
     if exit_arc_length is None:
-        # No exit found — all extended conformation
         exit_arc_length = total_len
 
-    # Tunnel portion: extended conformation (3.3 A per residue)
     tunnel_t = np.arange(0, exit_arc_length, EXTENDED_RISE_PER_RESIDUE)
     tunnel_exit_residue = len(tunnel_t)
 
-    # Post-exit portion: alpha helix (1.5 A per residue)
     remaining = total_len - exit_arc_length
     if remaining > 0:
-        post_exit_t = np.arange(
-            exit_arc_length, total_len, HELIX_RISE_PER_RESIDUE)
-        # Don't duplicate the exit point
+        post_exit_t = np.arange(exit_arc_length, total_len, HELIX_RISE_PER_RESIDUE)
         if len(post_exit_t) > 0 and len(tunnel_t) > 0:
             if abs(post_exit_t[0] - tunnel_t[-1]) < 0.1:
                 post_exit_t = post_exit_t[1:]
@@ -375,12 +340,6 @@ def smooth_centerline(centerline, exit_arc_length):
 def build_backbone_along_spline(spline_points, tunnel_exit_residue):
     """Build polyalanine backbone atoms along the spline centerline.
 
-    Uses extended conformation geometry for residues inside the tunnel
-    (before tunnel_exit_residue) and alpha helix geometry after the exit.
-
-    Extended conformation: flatter offsets, 180 deg twist per residue
-    Alpha helix: standard helix offsets, 100 deg twist per residue
-
     Returns: AtomArray
     """
     n_res = len(spline_points)
@@ -388,7 +347,6 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
     print(f"    Residues 1-{tunnel_exit_residue}: extended conformation (tunnel)")
     print(f"    Residues {tunnel_exit_residue+1}-{n_res}: alpha helix (post-exit)")
 
-    # Compute local coordinate frames along the spline
     tangents = np.zeros_like(spline_points)
     tangents[0] = spline_points[1] - spline_points[0]
     tangents[-1] = spline_points[-1] - spline_points[-2]
@@ -400,8 +358,6 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
     total_atoms = n_res * atoms_per_res
     arr = AtomArray(total_atoms)
 
-    # Extended conformation offsets — flatter, more elongated
-    # Diameter ~6 A (fits ~10 A L4-L22 constriction with clearance)
     offsets_extended = {
         "N":  np.array([-0.40, -0.30, -1.65]),
         "CA": np.array([0.0, 0.0, 0.0]),
@@ -410,7 +366,6 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
         "CB": np.array([-1.52, 0.0, 0.22]),
     }
 
-    # Alpha helix offsets — standard helix geometry
     offsets_helix = {
         "N":  np.array([-0.53, -0.84, -0.75]),
         "CA": np.array([0.0, 0.0, 0.0]),
@@ -427,7 +382,6 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
         ca_pos = spline_points[i]
         t = tangents[i]
 
-        # Build local frame
         if abs(t[0]) < 0.9:
             n_vec = np.cross(t, np.array([1, 0, 0]))
         else:
@@ -435,13 +389,10 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
         n_vec = n_vec / np.linalg.norm(n_vec)
         b_vec = np.cross(t, n_vec)
 
-        # Switch geometry based on tunnel position
         if i < tunnel_exit_residue:
-            # Extended conformation: 180 deg twist per residue
             offsets = offsets_extended
             twist_angle = np.radians(180) * i
         else:
-            # Alpha helix: 100 deg twist per residue
             offsets = offsets_helix
             twist_angle = np.radians(100) * i
 
@@ -465,40 +416,38 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
     return arr
 
 
-def fetch_folded_domain(pdb_id="1UBQ"):
-    """Fetch a small globular protein to use as the folded domain.
+# ---------------------------------------------------------------------------
+# HP35 domain handling
+# ---------------------------------------------------------------------------
+def fetch_hp35_domain():
+    """Fetch Villin HP35 (1YRF) with full sidechains.
 
-    Returns: AtomArray with backbone+CB atoms for the folded domain.
+    Returns: AtomArray with all non-water protein atoms (backbone + sidechains).
     """
-    print(f"  Fetching {pdb_id} for folded domain...")
-    cif_path = rcsb_db.fetch(pdb_id, "cif", target_path="/tmp")
+    print(f"  Fetching {HP35_PDB} (Villin HP35) for folded domain...")
+    cif_path = rcsb_db.fetch(HP35_PDB, "cif", target_path="/tmp")
     cif = pdbx.CIFFile.read(cif_path)
     full_arr = pdbx.get_structure(cif, model=1)
     if isinstance(full_arr, AtomArrayStack):
         full_arr = full_arr[0]
 
-    # Keep only protein atoms (first chain, exclude water/heteroatoms)
     chains = np.unique(full_arr.chain_id)
     domain = full_arr[full_arr.chain_id == chains[0]]
-    domain = domain[~domain.hetero]  # remove water (HOH) and other heteroatoms
+    domain = domain[~domain.hetero]  # remove water and heteroatoms
 
-    # Keep backbone + CB atoms only (N, CA, C, O, CB)
+    # Keep backbone + CB for consistent rendering with MolecularNodes
     backbone_names = {"N", "CA", "C", "O", "CB"}
     domain = domain[np.isin(domain.atom_name, list(backbone_names))]
 
     n_res = len(np.unique(domain.res_id))
-    print(f"  Folded domain: {pdb_id} chain {chains[0]}, "
-          f"{n_res} residues, {len(domain)} backbone atoms")
+    print(f"  HP35 domain: {HP35_PDB} chain {chains[0]}, "
+          f"{n_res} residues, {len(domain)} backbone+CB atoms")
     return domain
 
 
-def align_folded_domain(domain, exit_pos, exit_dir):
-    """Align a folded protein domain so its N-terminus is at exit_pos,
-    oriented along exit_dir.
-
-    The domain's first CA atom is placed at exit_pos. The domain is
-    rotated so that its N->C axis aligns with exit_dir (the tunnel
-    exit trajectory).
+def align_domain_to_position(domain, attach_pos, attach_dir):
+    """Align a folded domain so its N-terminal CA is at attach_pos,
+    oriented along attach_dir.
 
     Returns: modified domain AtomArray (copy).
     """
@@ -510,119 +459,280 @@ def align_folded_domain(domain, exit_pos, exit_dir):
     if len(ca_coords) < 2:
         return domain
 
-    # Domain's N->C axis (from first to last CA)
     sort_idx = np.argsort(ca_res)
     n_term_ca = ca_coords[sort_idx[0]]
     c_term_ca = ca_coords[sort_idx[-1]]
     domain_axis = c_term_ca - n_term_ca
     domain_axis = domain_axis / np.linalg.norm(domain_axis)
 
-    # Center the domain on its N-terminal CA
     domain.coord -= n_term_ca
 
-    # Compute rotation from domain_axis to exit_dir
-    exit_dir = exit_dir / np.linalg.norm(exit_dir)
-    cross = np.cross(domain_axis, exit_dir)
+    attach_dir = attach_dir / np.linalg.norm(attach_dir)
+    cross = np.cross(domain_axis, attach_dir)
     cross_norm = np.linalg.norm(cross)
-    dot = np.dot(domain_axis, exit_dir)
+    dot = np.dot(domain_axis, attach_dir)
 
     if cross_norm > 1e-6:
-        # Rodrigues rotation
         R = rotation_matrix(cross / cross_norm, np.arccos(np.clip(dot, -1, 1)))
         domain.coord = (R @ domain.coord.T).T
     elif dot < 0:
-        # 180 degree rotation — pick an arbitrary perpendicular axis
-        if abs(exit_dir[0]) < 0.9:
-            perp = np.cross(exit_dir, np.array([1, 0, 0]))
+        if abs(attach_dir[0]) < 0.9:
+            perp = np.cross(attach_dir, np.array([1, 0, 0]))
         else:
-            perp = np.cross(exit_dir, np.array([0, 1, 0]))
+            perp = np.cross(attach_dir, np.array([0, 1, 0]))
         perp = perp / np.linalg.norm(perp)
         R = rotation_matrix(perp, np.pi)
         domain.coord = (R @ domain.coord.T).T
 
-    # Translate so N-terminal CA is at exit_pos
-    domain.coord += exit_pos
-
+    domain.coord += attach_pos
     return domain
 
 
-def build_hybrid_polypeptide(spline_points, tunnel_exit_residue,
-                             exit_pos, exit_dir):
-    """Build a polypeptide with three zones:
-    1. Extended conformation in tunnel (polyalanine)
-    2. Real folded domain after exit (ubiquitin)
-    3. Polyalanine random-walk extension off-screen
+def build_extended_segment(n_residues, start_pos, direction, res_name="ALA"):
+    """Build an extended backbone segment along a direction.
+
+    Returns: AtomArray with backbone atoms (N, CA, C, O, CB) per residue.
+    """
+    direction = direction / np.linalg.norm(direction)
+
+    # Generate CA positions along the direction
+    ca_positions = np.array([start_pos + i * CA_CA_DIST * direction
+                              for i in range(n_residues)])
+
+    # Use build_backbone_along_spline with all-extended conformation
+    arr = build_backbone_along_spline(ca_positions, n_residues)
+
+    # Overwrite residue names
+    arr.res_name[:] = res_name
+    return arr
+
+
+def build_random_walk_extension(start_pos, start_dir, n_residues=10,
+                                 ca_spacing=3.8, angular_std=0.10, seed=42,
+                                 repel_center=None, repel_strength=0.3):
+    """Build a smooth random-walk polyalanine extension.
 
     Returns: AtomArray
     """
-    # Build tunnel portion (extended polyalanine)
-    tunnel_points = spline_points[:tunnel_exit_residue]
+    rng = np.random.default_rng(seed)
+    ca_positions = [start_pos.copy()]
+    current_dir = start_dir / np.linalg.norm(start_dir)
+
+    for _ in range(n_residues):
+        if abs(current_dir[0]) < 0.9:
+            perp1 = np.cross(current_dir, np.array([1.0, 0.0, 0.0]))
+        else:
+            perp1 = np.cross(current_dir, np.array([0.0, 1.0, 0.0]))
+        perp1 = perp1 / np.linalg.norm(perp1)
+        perp2 = np.cross(current_dir, perp1)
+
+        dtheta = rng.normal(0, angular_std)
+        dphi = rng.uniform(0, 2 * np.pi)
+        current_dir = (current_dir * np.cos(dtheta)
+                       + perp1 * np.sin(dtheta) * np.cos(dphi)
+                       + perp2 * np.sin(dtheta) * np.sin(dphi))
+        current_dir = current_dir / np.linalg.norm(current_dir)
+
+        if repel_center is not None:
+            away = ca_positions[-1] - repel_center
+            away = away / np.linalg.norm(away)
+            current_dir = (1 - repel_strength) * current_dir + repel_strength * away
+            current_dir = current_dir / np.linalg.norm(current_dir)
+
+        next_ca = ca_positions[-1] + current_dir * ca_spacing
+        ca_positions.append(next_ca)
+
+    ca_positions = np.array(ca_positions)
+    return build_backbone_along_spline(ca_positions, 0)
+
+
+def build_repeating_domain_chain(spline_points, tunnel_exit_residue,
+                                  exit_pos, exit_dir, ribo_center=None):
+    """Build polypeptide with repeating HP35 domains after the tunnel.
+
+    Layout:
+      1. Extended conformation in tunnel (polyalanine)
+      2. N_DOMAINS x (HP35 folded domain + GSG linker)
+      3. Short tail extension
+
+    Returns: (combined AtomArray, fold_data dict)
+    """
+    print(f"\n=== Building repeating domain chain ===")
+    print(f"  {N_DOMAINS} HP35 domains x {DOMAIN_RESIDUES} res + "
+          f"{LINKER_RESIDUES} res linkers = {REPEAT_UNIT} res/repeat")
+
+    # Build tunnel portion (extended polyalanine up to exit)
     tunnel_poly = build_backbone_along_spline(
-        spline_points[:tunnel_exit_residue + 10],  # include transition zone
-        tunnel_exit_residue)
+        spline_points[:tunnel_exit_residue], tunnel_exit_residue)
 
-    # Fetch and align the folded domain
-    domain = fetch_folded_domain("1UBQ")
-    domain = align_folded_domain(domain, exit_pos, exit_dir)
-
-    # Renumber domain residues to continue after tunnel
-    tunnel_res = np.unique(tunnel_poly.res_id)
-    n_tunnel_res = len(tunnel_res)
-    domain_res = np.unique(domain.res_id)
-    res_remap = {int(old): n_tunnel_res + i + 1
-                 for i, old in enumerate(domain_res)}
-    for i in range(len(domain)):
-        domain.res_id[i] = res_remap[int(domain.res_id[i])]
-    domain.chain_id[:] = "A"
-
-    # Build extension portion (polyalanine after folded domain)
-    # Use spline points past the folded domain region
-    domain_ca = domain.coord[domain.atom_name == "CA"]
-    if len(domain_ca) > 0:
-        domain_extent_A = np.linalg.norm(domain_ca[-1] - domain_ca[0])
-        # Estimate how many spline points the domain occupies
-        domain_spline_pts = int(domain_extent_A / HELIX_RISE_PER_RESIDUE)
+    tunnel_ca = tunnel_poly.coord[tunnel_poly.atom_name == "CA"]
+    tunnel_last_ca = tunnel_ca[-1]
+    if len(tunnel_ca) >= 2:
+        attach_dir = tunnel_ca[-1] - tunnel_ca[-2]
+        attach_dir = attach_dir / np.linalg.norm(attach_dir)
     else:
-        domain_spline_pts = 50
+        attach_dir = exit_dir
 
-    ext_start_idx = tunnel_exit_residue + domain_spline_pts
-    if ext_start_idx < len(spline_points):
-        ext_points = spline_points[ext_start_idx:]
-        ext_poly = build_backbone_along_spline(
-            ext_points, 0)  # all helix conformation
+    n_tunnel_res = len(np.unique(tunnel_poly.res_id))
+    print(f"  Tunnel: {n_tunnel_res} residues (extended)")
 
-        # Renumber extension residues
-        n_domain_res = len(np.unique(domain.res_id))
-        ext_poly.res_id += n_tunnel_res + n_domain_res
-    else:
-        ext_poly = None
+    # Bias exit direction away from ribosome and upward
+    chain_dir = attach_dir.copy()
+    if ribo_center is not None:
+        away = tunnel_last_ca - ribo_center
+        away = away / np.linalg.norm(away)
+        upper_left = np.array([-0.5, 0.0, 1.0])
+        upper_left = upper_left / np.linalg.norm(upper_left)
+        chain_dir = 0.4 * chain_dir + 0.1 * away + 0.5 * upper_left
+        chain_dir = chain_dir / np.linalg.norm(chain_dir)
+
+    # Fetch HP35 template
+    hp35_template = fetch_hp35_domain()
+    hp35_template_ca = hp35_template.coord[hp35_template.atom_name == "CA"]
+    hp35_n_res = len(np.unique(hp35_template.res_id))
+
+    # Compute HP35 extent along its N->C axis for domain spacing
+    hp35_res = hp35_template.res_id[hp35_template.atom_name == "CA"]
+    sort_idx = np.argsort(hp35_res)
+    hp35_n_term = hp35_template_ca[sort_idx[0]]
+    hp35_c_term = hp35_template_ca[sort_idx[-1]]
+    domain_extent = np.linalg.norm(hp35_c_term - hp35_n_term)
+    print(f"  HP35 extent (N->C CA): {domain_extent:.1f}A")
+
+    # Spacing between consecutive domain starts (domain extent + linker length)
+    repeat_distance = domain_extent + LINKER_RESIDUES * CA_CA_DIST
+    print(f"  Repeat distance: {repeat_distance:.1f}A "
+          f"(domain {domain_extent:.1f}A + linker {LINKER_RESIDUES * CA_CA_DIST:.1f}A)")
+
+    # Place domains along chain direction
+    parts = [tunnel_poly]
+    current_res_id = n_tunnel_res
+    current_pos = tunnel_last_ca + CA_CA_DIST * chain_dir
+
+    fold_data = {
+        'n_domains': N_DOMAINS,
+        'repeat_residues': REPEAT_UNIT,
+        'scroll_vector': chain_dir.copy(),
+        'repeat_distance': repeat_distance,
+    }
+
+    for di in range(N_DOMAINS):
+        print(f"\n  Domain {di}:")
+
+        # Place folded domain
+        domain = align_domain_to_position(hp35_template, current_pos, chain_dir)
+        domain_ca = domain.coord[domain.atom_name == "CA"]
+        domain_res_orig = np.unique(domain.res_id)
+
+        # Renumber domain residues
+        current_res_id += 1
+        domain_start_res = current_res_id
+        res_remap = {int(old): domain_start_res + i
+                     for i, old in enumerate(domain_res_orig)}
+        for ai in range(len(domain)):
+            domain.res_id[ai] = res_remap[int(domain.res_id[ai])]
+        domain.chain_id[:] = "A"
+        domain_end_res = current_res_id + len(domain_res_orig) - 1
+        current_res_id = domain_end_res
+
+        # Store folded coordinates for this domain
+        fold_data[f'domain_{di}_folded'] = domain.coord.copy()
+        fold_data[f'domain_{di}_start_res'] = domain_start_res
+        fold_data[f'domain_{di}_end_res'] = domain_end_res
+        fold_data[f'domain_{di}_atom_names'] = domain.atom_name.copy()
+
+        # Build extended conformation for the same residues
+        # (backbone stretched along chain direction)
+        n_domain_res = len(domain_res_orig)
+        ext_segment = build_extended_segment(
+            n_domain_res, current_pos, chain_dir)
+        # Match residue IDs to the folded domain
+        ext_res_orig = np.unique(ext_segment.res_id)
+        for ai in range(len(ext_segment)):
+            old_res = ext_segment.res_id[ai]
+            local_idx = np.searchsorted(ext_res_orig, old_res)
+            ext_segment.res_id[ai] = domain_start_res + local_idx
+        ext_segment.chain_id[:] = "A"
+
+        fold_data[f'domain_{di}_extended'] = ext_segment.coord.copy()
+
+        print(f"    Folded: res {domain_start_res}-{domain_end_res} "
+              f"({n_domain_res} res, {len(domain)} atoms)")
+        print(f"    Attach: ({current_pos[0]:.1f}, {current_pos[1]:.1f}, "
+              f"{current_pos[2]:.1f})")
+
+        # Use FOLDED domain for PDB output (visible secondary structure)
+        # Animation morph will interpolate between extended/folded from NPZ
+        parts.append(domain)
+
+        # Advance position based on folded domain's C-terminal CA
+        domain_ca_sorted = domain.coord[domain.atom_name == "CA"]
+        domain_ca_res = domain.res_id[domain.atom_name == "CA"]
+        c_term_idx = np.argmax(domain_ca_res)
+        current_pos = domain_ca_sorted[c_term_idx] + CA_CA_DIST * chain_dir
+
+        # Add GSG linker (except after last domain)
+        if di < N_DOMAINS - 1:
+            linker = build_extended_segment(
+                LINKER_RESIDUES, current_pos, chain_dir, res_name="GLY")
+            current_res_id += 1
+            linker_start = current_res_id
+            linker_res_orig = np.unique(linker.res_id)
+            for ai in range(len(linker)):
+                old_res = linker.res_id[ai]
+                local_idx = np.searchsorted(linker_res_orig, old_res)
+                linker.res_id[ai] = linker_start + local_idx
+            linker.chain_id[:] = "A"
+            # Set GSG residue names
+            linker_res_unique = np.unique(linker.res_id)
+            for li, lr in enumerate(linker_res_unique):
+                name = ["GLY", "SER", "GLY"][li % 3]
+                linker.res_name[linker.res_id == lr] = name
+            current_res_id = linker_start + LINKER_RESIDUES - 1
+            parts.append(linker)
+
+            linker_ca = linker.coord[linker.atom_name == "CA"]
+            current_pos = linker_ca[-1] + CA_CA_DIST * chain_dir
+            print(f"    Linker: {LINKER_RESIDUES} res (GSG)")
+
+    # Tail extension (random walk off-screen)
+    tail = build_random_walk_extension(
+        current_pos, chain_dir, n_residues=TAIL_RESIDUES - 1,
+        ca_spacing=CA_CA_DIST, angular_std=0.08, seed=99,
+        repel_center=ribo_center, repel_strength=0.2)
+    current_res_id += 1
+    tail_start = current_res_id
+    tail_res_orig = np.unique(tail.res_id)
+    for ai in range(len(tail)):
+        old_res = tail.res_id[ai]
+        local_idx = np.searchsorted(tail_res_orig, old_res)
+        tail.res_id[ai] = tail_start + local_idx
+    tail.chain_id[:] = "A"
+    parts.append(tail)
+    print(f"\n  Tail: {TAIL_RESIDUES} residues (random walk)")
 
     # Concatenate all parts
-    parts = [tunnel_poly, domain]
-    if ext_poly is not None:
-        parts.append(ext_poly)
-
     combined = concatenate(parts)
     n_total_res = len(np.unique(combined.res_id))
-    n_domain_res = len(np.unique(domain.res_id))
-    print(f"  Hybrid polypeptide: {n_total_res} residues total")
-    print(f"    Tunnel: {n_tunnel_res} residues (extended)")
-    print(f"    Folded domain: {n_domain_res} residues (ubiquitin)")
-    if ext_poly is not None:
-        n_ext = len(np.unique(ext_poly.res_id))
-        print(f"    Extension: {n_ext} residues (helix)")
+    print(f"\n  Total: {n_total_res} residues, {len(combined)} atoms")
 
-    return combined
+    # Verify CA-CA junctions
+    all_ca = combined.coord[combined.atom_name == "CA"]
+    if len(all_ca) > 1:
+        ca_dists = np.linalg.norm(np.diff(all_ca, axis=0), axis=1)
+        bad = np.where((ca_dists > 6.0) | (ca_dists < 1.5))[0]
+        if len(bad) > 0:
+            print(f"  WARNING: {len(bad)} problematic CA-CA distances (>6A or <1.5A)")
+            for i in bad[:10]:
+                print(f"    CA {i+1}->{i+2}: {ca_dists[i]:.2f}A")
+        else:
+            print(f"  All CA-CA distances in range [1.5, 6.0]A")
+
+    return combined, fold_data
 
 
 def declash_structure(coords, ribosome_tree, ribo_coords, min_dist=3.0, max_iter=100):
-    """Push polypeptide atoms away from ribosome walls.
-
-    Iteratively displaces any atom closer than min_dist to the nearest
-    ribosome atom, pushing it radially outward until clearance is achieved.
-
-    Returns: modified coords (in-place).
-    """
+    """Push polypeptide atoms away from ribosome walls."""
     print(f"  Geometric de-clash (min_dist={min_dist}A, max_iter={max_iter})...")
     for iteration in range(max_iter):
         dists, idxs = ribosome_tree.query(coords)
@@ -633,7 +743,7 @@ def declash_structure(coords, ribosome_tree, ribo_coords, min_dist=3.0, max_iter
             break
         push_dir = coords[clashing] - ribo_coords[idxs[clashing]]
         norms = np.linalg.norm(push_dir, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-6)  # avoid division by zero
+        norms = np.maximum(norms, 1e-6)
         push_dir = push_dir / norms
         deficit = min_dist - dists[clashing]
         coords[clashing] += push_dir * deficit[:, None]
@@ -644,7 +754,7 @@ def declash_structure(coords, ribosome_tree, ribo_coords, min_dist=3.0, max_iter
 
 
 def verify_clearance(label, coords, ribosome_tree):
-    """Verify and print clearance stats for ALL atoms against ribosome."""
+    """Verify and print clearance stats."""
     distances, _ = ribosome_tree.query(coords)
     min_dist = distances.min()
     max_dist = distances.max()
@@ -664,13 +774,7 @@ def verify_clearance(label, coords, ribosome_tree):
 
 
 def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
-    """3-stage constrained MD with wall repulsion.
-
-    Phase 1: 50K steps at 400K (k_restraint=50, k_wall=1000)
-    Phase 2: 30K steps at 350K (k_restraint=20, k_wall=3000)
-    Phase 3: 20K steps at 310K (k_restraint=10, k_wall=5000)
-    Final energy minimization.
-    """
+    """3-stage constrained MD with wall repulsion."""
     from openmm.app import (
         PDBFile as OmmPDB, ForceField, Modeller, Simulation,
         NoCutoff, HBonds, StateDataReporter,
@@ -688,7 +792,6 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
 
     print(f"\n=== 3-stage MD relaxation with wall repulsion ({TOTAL_STEPS} steps) ===")
 
-    # Load polypeptide
     with open(polypeptide_pdb) as f:
         lines = [line for line in f if not line.startswith("CONECT")]
     clean = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w")
@@ -726,7 +829,7 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
     system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff,
                              constraints=HBonds)
 
-    # Position restraints (ramped via global parameter)
+    # Position restraints
     restraint = CustomExternalForce("0.5*k_restraint*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
     restraint.addGlobalParameter("k_restraint", 50.0)
     restraint.addPerParticleParameter("x0")
@@ -739,19 +842,16 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
         restraint.addParticle(i, [pos[0], pos[1], pos[2]])
     system.addForce(restraint)
 
-    # Wall repulsion force: penalizes atoms closer than 3 A to nearest ribosome atom.
-    # Pre-compute nearest ribosome wall point per peptide atom.
+    # Wall repulsion force
     ribo_tree = KDTree(ribo_coords)
     pep_coords_nm = np.array([positions[i].value_in_unit(nanometer)
                                for i in range(n_peptide_atoms)])
-    pep_coords_A = pep_coords_nm * 10.0  # nm -> Angstroms for KDTree query
+    pep_coords_A = pep_coords_nm * 10.0
 
     _, nearest_idx = ribo_tree.query(pep_coords_A)
-    nearest_ribo_A = ribo_coords[nearest_idx]  # in Angstroms
-    nearest_ribo_nm = nearest_ribo_A * 0.1  # -> nm
+    nearest_ribo_A = ribo_coords[nearest_idx]
+    nearest_ribo_nm = nearest_ribo_A * 0.1
 
-    # Wall force: quadratic repulsion from pre-computed wall points
-    # r_min = 0.3 nm (3 A), distance measured from wall point
     wall_force = CustomExternalForce(
         "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
         "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
@@ -770,17 +870,14 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
 
     integrator = LangevinMiddleIntegrator(
         PHASE1_TEMP * kelvin, 1 / picosecond, 0.002 * picoseconds)
-    # Force CPU platform (OpenCL can hang on Apple Silicon)
     from openmm import Platform
     platform = Platform.getPlatformByName('CPU')
     sim = Simulation(modeller.topology, system, integrator, platform)
     sim.context.setPositions(modeller.positions)
 
-    # Initial minimize
     print("  Minimizing...")
     sim.minimizeEnergy(maxIterations=0)
 
-    # Phase 1: 400K, k_restraint=50, k_wall=1000
     print(f"  Phase 1: {PHASE1_STEPS} steps at {PHASE1_TEMP}K "
           f"(k_restraint=50, k_wall=1000)...")
     sim.reporters.append(
@@ -789,7 +886,6 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
     )
     sim.step(PHASE1_STEPS)
 
-    # Phase 2: 350K, k_restraint=20, k_wall=3000
     print(f"  Phase 2: {PHASE2_STEPS} steps at {PHASE2_TEMP}K "
           f"(k_restraint=20, k_wall=3000)...")
     integrator.setTemperature(PHASE2_TEMP * kelvin)
@@ -797,7 +893,6 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
     sim.context.setParameter("k_wall", 3000.0)
     sim.step(PHASE2_STEPS)
 
-    # Phase 3: 310K, k_restraint=10, k_wall=5000
     print(f"  Phase 3: {PHASE3_STEPS} steps at {PHASE3_TEMP}K "
           f"(k_restraint=10, k_wall=5000)...")
     integrator.setTemperature(PHASE3_TEMP * kelvin)
@@ -805,7 +900,6 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
     sim.context.setParameter("k_wall", 5000.0)
     sim.step(PHASE3_STEPS)
 
-    # Final minimize
     print("  Final minimization...")
     sim.minimizeEnergy(maxIterations=0)
     state_final = sim.context.getState(getEnergy=True, getPositions=True)
@@ -817,27 +911,15 @@ def relax_polypeptide(polypeptide_pdb, ribo_coords, output_pdb):
 
 
 def verify_channel_threading(coords, ribo_coords, ribo_tree, label="polypeptide"):
-    """Verify that the molecule threads through the ribosome channel.
-
-    Checks:
-    1. Backbone atoms span from one side of ribosome to the other along
-       the channel axis (extent > ribosome diameter * 0.5)
-    2. Atoms inside the ribosome have clearance consistent with channel
-       (< 15 A from walls = inside, > 2.5 A from walls = not clipping)
-
-    Prints PASS/FAIL.
-    """
+    """Verify that the molecule threads through the ribosome channel."""
     print(f"\n=== Channel threading verification: {label} ===")
 
-    # Ribosome bounding box for reference
     ribo_min = ribo_coords.min(axis=0)
     ribo_max = ribo_coords.max(axis=0)
     ribo_extent = ribo_max - ribo_min
-    ribo_center = (ribo_min + ribo_max) / 2
     print(f"  Ribosome extent: ({ribo_extent[0]:.0f}, {ribo_extent[1]:.0f}, "
           f"{ribo_extent[2]:.0f}) A")
 
-    # Check 1: molecule spans across the ribosome
     mol_min = coords.min(axis=0)
     mol_max = coords.max(axis=0)
     mol_extent = mol_max - mol_min
@@ -850,9 +932,8 @@ def verify_channel_threading(coords, ribo_coords, ribo_tree, label="polypeptide"
     print(f"  Span check: {'PASS' if span_pass else 'FAIL'} "
           f"(need > 0.5x ribosome)")
 
-    # Check 2: atoms inside ribosome have proper clearance
     distances, _ = ribo_tree.query(coords)
-    inside_mask = distances < 15.0  # atoms within 15 A of ribosome walls = "inside"
+    inside_mask = distances < 15.0
     n_inside = inside_mask.sum()
 
     if n_inside > 0:
@@ -864,7 +945,7 @@ def verify_channel_threading(coords, ribo_coords, ribo_tree, label="polypeptide"
         print(f"  Clearance check: {'PASS' if clearance_pass else 'FAIL'}")
     else:
         clearance_pass = True
-        print(f"  No atoms inside ribosome — molecule is entirely outside")
+        print(f"  No atoms inside ribosome -- molecule is entirely outside")
         print(f"  Clearance check: PASS (trivially)")
 
     overall = span_pass and clearance_pass
@@ -873,7 +954,7 @@ def verify_channel_threading(coords, ribo_coords, ribo_tree, label="polypeptide"
 
 
 def main():
-    print("=== Building tunnel-threaded polypeptide ===")
+    print("=== Building tunnel-threaded polypeptide with repeating HP35 domains ===")
 
     # Load ribosome
     atoms_60s, c4, full_arr = load_ribosome()
@@ -883,33 +964,31 @@ def main():
     # Find PTC position
     ptc_pos = find_ptc_position(c4)
 
-    # Get C4 CA coordinates sorted PTC → exit (descending res_id)
-    # C4 is the crystallographic nascent chain — its backbone IS the tunnel path
+    # Get C4 CA coordinates sorted PTC -> exit (descending res_id)
     ca_mask = c4.atom_name == "CA"
     ca_coords = c4.coord[ca_mask]
     ca_res = c4.res_id[ca_mask]
     if len(ca_coords) >= 2:
-        sort_idx_desc = np.argsort(ca_res)[::-1]  # PTC (highest res_id) first
+        sort_idx_desc = np.argsort(ca_res)[::-1]
         c4_cas = ca_coords[sort_idx_desc]
-        # Initial direction: PTC → N-terminus (toward exit)
         initial_dir = c4_cas[-1] - c4_cas[0]
         initial_dir = initial_dir / np.linalg.norm(initial_dir)
-        print(f"  C4 chain: {len(c4_cas)} CAs, PTC → exit")
+        print(f"  C4 chain: {len(c4_cas)} CAs, PTC -> exit")
         print(f"  Initial direction from C4: ({initial_dir[0]:.2f}, "
               f"{initial_dir[1]:.2f}, {initial_dir[2]:.2f})")
     else:
         c4_cas = None
         initial_dir = None
 
-    # Trace tunnel using C4 crystallographic path, then extend
+    # Trace tunnel
     centerline, exit_arc_length = trace_tunnel(
         ribo_coords, ptc_pos, c4_ca_coords=c4_cas, initial_direction=initial_dir)
 
-    # Smooth centerline with variable-rate resampling
+    # Smooth centerline
     spline_points, tunnel_exit_residue, spline_fn, total_len = smooth_centerline(
         centerline, exit_arc_length)
 
-    # Compute exit position and direction for folded domain alignment
+    # Compute exit position and direction
     exit_pos = spline_points[tunnel_exit_residue]
     if tunnel_exit_residue + 1 < len(spline_points):
         exit_dir = spline_points[tunnel_exit_residue + 1] - spline_points[tunnel_exit_residue]
@@ -919,9 +998,11 @@ def main():
         exit_dir = np.array([0, 0, -1])
     exit_dir = exit_dir / np.linalg.norm(exit_dir)
 
-    # Build hybrid polypeptide: tunnel (extended) + folded domain + extension (helix)
-    polypeptide = build_hybrid_polypeptide(
-        spline_points, tunnel_exit_residue, exit_pos, exit_dir)
+    # Build repeating domain polypeptide
+    ribo_center = ribo_coords.mean(axis=0)
+    polypeptide, fold_data = build_repeating_domain_chain(
+        spline_points, tunnel_exit_residue, exit_pos, exit_dir,
+        ribo_center=ribo_center)
 
     # Geometric de-clash against ribosome walls
     verify_clearance("before de-clash", polypeptide.coord, ribo_tree)
@@ -930,30 +1011,44 @@ def main():
     verify_clearance("after de-clash", polypeptide.coord, ribo_tree)
 
     # Write raw PDB
-    raw_pdb = "tunnel_polypeptide_raw.pdb"
+    raw_pdb = "repeating_polypeptide_raw.pdb"
     pdb = PDBFile()
     pdb.set_structure(polypeptide)
     pdb.write(raw_pdb)
     print(f"  Raw polypeptide: {raw_pdb} ({len(polypeptide)} atoms, "
           f"{len(np.unique(polypeptide.res_id))} residues)")
 
-    # Relax with 3-stage MD + wall repulsion (fallback to raw if it fails)
+    # Relax with 3-stage MD + wall repulsion
     try:
-        relax_polypeptide(raw_pdb, ribo_coords, OUTPUT)
+        relax_polypeptide(raw_pdb, ribo_coords, OUTPUT_PDB)
     except Exception as e:
         print(f"  WARNING: MD relaxation failed ({e}), using raw structure")
         import shutil
-        shutil.copy(raw_pdb, OUTPUT)
+        shutil.copy(raw_pdb, OUTPUT_PDB)
 
-    # Reload and verify final clearance
-    final_pdb = PDBFile.read(OUTPUT)
+    # Also write legacy name
+    import shutil
+    shutil.copy(OUTPUT_PDB, OUTPUT_LEGACY)
+    print(f"  Also copied to {OUTPUT_LEGACY} (backward compat)")
+
+    # Save fold data NPZ
+    np.savez(OUTPUT_NPZ, **fold_data)
+    print(f"  Fold data: {OUTPUT_NPZ}")
+    for key in sorted(fold_data.keys()):
+        val = fold_data[key]
+        if isinstance(val, np.ndarray):
+            print(f"    {key}: shape={val.shape}, dtype={val.dtype}")
+        else:
+            print(f"    {key}: {val}")
+
+    # Reload and verify
+    final_pdb = PDBFile.read(OUTPUT_PDB)
     final_arr = final_pdb.get_structure()
     if isinstance(final_arr, AtomArrayStack):
         final_arr = final_arr[0]
 
     verify_clearance("final structure", final_arr.coord, ribo_tree)
 
-    # Compute extent
     ca_coords = final_arr.coord[final_arr.atom_name == "CA"]
     if len(ca_coords) > 0:
         extent = np.linalg.norm(ca_coords[-1] - ca_coords[0])
@@ -961,7 +1056,6 @@ def main():
               f"{len(np.unique(final_arr.res_id))} residues")
         print(f"  CA extent: {extent:.1f}A = {extent * 0.1:.1f} BU")
 
-    # Threading verification
     verify_channel_threading(final_arr.coord, ribo_coords, ribo_tree, "polypeptide")
 
     # Clean up temp file

@@ -1,64 +1,24 @@
-"""Animate 10 elongation cycles of the 6Y0G human 80S ribosome.
+"""Animate seamless-looping ribosome translation with repeating folded domains.
 
-v5 (WIP): Fix mRNA bend + ribosome opacity + disable vertex deformation
-- mRNA bend axis computed via SVD in local space (fixes invisible bend)
-- MRNA_BEND_STRENGTH reduced to 0.015 (correct scale for local-space axis)
-- Disabled per-residue jitter and PCA vertex deformation (was tearing
-  StyleSurface meshes at residue boundaries). Polypeptide progressive
-  reveal still active. Per-atom jitter deferred to later.
-- Ribosome material: currently Principled BSDF Alpha=0.01 (hashed).
-  Translucent but fluffy/noisy — needs a non-hashed approach.
+v6: Repeating HP35 domain polypeptide with folding morph animation.
+- 38 cycles (one repeat unit = 35 res domain + 3 res linker) for seamless loop
+- 12 frames/cycle at 24fps = 2 AA/s elongation rate (debug: 6 frames/cycle)
+- Domain folding: extended→folded morph with N-to-C wave propagation
+- Scrolling: polypeptide scrolls by repeat_distance/38 per cycle
+- Per-domain fold scheduling: nearest-to-tunnel folds, others fully folded
 
-Tested approaches for ribosome translucency (none fully satisfactory):
-  - Mix-shader (v4 style): smooth texture but opacity accumulates across
-    ~50 overlapping front-facing layers. Even fac=0.99 is still opaque.
-  - Hashed alpha (Principled BSDF): real translucency but noisy/fluffy
-    texture. Smoother at 64+ samples. Alpha 0.06 best balance so far.
-  - Principled BSDF Transmission: dark and murky (frosted glass).
-  - Fresnel-based alpha: wireframe/mesh-net look (hashed noise at edges).
-  - Glass BSDF: extremely dark, nearly invisible internals.
-  - Mix-shader + mesh backface cull: testing (halves face count).
-  - Hashed alpha at 64 samples: testing (may smooth noise enough).
-  Best candidate: hashed alpha ~0.06 at 64+ samples, pending review.
+6-phase per-cycle choreography (from v5):
+  Phase 1: ESTABLISH        f0-f12    (5%)
+  Phase 2: tRNA DELIVERY    f12-f96   (35%)
+  Phase 3: ACCOMMODATION    f96-f120  (10%)
+  Phase 4: PEPTIDE TRANSFER f120-f144 (10%)
+  Phase 5: TRANSLOCATION    f144-f192 (20%)
+  Phase 6: tRNA DEPARTURE   f192-f240 (20%)
 
-Known issues / TODO:
-  Visual:
-  - Ribosome translucency: need an approach that gives smooth surface
-    quality (like v4 mix-shader) AND actual see-through transparency
-    (like hashed alpha). Neither approach alone works.
-  - mRNA bend: SVD axis fix is in place, not yet visually verified.
-    May need higher MRNA_BEND_STRENGTH.
-  - Polypeptide too short: build_tunnel_polypeptide.py updated to extend
-    100 steps (200A) past exit. Rebuild in progress.
-  - Per-atom jitter: disabled for now (tears surfaces). Need to
-    re-enable by deforming atom positions pre-surface generation or
-    applying smooth whole-object deformation.
-  Animation:
-  - mRNA codon translocation: must slide smoothly by one codon per
-    cycle. Logic exists but not yet verified in rendered output.
-  - Polypeptide extension: progressive reveal of new residues each
-    cycle during peptide transfer. Logic exists but not yet verified.
-  - Seamless looping: 10-cycle animation must loop. Integer-harmonic
-    jitter frequencies ensure this mathematically, but not yet
-    verified visually.
-
-v4: Architectural overhaul
-- All molecules use StyleSurface (unified realistic look)
-- Single-pass rendering with shader transparency (proper depth occlusion)
-- Per-residue deformation (replaces per-atom jitter)
-- Increased ribosome jitter (5x) and PCA amplitude (3x)
-- Extended tRNA tumbling windows with residual tumble when bound
-
-Renders N_CYCLES * FRAMES_PER_CYCLE frames (seamless loop) showing:
-- tRNA delivery to A-site (with tumbling)
-- Peptide transfer with progressive polypeptide reveal
-- Translocation (A->P, P->E)
-- tRNA departure (with tumbling)
-
-Single-pass rendering to renders/frames/frame_NNNN.png.
+Renders N_CYCLES * FRAMES_PER_CYCLE frames (seamless loop).
 
 Run with: python3.11 animate.py [--debug]
-  --debug: 480x270, 24 frames/cycle, 8 samples (fast preview)
+  --debug: 480x270, 6 frames/cycle, 32 samples (fast preview)
 """
 
 import molecularnodes as mn
@@ -73,7 +33,7 @@ import math
 # ---------------------------------------------------------------------------
 DEBUG = "--debug" in sys.argv
 SAVE_BLEND = "--save-blend" in sys.argv
-N_CYCLES = 10
+N_CYCLES = 38  # one repeat unit (35 res domain + 3 res linker)
 
 # Molecule style: cartoon (fast) or surface (production)
 MOL_STYLE = "cartoon"
@@ -83,15 +43,20 @@ for arg in sys.argv:
 
 if DEBUG:
     RES = (480, 270)
-    FRAMES_PER_CYCLE = 24
+    FRAMES_PER_CYCLE = 6   # debug: 6 frames/cycle -> 228 frames total
     SAMPLES = 32
 else:
     RES = (1920, 1080)
-    FRAMES_PER_CYCLE = 240
+    FRAMES_PER_CYCLE = 12  # production: 12 frames/cycle @ 24fps = 2 AA/s
     SAMPLES = 64
 
 TOTAL_FRAMES = N_CYCLES * FRAMES_PER_CYCLE
 FPS = 24
+
+# Fold data (loaded from NPZ in main())
+FOLD_DATA = None
+SCROLL_PER_CYCLE = None  # computed from NPZ: repeat_distance / N_CYCLES
+SCROLL_VECTOR = None     # unit vector along chain exit direction
 
 if DEBUG:
     print(f"=== DEBUG MODE: {RES[0]}x{RES[1]}, {N_CYCLES} cycles x "
@@ -131,7 +96,7 @@ DEPART_OFFSET = 3.0 * EP_VEC  # departure position for leaving tRNA
 RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 
-# Polypeptide progressive reveal
+# Polypeptide (legacy progressive reveal kept for fallback)
 INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of tunnel)
 
 # mRNA bend — droop outside the ribosome channel
@@ -634,6 +599,131 @@ def compute_peptide_positions(orig_positions, res_ids, cycle, local_frame):
 
 
 # ---------------------------------------------------------------------------
+# Polypeptide folding morph (v6: repeating HP35 domains)
+# ---------------------------------------------------------------------------
+def smoothstep(t):
+    """Hermite smoothstep: t^2 * (3 - 2*t). Starts slow, accelerates, settles."""
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
+                               cycle, local_frame, frames_per_cycle):
+    """Per-frame polypeptide vertex positions with folding + scrolling.
+
+    1. Compute global progress (fractional cycles elapsed)
+    2. For each domain: determine fold_t, interpolate extended<->folded
+    3. Apply cumulative scroll to all vertices
+
+    Args:
+        orig_positions: (N, 3) original vertex positions (extended conformation)
+        res_ids: (N,) per-vertex residue IDs
+        fold_data: dict from NPZ with domain coords and metadata
+        cycle: current cycle index (0 to N_CYCLES-1)
+        local_frame: frame within cycle (0 to frames_per_cycle-1)
+        frames_per_cycle: frames per cycle
+
+    Returns: (N, 3) modified vertex positions
+    """
+    positions = orig_positions.copy()
+    n_domains = int(fold_data['n_domains'])
+    scroll_vector = fold_data['scroll_vector']
+    repeat_distance = float(fold_data['repeat_distance'])
+    scroll_per_cycle = repeat_distance / N_CYCLES
+
+    # Global progress in fractional cycles
+    global_progress = cycle + local_frame / frames_per_cycle
+
+    for di in range(n_domains):
+        start_res = int(fold_data[f'domain_{di}_start_res'])
+        end_res = int(fold_data[f'domain_{di}_end_res'])
+        folded_coords = fold_data[f'domain_{di}_folded']
+        extended_coords = fold_data[f'domain_{di}_extended']
+
+        # Domain mask: vertices belonging to this domain
+        domain_mask = (res_ids >= start_res) & (res_ids <= end_res)
+        if not np.any(domain_mask):
+            continue
+
+        # Domain fold scheduling:
+        # - Domain 0 (nearest tunnel exit): fold_t ramps 0->1 over 38 cycles
+        # - All other domains: fold_t = 1.0 (fully folded, static)
+        if di == 0:
+            fold_t = np.clip(global_progress / N_CYCLES, 0.0, 1.0)
+        else:
+            fold_t = 1.0
+
+        if fold_t <= 0.0:
+            continue  # still fully extended, use orig_positions
+
+        # Get domain vertex indices
+        domain_indices = np.where(domain_mask)[0]
+
+        # Map mesh vertices to domain atom coordinates by residue ID
+        # The folded/extended coords arrays have one set per backbone atom
+        # (N, CA, C, O, CB) per residue, matching the PDB atom order
+        domain_res_unique = np.unique(res_ids[domain_mask])
+        n_domain_atoms = len(folded_coords)
+        n_domain_verts = len(domain_indices)
+
+        # Build mapping: for each mesh vertex, find corresponding atom index
+        # in the domain coordinate arrays
+        if n_domain_verts != n_domain_atoms:
+            # MN mesh may have different vertex count than PDB atoms
+            # Fall back to per-residue centroid morphing
+            for ri, res in enumerate(domain_res_unique):
+                res_mask = domain_mask & (res_ids == res)
+                if not np.any(res_mask):
+                    continue
+
+                # Per-residue fold_t with N-to-C wave
+                n_res = len(domain_res_unique)
+                residue_frac = ri / max(n_res - 1, 1)
+                per_res_t = np.clip((fold_t - residue_frac * 0.5) / 0.5, 0.0, 1.0)
+                eased_t = smoothstep(per_res_t)
+
+                if eased_t <= 0.0:
+                    continue
+
+                # Find centroid of folded/extended for this residue
+                atom_start = ri * 5  # 5 atoms per res (N, CA, C, O, CB)
+                atom_end = min(atom_start + 5, n_domain_atoms)
+                if atom_start >= n_domain_atoms:
+                    continue
+
+                folded_centroid = folded_coords[atom_start:atom_end].mean(axis=0)
+                extended_centroid = extended_coords[atom_start:atom_end].mean(axis=0)
+
+                # Current centroid from mesh
+                current_centroid = orig_positions[res_mask].mean(axis=0)
+
+                # Target position: interpolate centroids
+                target_centroid = extended_centroid + eased_t * (folded_centroid - extended_centroid)
+                delta = target_centroid - current_centroid
+                positions[res_mask] += delta
+        else:
+            # Direct 1:1 mapping between mesh vertices and domain atoms
+            for vi, idx in enumerate(domain_indices):
+                res = res_ids[idx]
+                ri = np.searchsorted(domain_res_unique, res)
+                n_res = len(domain_res_unique)
+                residue_frac = ri / max(n_res - 1, 1)
+                per_res_t = np.clip((fold_t - residue_frac * 0.5) / 0.5, 0.0, 1.0)
+                eased_t = smoothstep(per_res_t)
+
+                if eased_t > 0.0 and vi < n_domain_atoms:
+                    interp = extended_coords[vi] + eased_t * (folded_coords[vi] - extended_coords[vi])
+                    positions[idx] = interp
+
+    # Apply cumulative scroll: shift all vertices along scroll_vector
+    # Convert scroll from Angstroms to Blender units (1 BU = 10 A)
+    scroll_offset = global_progress * scroll_per_cycle * scroll_vector * 0.1  # A->BU
+    positions += scroll_offset
+
+    return positions
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def _extract_trna_pdbs():
@@ -671,6 +761,8 @@ def _extract_trna_pdbs():
 
 
 def main():
+    global FOLD_DATA, SCROLL_PER_CYCLE, SCROLL_VECTOR
+
     mn.register()
 
     print(f"=== Loading scene ({N_CYCLES} cycles x {FRAMES_PER_CYCLE} = "
@@ -686,13 +778,28 @@ def main():
         assert max_diff < 1e-10, f"Loop broken for obj {obj_idx}: diff={max_diff}"
     print(f"  Loop verification: PASS (jitter at frame 0 == frame {TOTAL_FRAMES})")
 
+    # --- Load fold data for polypeptide morph ---
+    fold_npz = "repeating_polypeptide_folds.npz"
+    if os.path.exists(fold_npz):
+        FOLD_DATA = dict(np.load(fold_npz, allow_pickle=True))
+        repeat_distance = float(FOLD_DATA['repeat_distance'])
+        SCROLL_PER_CYCLE = repeat_distance / N_CYCLES
+        SCROLL_VECTOR = FOLD_DATA['scroll_vector']
+        print(f"  Fold data: {fold_npz}")
+        print(f"    {int(FOLD_DATA['n_domains'])} domains, "
+              f"repeat_distance={repeat_distance:.1f}A, "
+              f"scroll_per_cycle={SCROLL_PER_CYCLE:.2f}A")
+    else:
+        print(f"  WARNING: {fold_npz} not found, folding morph disabled")
+        FOLD_DATA = None
+
     canvas = mn.Canvas(mn.scene.Cycles(samples=SAMPLES), resolution=RES)
     scene = bpy.context.scene
     scene.render.film_transparent = False
     set_bg(scene, (0.04, 0.04, 0.06), 0.5)
     scene.cycles.max_bounces = 12
-    scene.cycles.transparent_max_bounces = 64  # allow rays through many transparent layers
-    scene.cycles.use_denoising = True  # OpenImageDenoise smooths hashed noise
+    scene.cycles.transparent_max_bounces = 64
+    scene.cycles.use_denoising = True
 
     # --- Load PCA modes ---
     mrna_modes, mrna_pca_res = load_pca_modes("mrna_modes.npz")
@@ -701,17 +808,14 @@ def main():
     # --- Load molecules ---
     print("  Loading molecules...")
 
-    # Style helper: cartoon (fast) or StyleSurface (production)
     def mol_style():
         if MOL_STYLE == "surface":
             return mn.StyleSurface()
-        return MOL_STYLE  # string style name: 'cartoon', 'spheres', etc.
+        return MOL_STYLE
 
-    # Extract tRNA chains as separate PDB files (avoids processing all 210K
-    # atoms of 6Y0G three times — tRNAs are only ~2K atoms each)
     _extract_trna_pdbs()
 
-    # 1. Ribosome (40S + 60S) — translucent surface or lightweight cartoon
+    # 1. Ribosome (40S + 60S)
     mol_surface = mn.Molecule.fetch("6Y0G")
     ribo_material = (make_translucent_surface_material()
                      if MOL_STYLE == "surface"
@@ -723,7 +827,7 @@ def main():
         name="surface",
     )
 
-    # 2. mRNA (extended, from preprocessed PDB)
+    # 2. mRNA
     mol_mrna = mn.Molecule.load("extended_mrna.pdb")
     mol_mrna.add_style(
         style=mol_style(),
@@ -731,7 +835,7 @@ def main():
         name="mRNA",
     )
 
-    # 3. P-site tRNA (chain B4 — extracted PDB, ~2K atoms)
+    # 3. P-site tRNA (chain B4)
     mol_trna_p = mn.Molecule.load("trna_b4.pdb")
     mol_trna_p.add_style(
         style=mol_style(),
@@ -739,7 +843,7 @@ def main():
         name="tRNA_P",
     )
 
-    # 4. A-site tRNA (chain D4 — extracted PDB, ~2K atoms)
+    # 4. A-site tRNA (chain D4)
     mol_trna_a = mn.Molecule.load("trna_d4.pdb")
     mol_trna_a.add_style(
         style=mol_style(),
@@ -747,10 +851,12 @@ def main():
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (tunnel-threaded from preprocessed PDB)
-    peptide_pdb = "tunnel_polypeptide.pdb"
+    # 5. Polypeptide (repeating domains)
+    peptide_pdb = "repeating_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
-        print(f"  WARNING: {peptide_pdb} not found, falling back to extended_polypeptide.pdb")
+        peptide_pdb = "tunnel_polypeptide.pdb"
+    if not os.path.exists(peptide_pdb):
+        print(f"  WARNING: no polypeptide PDB found, falling back to extended_polypeptide.pdb")
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
@@ -908,15 +1014,17 @@ def main():
             obj_peptide.location = (0, 0, 0)
             obj_peptide.rotation_euler = (0, 0, math.pi / 2)
 
-            # --- Polypeptide progressive reveal ---
-            # (Per-residue jitter and PCA deformation disabled for now:
-            # they tear StyleSurface meshes at residue boundaries.
-            # TODO: re-enable by deforming atom positions pre-surface
-            # generation, or by applying smooth whole-object deformation.)
+            # --- Polypeptide folding morph + scroll ---
             pep_orig = orig_verts[obj_peptide.name]
-            revealed = compute_peptide_positions(
-                pep_orig, pep_res_ids, cycle, local_frame)
-            obj_peptide.data.vertices.foreach_set('co', revealed.ravel())
+            if FOLD_DATA is not None:
+                morphed = compute_polypeptide_morph(
+                    pep_orig, pep_res_ids, FOLD_DATA,
+                    cycle, local_frame, FRAMES_PER_CYCLE)
+            else:
+                # Fallback to legacy progressive reveal
+                morphed = compute_peptide_positions(
+                    pep_orig, pep_res_ids, cycle, local_frame)
+            obj_peptide.data.vertices.foreach_set('co', morphed.ravel())
             obj_peptide.data.update()
 
             # Camera orbit
