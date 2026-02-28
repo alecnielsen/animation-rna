@@ -1,9 +1,10 @@
-"""GPU-accelerated mRNA relaxation and rendering via Modal.
+"""GPU-accelerated mRNA relaxation, rendering, and ribosome thermal motion via Modal.
 
 GPU functions:
-  relax_on_gpu    — MD annealing on T4 (configurable steps/temps)
-  render_on_gpu   — Blender Cycles render from pre-baked .blend file
-  animate_on_gpu  — Render frame range from pre-baked .blend file
+  relax_on_gpu              — MD annealing on T4 (configurable steps/temps)
+  render_on_gpu             — Blender Cycles render from pre-baked .blend file
+  animate_on_gpu            — Render frame range from pre-baked .blend file
+  compute_ribosome_thermal  — Pre-compute ribosome ENM thermal trajectory on T4
 
 Usage:
   # Full pipeline: relax + render (debug)
@@ -20,6 +21,9 @@ Usage:
 
   # Render animation frames (requires scene.blend with animation setup)
   modal run modal_gpu.py --skip-relax --animate --frame-start 0 --frame-end 239
+
+  # Pre-compute ribosome thermal motion (outputs ribosome_thermal.npz)
+  modal run modal_gpu.py --ribosome-thermal
 
 Prerequisites:
   pip install modal
@@ -388,6 +392,204 @@ def animate_on_gpu(
 
 
 # ---------------------------------------------------------------------------
+# Ribosome thermal motion pre-computation (GPU MD)
+# ---------------------------------------------------------------------------
+
+@app.function(gpu="T4", image=md_image, timeout=3600)
+def compute_ribosome_thermal(
+    n_frames: int = 456,
+    steps_per_frame: int = 500,
+    temperature: int = 310,
+    k_restraint: float = 100.0,
+) -> bytes:
+    """Pre-compute ribosome thermal motion trajectory on GPU.
+
+    Uses coarse-grained elastic network model (ENM): one bead per residue
+    (CA for protein, P for RNA). ENM + Langevin dynamics avoids all
+    parameterization issues with modified nucleotides/metals.
+
+    Returns NPZ bytes with:
+      deltas: (n_frames, n_residues, 3) in Blender units
+      residue_ids: (n_residues,) ordinal residue indices
+    """
+    import numpy as np
+    from biotite.structure import AtomArrayStack
+    import biotite.database.rcsb as rcsb_db
+    import biotite.structure.io.pdbx as pdbx
+    import sys
+
+    print(f"=== Ribosome thermal motion ({n_frames} frames, "
+          f"{steps_per_frame} steps/frame, T={temperature}K) ===")
+
+    # Load 6Y0G
+    print("  Fetching 6Y0G...")
+    cif_path = rcsb_db.fetch("6Y0G", "cif", target_path="/tmp")
+    cif = pdbx.CIFFile.read(cif_path)
+    full_arr = pdbx.get_structure(cif, model=1)
+    if isinstance(full_arr, AtomArrayStack):
+        full_arr = full_arr[0]
+
+    # Extract ribosome chains
+    mask_ribo = np.isin(full_arr.chain_id, RIBOSOME_CHAINS)
+    ribo = full_arr[mask_ribo]
+    print(f"  Ribosome: {len(ribo)} atoms")
+
+    # Coarse-grain: one bead per residue (CA for protein, P for RNA)
+    # Build residue centroids
+    residue_keys = []
+    bead_coords = []  # in Angstroms
+    prev_key = None
+
+    for i in range(len(ribo)):
+        key = (ribo.chain_id[i], ribo.res_id[i])
+        if key != prev_key:
+            residue_keys.append(key)
+            prev_key = key
+
+    n_residues = len(residue_keys)
+    print(f"  Residues: {n_residues}")
+
+    # For each residue, pick representative atom (CA or P)
+    bead_coords = np.zeros((n_residues, 3))
+    for ri, (chain, resid) in enumerate(residue_keys):
+        res_mask = (ribo.chain_id == chain) & (ribo.res_id == resid)
+        res_atoms = ribo[res_mask]
+
+        # Try CA (protein) or P (RNA)
+        rep_mask = np.isin(res_atoms.atom_name, ["CA", "P"])
+        if np.any(rep_mask):
+            bead_coords[ri] = res_atoms.coord[rep_mask][0]
+        else:
+            bead_coords[ri] = res_atoms.coord.mean(axis=0)
+
+    # Build ENM system with OpenMM
+    from openmm import (
+        System, LangevinMiddleIntegrator, CustomBondForce,
+        CustomExternalForce, Platform,
+    )
+    from openmm.app import Simulation, Topology, Element
+    from openmm.unit import (
+        kelvin, picosecond, picoseconds, nanometer, dalton,
+        kilojoule_per_mole, angstrom,
+    )
+
+    # Create topology with one particle per residue
+    topology = Topology()
+    chain_top = topology.addChain()
+    carbon = Element.getBySymbol('C')
+    for ri in range(n_residues):
+        res = topology.addResidue(f"R{ri}", chain_top)
+        topology.addAtom(f"CA", carbon, res)
+
+    system = System()
+    bead_coords_nm = bead_coords * 0.1  # A -> nm
+
+    for ri in range(n_residues):
+        system.addParticle(100.0 * dalton)  # uniform mass
+
+    # ENM spring network: connect residues within cutoff
+    ENM_CUTOFF = 1.5  # nm (15 Angstroms)
+    ENM_K = 10.0  # kJ/mol/nm^2
+
+    from scipy.spatial import KDTree
+    tree = KDTree(bead_coords_nm)
+    pairs = tree.query_pairs(ENM_CUTOFF)
+    print(f"  ENM springs: {len(pairs)} (cutoff={ENM_CUTOFF}nm)")
+
+    bond_force = CustomBondForce("0.5*k_enm*(r-r0)^2")
+    bond_force.addGlobalParameter("k_enm", ENM_K)
+    bond_force.addPerBondParameter("r0")
+
+    for i, j in pairs:
+        r0 = np.linalg.norm(bead_coords_nm[i] - bead_coords_nm[j])
+        bond_force.addBond(i, j, [r0])
+    system.addForce(bond_force)
+
+    # Position restraints (keeps overall shape)
+    restraint = CustomExternalForce(
+        "0.5*k_restraint*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    restraint.addGlobalParameter("k_restraint", k_restraint)
+    restraint.addPerParticleParameter("x0")
+    restraint.addPerParticleParameter("y0")
+    restraint.addPerParticleParameter("z0")
+    for i in range(n_residues):
+        restraint.addParticle(i, [
+            bead_coords_nm[i, 0], bead_coords_nm[i, 1], bead_coords_nm[i, 2]
+        ])
+    system.addForce(restraint)
+
+    # Langevin dynamics
+    integrator = LangevinMiddleIntegrator(
+        temperature * kelvin, 1 / picosecond, 0.002 * picoseconds)
+
+    # Use CUDA on GPU
+    try:
+        platform = Platform.getPlatformByName('CUDA')
+        print("  Using CUDA platform")
+    except Exception:
+        platform = Platform.getPlatformByName('CPU')
+        print("  Falling back to CPU platform")
+
+    # Create positions as OpenMM Vec3 list
+    from openmm import Vec3
+    positions = [Vec3(bead_coords_nm[i, 0], bead_coords_nm[i, 1],
+                      bead_coords_nm[i, 2]) * nanometer
+                 for i in range(n_residues)]
+
+    sim = Simulation(topology, system, integrator, platform)
+    sim.context.setPositions(positions)
+
+    # Minimize
+    print("  Minimizing...")
+    sim.minimizeEnergy(maxIterations=500)
+
+    # Thermalize
+    print("  Thermalizing (2000 steps)...")
+    sim.step(2000)
+
+    # Record rest positions
+    state = sim.context.getState(getPositions=True)
+    rest_pos = state.getPositions(asNumpy=True).value_in_unit(angstrom)
+
+    # Run trajectory, save per-frame centroids
+    print(f"  Running {n_frames} frames x {steps_per_frame} steps...")
+    from openmm.app import StateDataReporter
+    sim.reporters.append(
+        StateDataReporter(sys.stdout, max(n_frames * steps_per_frame // 10, 1),
+                          step=True, potentialEnergy=True, temperature=True,
+                          speed=True)
+    )
+
+    deltas = np.zeros((n_frames, n_residues, 3), dtype=np.float32)
+
+    for fi in range(n_frames):
+        sim.step(steps_per_frame)
+        state = sim.context.getState(getPositions=True)
+        pos = state.getPositions(asNumpy=True).value_in_unit(angstrom)
+        # Delta in Angstroms -> BU (1 BU = 10 A)
+        deltas[fi] = (pos - rest_pos) * 0.1
+
+    # Cross-fade last 12 frames for seamless loop
+    BLEND_N = 12
+    for i in range(BLEND_N):
+        t = (i + 1) / BLEND_N  # 0→1 as we approach end
+        t = t * t * (3.0 - 2.0 * t)  # smoothstep
+        fi = n_frames - BLEND_N + i
+        deltas[fi] = (1.0 - t) * deltas[fi] + t * deltas[i]
+
+    print(f"  Deltas shape: {deltas.shape}, "
+          f"RMS: {np.sqrt(np.mean(deltas**2)):.4f} BU")
+
+    # Save to NPZ
+    import io
+    buf = io.BytesIO()
+    np.savez_compressed(buf, deltas=deltas,
+                        residue_ids=np.arange(n_residues))
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoint
 # ---------------------------------------------------------------------------
 
@@ -397,14 +599,29 @@ def main(
     skip_render: bool = False,
     production: bool = False,
     animate: bool = False,
+    ribosome_thermal: bool = False,
     frame_start: int = 0,
     frame_end: int = 239,
 ):
     import os
+    import numpy as np
 
     mrna_pdb_path = "extended_mrna.pdb"
     blend_path = "scene.blend"
     output_png = "renders/single_frame.png"
+
+    # --- Ribosome thermal pre-computation ---
+    if ribosome_thermal:
+        print("=== Computing ribosome thermal motion on GPU... ===")
+        npz_bytes = compute_ribosome_thermal.remote()
+        output_path = "ribosome_thermal.npz"
+        with open(output_path, "wb") as f:
+            f.write(npz_bytes)
+        data = np.load(output_path)
+        print(f"Saved {output_path}: deltas={data['deltas'].shape}, "
+              f"residue_ids={data['residue_ids'].shape}")
+        print("=== Done ===")
+        return
 
     # --- Relax ---
     if not skip_relax:

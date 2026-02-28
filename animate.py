@@ -1,5 +1,12 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v7: Physics-based thermal motion via per-frame OpenMM MD.
+- Replaces sinusoidal jitter/PCA with Langevin dynamics (310K, position restraints)
+- mRNA slides smoothly along SVD backbone axis (was stationary)
+- 4 mobile molecules (mRNA, tRNA-P, tRNA-A, polypeptide): per-frame CPU MD
+- Ribosome: pre-computed ENM trajectory from Modal GPU (ribosome_thermal.npz)
+- Cross-fade last 12 frames for seamless loop blending
+
 v6: Repeating HP35 domain polypeptide with folding morph animation.
 - 38 cycles (one repeat unit = 35 res domain + 3 res linker) for seamless loop
 - 12 frames/cycle at 24fps = 2 AA/s elongation rate (debug: 6 frames/cycle)
@@ -27,6 +34,7 @@ import numpy as np
 import os
 import sys
 import math
+from PIL import Image, ImageFilter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -251,177 +259,228 @@ def scale_frames(f):
     return int(round(f * FRAMES_PER_CYCLE / 240))
 
 
-# ---------------------------------------------------------------------------
-# Molecular jitter -- sum-of-sines with integer-harmonic frequencies
-#
-# Frequencies are integer multiples of 1/TOTAL_FRAMES, guaranteeing that
-# sin(2pi * freq * TOTAL_FRAMES + phase) == sin(phase) -- perfect loop.
-# ---------------------------------------------------------------------------
-JITTER_HARMONICS = 4
+def apply_md_deltas_to_mesh(positions, res_ids, md_deltas, md_residue_ids):
+    """Apply per-residue MD displacement to mesh vertices.
 
-# Target frequencies (cycles/frame) matching original visual feel.
-# Rounded to nearest integer harmonic of TOTAL_FRAMES for seamless looping.
-_TARGET_FREQS = [0.07, 0.113, 0.183, 0.296]
-JITTER_HARMONIC_NUMBERS = [max(1, round(f * TOTAL_FRAMES)) for f in _TARGET_FREQS]
-JITTER_FREQS = [k / TOTAL_FRAMES for k in JITTER_HARMONIC_NUMBERS]
-
-# Ribosome jitter (increased 5x from v3)
-RIBO_JITTER_TRANS_AMP = 0.15  # BU per axis (was 0.03)
-RIBO_JITTER_ROT_AMP = 5.0     # degrees per axis (was 1.5)
-
-# tRNA jitter (moderate)
-TRNA_JITTER_TRANS_AMP = 0.12  # BU per axis
-TRNA_JITTER_ROT_AMP = 8.0     # degrees per axis
-
-# Per-residue thermal jitter amplitudes (replaces per-atom jitter)
-RESIDUE_JITTER_MRNA = 0.05     # BU (was ATOM_JITTER_MRNA = 0.1)
-RESIDUE_JITTER_TRNA = 0.08     # BU (was 0.2)
-RESIDUE_JITTER_PEPTIDE = 0.05  # BU (was 0.15)
-
-# PCA deformation amplitude (BU, scaled per mode) — increased 3x from v3
-PCA_BASE_AMP = 1.5  # base amplitude for mode 0 (was 0.5)
-
-# Residual tumble when tRNA is bound (5%)
-RESIDUAL_TUMBLE = 0.05
-
-
-def compute_jitter(global_frame, obj_index, trans_amp, rot_amp):
-    """Return (trans_xyz, rot_xyz) rigid-body jitter for given frame and object index."""
-    trans = np.zeros(3)
-    rot = np.zeros(3)
-    for axis in range(3):
-        t_sum = 0.0
-        r_sum = 0.0
-        for h in range(JITTER_HARMONICS):
-            phase = (obj_index * 7.3 + axis * 2.9 + h * 1.7) % (2 * math.pi)
-            val = math.sin(2 * math.pi * JITTER_FREQS[h] * global_frame + phase)
-            t_sum += val / (h + 1)
-            r_sum += val / (h + 1)
-        norm = sum(1.0 / (h + 1) for h in range(JITTER_HARMONICS))
-        trans[axis] = trans_amp * t_sum / norm
-        rot[axis] = math.radians(rot_amp) * r_sum / norm
-    return trans, rot
-
-
-def compute_per_residue_jitter(global_frame, obj_index, positions, res_ids, amplitude):
-    """Return (N, 3) per-vertex displacement with per-residue coherence.
-
-    Groups atoms by res_id and computes ONE displacement per residue using
-    integer-harmonic sines with spatial correlation along residue index.
-    All atoms in a residue get the same displacement, so surface meshes
-    re-evaluate cleanly.
+    Maps MD residue indices to mesh res_id attribute by ordinal position.
+    md_deltas: (n_residues, 3) in Blender units.
     """
-    n = len(positions)
-    displacement = np.zeros((n, 3))
-
-    if res_ids is None:
-        return displacement
-
-    unique_res = np.unique(res_ids)
-
-    for ri, res in enumerate(unique_res):
-        mask = res_ids == res
-        # Per-residue displacement from sum-of-sines
-        disp = np.zeros(3)
-        for axis in range(3):
-            total = 0.0
-            for h in range(JITTER_HARMONICS):
-                freq = JITTER_FREQS[h]
-                # Phase depends on residue index for spatial correlation
-                phase = (obj_index * 7.3 + axis * 2.9 + h * 1.7 + ri * 0.37) % (2 * math.pi)
-                total += math.sin(2 * math.pi * freq * global_frame + phase) / (h + 1)
-            norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
-            disp[axis] = amplitude * total / norm
-        displacement[mask] = disp
-
-    return displacement
-
-
-# ---------------------------------------------------------------------------
-# PCA deformation
-# ---------------------------------------------------------------------------
-def load_pca_modes(npz_path):
-    """Load PCA modes from npz file. Returns (modes, residue_ids) or (None, None)."""
-    if not os.path.exists(npz_path):
-        print(f"  WARNING: {npz_path} not found, PCA deformation disabled")
-        return None, None
-    data = np.load(npz_path)
-    modes = data['modes']  # (n_modes, n_residues, 3)
-    residue_ids = data['residue_ids']
-    print(f"  Loaded {npz_path}: {modes.shape[0]} modes, {modes.shape[1]} residues")
-    return modes, residue_ids
-
-
-def compute_pca_displacement(global_frame, modes, obj_index):
-    """Compute per-residue PCA displacement for a given frame.
-
-    Returns (n_residues, 3) displacement vector.
-    Uses integer-harmonic sines with different frequency per mode.
-    """
-    if modes is None:
-        return None
-
-    n_modes, n_res, _ = modes.shape
-    displacement = np.zeros((n_res, 3))
-
-    for m in range(n_modes):
-        # Each mode gets a unique harmonic number (avoid collisions with jitter)
-        harmonic_num = max(1, JITTER_HARMONIC_NUMBERS[0] + m * 3 + obj_index * 2)
-        freq = harmonic_num / TOTAL_FRAMES
-        phase = (m * 3.7 + obj_index * 5.1) % (2 * math.pi)
-        amplitude = PCA_BASE_AMP / (m + 1)  # decreasing amplitude for higher modes
-
-        val = math.sin(2 * math.pi * freq * global_frame + phase)
-        displacement += amplitude * val * modes[m]
-
-    return displacement
-
-
-def apply_pca_to_vertices(positions, res_ids, pca_displacement, pca_residue_ids):
-    """Apply per-residue PCA displacement to mesh vertices.
-
-    Maps PCA residue indices to mesh res_id attribute.
-    """
-    if pca_displacement is None or res_ids is None:
+    if md_deltas is None or res_ids is None:
         return positions
 
     result = positions.copy()
     unique_mesh_res = np.unique(res_ids)
 
-    # Map PCA residue indices to mesh residues (by order)
-    n_pca = len(pca_residue_ids)
+    n_md = len(md_residue_ids)
     n_mesh = len(unique_mesh_res)
-    n_map = min(n_pca, n_mesh)
+    n_map = min(n_md, n_mesh)
 
     for i in range(n_map):
         mesh_res = unique_mesh_res[i]
         mask = res_ids == mesh_res
-        # PCA displacement is in Angstroms, mesh is in BU (1 BU = 10 A)
-        result[mask] += pca_displacement[i] * 0.1  # A -> BU
+        result[mask] += md_deltas[i]
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# tRNA tumbling
+# Per-frame OpenMM MD thermal motion
 # ---------------------------------------------------------------------------
-def compute_tumble_rotation(global_frame, obj_index, max_angle_deg=180):
-    """Compute tumbling rotation angles for a tRNA in solution.
+LOOP_BLEND_FRAMES = 12  # cross-fade last N frames for seamless loop
 
-    Returns (rx, ry, rz) Euler angles.
-    Uses integer-harmonic sines with unique frequencies per axis.
+class MolecularDynamics:
+    """Per-frame OpenMM MD simulation for physics-based thermal motion.
+
+    Runs a continuous Langevin dynamics trajectory with position restraints
+    (keeps atoms near rest positions) and wall repulsion (prevents clipping
+    through ribosome). Each call to step_and_get_deltas() advances the
+    simulation and returns per-residue centroid displacements in BU.
     """
-    rot = np.zeros(3)
-    for axis in range(3):
-        total = 0.0
-        for h in range(JITTER_HARMONICS):
-            harmonic_num = max(1, JITTER_HARMONIC_NUMBERS[h] + axis * 5 + obj_index * 11)
-            freq = harmonic_num / TOTAL_FRAMES
-            phase = (obj_index * 11.3 + axis * 4.1 + h * 2.3) % (2 * math.pi)
-            total += math.sin(2 * math.pi * freq * global_frame + phase) / (h + 1)
-        norm = sum(1.0 / (k + 1) for k in range(JITTER_HARMONICS))
-        rot[axis] = math.radians(max_angle_deg) * total / norm
-    return rot
+
+    def __init__(self, label, pdb_path, ribo_coords_A,
+                 k_restraint=100.0, k_wall=1000.0, temperature=310,
+                 steps_per_frame=500, mol_type="rna"):
+        import tempfile
+        from openmm.app import (
+            PDBFile as OmmPDB, ForceField, Modeller, Simulation,
+            CutoffNonPeriodic, HBonds,
+        )
+        from openmm import (
+            LangevinMiddleIntegrator, CustomExternalForce, Platform,
+        )
+        from openmm.unit import kelvin, picosecond, picoseconds, nanometer
+        from scipy.spatial import KDTree
+
+        self.label = label
+        self.steps_per_frame = steps_per_frame
+        self._early_deltas = []  # store first LOOP_BLEND_FRAMES for cross-fade
+
+        print(f"  MD init: {label} ({mol_type}, k={k_restraint}, T={temperature}K)")
+
+        # Strip CONECT records
+        with open(pdb_path) as f:
+            lines = [line for line in f if not line.startswith("CONECT")]
+        clean = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w")
+        clean.writelines(lines)
+        clean.close()
+
+        try:
+            pdb = OmmPDB(clean.name)
+        finally:
+            os.unlink(clean.name)
+
+        ff = ForceField("amber14-all.xml")
+
+        modeller = Modeller(pdb.topology, pdb.positions)
+
+        # RNA: remove P/OP1/OP2 from 5' terminus (AMBER14 compatibility)
+        if mol_type == "rna":
+            first_res = list(modeller.topology.residues())[0]
+            to_remove = [a for a in first_res.atoms()
+                         if a.name in ("P", "OP1", "OP2")]
+            if to_remove:
+                modeller.delete(to_remove)
+
+        # Add hydrogens
+        if mol_type == "protein":
+            try:
+                modeller.addHydrogens(ff)
+            except ValueError:
+                residues = list(modeller.topology.residues())
+                variants = [None] * len(residues)
+                variants[0] = 'ACE'
+                variants[-1] = 'NME'
+                modeller.addHydrogens(ff, variants=variants)
+        else:
+            modeller.addHydrogens(ff)
+
+        n_atoms = modeller.topology.getNumAtoms()
+        print(f"    {n_atoms} atoms (with H)")
+
+        # Create system: in-vacuo, CutoffNonPeriodic for fast pair computation
+        system = ff.createSystem(
+            modeller.topology,
+            nonbondedMethod=CutoffNonPeriodic,
+            nonbondedCutoff=1.0 * nanometer,
+            constraints=HBonds,
+        )
+
+        # Position restraints: E = 0.5 * k * ((x-x0)^2 + (y-y0)^2 + (z-z0)^2)
+        restraint = CustomExternalForce(
+            "0.5*k_restraint*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+        restraint.addGlobalParameter("k_restraint", k_restraint)
+        restraint.addPerParticleParameter("x0")
+        restraint.addPerParticleParameter("y0")
+        restraint.addPerParticleParameter("z0")
+
+        positions = modeller.positions
+        for i in range(n_atoms):
+            pos = positions[i].value_in_unit(nanometer)
+            restraint.addParticle(i, [pos[0], pos[1], pos[2]])
+        system.addForce(restraint)
+
+        # Wall repulsion from ribosome atoms
+        if ribo_coords_A is not None and len(ribo_coords_A) > 0:
+            ribo_tree = KDTree(ribo_coords_A)
+            mol_coords_nm = np.array([positions[i].value_in_unit(nanometer)
+                                       for i in range(n_atoms)])
+            mol_coords_A = mol_coords_nm * 10.0
+
+            _, nearest_idx = ribo_tree.query(mol_coords_A)
+            nearest_ribo_nm = ribo_coords_A[nearest_idx] * 0.1
+
+            wall_force = CustomExternalForce(
+                "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
+                "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
+                "r_min=0.3"
+            )
+            wall_force.addGlobalParameter("k_wall", k_wall)
+            wall_force.addPerParticleParameter("wx")
+            wall_force.addPerParticleParameter("wy")
+            wall_force.addPerParticleParameter("wz")
+
+            for i in range(n_atoms):
+                wall_force.addParticle(i, [
+                    nearest_ribo_nm[i, 0], nearest_ribo_nm[i, 1],
+                    nearest_ribo_nm[i, 2],
+                ])
+            system.addForce(wall_force)
+
+        # Integrator + simulation (CPU platform)
+        integrator = LangevinMiddleIntegrator(
+            temperature * kelvin, 1 / picosecond, 0.002 * picoseconds)
+        platform = Platform.getPlatformByName('CPU')
+        self.sim = Simulation(modeller.topology, system, integrator, platform)
+        self.sim.context.setPositions(modeller.positions)
+
+        # Minimize
+        print(f"    Minimizing (500 iterations)...")
+        self.sim.minimizeEnergy(maxIterations=500)
+
+        # Thermalize (burn-in)
+        print(f"    Thermalizing (1000 steps)...")
+        self.sim.step(1000)
+
+        # Build residue → atom index mapping
+        self._residue_atoms = {}
+        for residue in self.sim.topology.residues():
+            self._residue_atoms[residue.index] = [a.index for a in residue.atoms()]
+        self.residue_ids = np.array(sorted(self._residue_atoms.keys()))
+        self.n_residues = len(self.residue_ids)
+
+        # Record rest centroids (post-thermalization)
+        from openmm.unit import angstrom
+        state = self.sim.context.getState(getPositions=True)
+        pos_A = state.getPositions(asNumpy=True).value_in_unit(angstrom)
+        self._rest_centroids = np.zeros((self.n_residues, 3))
+        for ri, res_id in enumerate(self.residue_ids):
+            atom_idx = self._residue_atoms[res_id]
+            self._rest_centroids[ri] = pos_A[atom_idx].mean(axis=0)
+
+        print(f"    Ready: {self.n_residues} residues, "
+              f"{steps_per_frame} steps/frame")
+
+    def step_and_get_deltas(self, global_frame):
+        """Run MD steps and return per-residue centroid deltas in BU.
+
+        Returns (n_residues, 3) displacement from rest position.
+        Handles seamless loop blending for last LOOP_BLEND_FRAMES frames.
+        """
+        from openmm.unit import angstrom
+
+        try:
+            self.sim.step(self.steps_per_frame)
+        except Exception as e:
+            print(f"    WARNING: {self.label} MD step failed ({e}), returning zeros")
+            return np.zeros((self.n_residues, 3))
+
+        state = self.sim.context.getState(getPositions=True)
+        pos_A = state.getPositions(asNumpy=True).value_in_unit(angstrom)
+
+        centroids = np.zeros((self.n_residues, 3))
+        for ri, res_id in enumerate(self.residue_ids):
+            atom_idx = self._residue_atoms[res_id]
+            centroids[ri] = pos_A[atom_idx].mean(axis=0)
+
+        # Deltas in Angstroms, convert to BU (1 BU = 10 A)
+        deltas_BU = (centroids - self._rest_centroids) * 0.1
+
+        # Store early frames for cross-fade
+        if len(self._early_deltas) < LOOP_BLEND_FRAMES:
+            self._early_deltas.append(deltas_BU.copy())
+
+        return deltas_BU
+
+    def get_blended_deltas(self, global_frame, total_frames, raw_deltas):
+        """Cross-fade last LOOP_BLEND_FRAMES back to early frames for seamless loop."""
+        frames_from_end = total_frames - 1 - global_frame
+        if frames_from_end < LOOP_BLEND_FRAMES and len(self._early_deltas) > 0:
+            blend_idx = LOOP_BLEND_FRAMES - 1 - frames_from_end
+            if blend_idx < len(self._early_deltas):
+                t = (frames_from_end + 1) / LOOP_BLEND_FRAMES  # 1→0 as we approach end
+                t = t * t * (3.0 - 2.0 * t)  # smoothstep
+                return t * raw_deltas + (1.0 - t) * self._early_deltas[blend_idx]
+        return raw_deltas
 
 
 # ---------------------------------------------------------------------------
@@ -488,48 +547,6 @@ def get_positions(local_frame):
         trna_a_delta = zero.copy()
 
     return mrna_delta, trna_p_delta, trna_a_delta
-
-
-def get_trna_tumble_factor(local_frame, site):
-    """Return tumble amplitude factor for tRNA.
-
-    Returns at least RESIDUAL_TUMBLE when bound (5% residual tumble).
-
-    A-site tRNA (v4 extended windows):
-      - Full tumble during delivery (f12-f96, was f30-f90)
-      - Ramps down during accommodation (f96-f120)
-      - Residual tumble when bound
-
-    P-site tRNA:
-      - Residual tumble when bound
-      - Ramps up during departure (f192-f240, was f210-f240)
-    """
-    f12 = scale_frames(12)
-    f96 = scale_frames(96)
-    f120 = scale_frames(120)
-    f192 = scale_frames(192)
-    f240 = scale_frames(240)
-
-    if site == "A":
-        if local_frame < f12:
-            return 1.0  # full tumble before delivery starts
-        elif local_frame < f96:
-            return 1.0  # full tumble during delivery
-        elif local_frame < f120:
-            # Decay during accommodation
-            t = frame_t(local_frame, f96, f120)
-            return max(RESIDUAL_TUMBLE, 1.0 - t)
-        else:
-            return RESIDUAL_TUMBLE  # bound, residual tumble
-    elif site == "P":
-        if local_frame < f192:
-            return RESIDUAL_TUMBLE  # bound, residual tumble
-        elif local_frame < f240:
-            # Ramp up during departure
-            t = frame_t(local_frame, f192, f240)
-            return RESIDUAL_TUMBLE + (1.0 - RESIDUAL_TUMBLE) * t
-        else:
-            return 1.0  # fully departed
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +743,25 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _write_backbone(in_pdb, out_pdb, mol_type="rna"):
+    """Write a backbone-only PDB for cleaner visualization."""
+    from biotite.structure.io.pdb import PDBFile as BiotitePDB
+    from biotite.structure import AtomArrayStack
+    pdb = BiotitePDB.read(in_pdb)
+    arr = pdb.get_structure(model=1)
+    if isinstance(arr, AtomArrayStack):
+        arr = arr[0]
+    if mol_type == "rna":
+        bb_names = {"P", "O5'", "C5'", "C4'", "C3'", "O3'"}
+    else:
+        bb_names = {"N", "CA", "C", "O"}
+    bb = arr[np.isin(arr.atom_name, list(bb_names))]
+    out = BiotitePDB()
+    out.set_structure(bb)
+    out.write(out_pdb)
+    print(f"  Backbone: {in_pdb} ({len(arr)} atoms) -> {out_pdb} ({len(bb)} atoms)")
+
+
 def _extract_trna_pdbs():
     """Extract tRNA chains from 6Y0G as separate PDB files if not already cached."""
     from biotite.structure import AtomArrayStack
@@ -767,16 +803,6 @@ def main():
 
     print(f"=== Loading scene ({N_CYCLES} cycles x {FRAMES_PER_CYCLE} = "
           f"{TOTAL_FRAMES} frames @ {FPS}fps) ===")
-    print(f"  Jitter harmonics: {JITTER_HARMONIC_NUMBERS} "
-          f"(freqs: {[f'{f:.4f}' for f in JITTER_FREQS]})")
-
-    # Verify seamless loop: jitter at frame 0 must equal jitter at frame TOTAL_FRAMES
-    for obj_idx in [1, 2, 10]:
-        t0, r0 = compute_jitter(0, obj_idx, RIBO_JITTER_TRANS_AMP, RIBO_JITTER_ROT_AMP)
-        tN, rN = compute_jitter(TOTAL_FRAMES, obj_idx, RIBO_JITTER_TRANS_AMP, RIBO_JITTER_ROT_AMP)
-        max_diff = max(np.max(np.abs(t0 - tN)), np.max(np.abs(r0 - rN)))
-        assert max_diff < 1e-10, f"Loop broken for obj {obj_idx}: diff={max_diff}"
-    print(f"  Loop verification: PASS (jitter at frame 0 == frame {TOTAL_FRAMES})")
 
     # --- Load fold data for polypeptide morph ---
     fold_npz = "repeating_polypeptide_folds.npz"
@@ -801,57 +827,62 @@ def main():
     scene.cycles.transparent_max_bounces = 64
     scene.cycles.use_denoising = True
 
-    # --- Load PCA modes ---
-    mrna_modes, mrna_pca_res = load_pca_modes("mrna_modes.npz")
-    trna_modes, trna_pca_res = load_pca_modes("trna_modes.npz")
-
     # --- Load molecules ---
     print("  Loading molecules...")
 
-    def mol_style():
-        if MOL_STYLE == "surface":
-            return mn.StyleSurface()
-        return MOL_STYLE
-
     _extract_trna_pdbs()
 
-    # 1. Ribosome (40S + 60S)
+    # Write backbone-only mRNA PDB for cleaner rendering
+    _write_backbone("extended_mrna.pdb", "extended_mrna_bb.pdb", mol_type="rna")
+
+    # Flat opaque material for ribosome silhouette pass (rendered with
+    # film_transparent=True, then PIL edge-detects the alpha channel)
+    def make_ribo_material():
+        mat = bpy.data.materials.new(name="ribo_flat")
+        n = mat.node_tree.nodes
+        l = mat.node_tree.links
+        n.clear()
+        bsdf = n.new("ShaderNodeBsdfDiffuse")
+        bsdf.inputs["Color"].default_value = (0.45, 0.55, 0.75, 1.0)
+        bsdf.inputs["Roughness"].default_value = 1.0
+        out = n.new("ShaderNodeOutputMaterial")
+        l.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        return mat
+
+    # 1. Ribosome (40S + 60S) — cartoon for silhouette pass
     mol_surface = mn.Molecule.fetch("6Y0G")
-    ribo_material = (make_translucent_surface_material()
-                     if MOL_STYLE == "surface"
-                     else make_solid_material((0.45, 0.55, 0.75)))
     mol_surface.add_style(
-        style=mol_style(),
+        style="cartoon",
         selection=mol_surface.select.chain_id(RIBOSOME_CHAINS),
-        material=ribo_material,
+        material=make_ribo_material(),
         name="surface",
     )
 
-    # 2. mRNA
-    mol_mrna = mn.Molecule.load("extended_mrna.pdb")
+    # 2. mRNA (backbone-only for clean rendering)
+    mol_mrna = mn.Molecule.load("extended_mrna_bb.pdb")
     mol_mrna.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.1, 0.35, 0.95)),
+        style="cartoon",
+        material=make_solid_material((0.05, 0.25, 0.95)),
         name="mRNA",
     )
 
-    # 3. P-site tRNA (chain B4)
+    # 3. P-site tRNA (chain B4) — ribbon
     mol_trna_p = mn.Molecule.load("trna_b4.pdb")
     mol_trna_p.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.95, 0.5, 0.1)),
+        style="ribbon",
+        material=make_solid_material((0.95, 0.4, 0.0)),
         name="tRNA_P",
     )
 
-    # 4. A-site tRNA (chain D4)
+    # 4. A-site tRNA (chain D4) — ribbon
     mol_trna_a = mn.Molecule.load("trna_d4.pdb")
     mol_trna_a.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.95, 0.5, 0.1)),
+        style="ribbon",
+        material=make_solid_material((0.95, 0.4, 0.0)),
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (repeating domains)
+    # 5. Polypeptide (repeating domains) — spheres
     peptide_pdb = "repeating_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         peptide_pdb = "tunnel_polypeptide.pdb"
@@ -860,8 +891,8 @@ def main():
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
-        style=mol_style(),
-        material=make_solid_material((0.8, 0.15, 0.6)),
+        style="spheres",
+        material=make_solid_material((0.85, 0.05, 0.55)),
         name="polypeptide",
     )
 
@@ -870,7 +901,7 @@ def main():
         return [o for o in bpy.data.objects if name_substr in o.name and o.type == "MESH"]
 
     objs_surface = find_mesh("6Y0G")
-    objs_mrna = find_mesh("extended_mrna")
+    objs_mrna = find_mesh("extended_mrna_bb")
     objs_trna_p = find_mesh("trna_b4")
     objs_trna_a = find_mesh("trna_d4")
     pep_search = os.path.splitext(os.path.basename(peptide_pdb))[0]
@@ -917,7 +948,28 @@ def main():
     obj_mrna.data.vertices.foreach_set('co', orig_verts[obj_mrna.name].ravel())
     obj_mrna.data.update()
 
-    # --- Get mesh res_ids for PCA mapping and per-residue jitter ---
+    # --- mRNA slide axis (SVD principal axis, 5'→3' oriented) ---
+    _mrna_pos = orig_verts[obj_mrna.name]
+    _, _, _vt = np.linalg.svd(_mrna_pos - _mrna_pos.mean(axis=0), full_matrices=False)
+    _local_axis = _vt[0]
+
+    # Orient 5'→3' via residue IDs
+    _unique_res = np.unique(mrna_mesh_res_ids) if mrna_mesh_res_ids is not None else np.array([0])
+    _first = _mrna_pos[mrna_mesh_res_ids == _unique_res[0]].mean(axis=0) if mrna_mesh_res_ids is not None else _mrna_pos[0]
+    _last = _mrna_pos[mrna_mesh_res_ids == _unique_res[-1]].mean(axis=0) if mrna_mesh_res_ids is not None else _mrna_pos[-1]
+    if np.dot(_last - _first, _local_axis) < 0:
+        _local_axis = -_local_axis
+
+    # Local → world space (Z rotation = pi/2): (x,y,z) → (-y,x,z)
+    _world_axis = np.array([-_local_axis[1], _local_axis[0], _local_axis[2]])
+    _world_axis /= np.linalg.norm(_world_axis)
+
+    # mRNA slides 3'→5' (ribosome reads 5'→3')
+    MRNA_SLIDE_AXIS = -_world_axis
+    MRNA_SLIDE_PER_CYCLE = np.linalg.norm(CODON_SHIFT)  # ≈1.0 BU
+    print(f"  mRNA slide: axis={MRNA_SLIDE_AXIS}, per_cycle={MRNA_SLIDE_PER_CYCLE:.3f} BU")
+
+    # --- Get mesh res_ids for MD mapping ---
     trna_p_mesh_res_ids = get_mesh_res_ids(obj_trna_p)
     trna_a_mesh_res_ids = get_mesh_res_ids(obj_trna_a)
 
@@ -935,17 +987,87 @@ def main():
         pep_n_res = n_res_est
         print(f"  Polypeptide: {pep_n_res} residues (estimated, {atoms_per_res} atoms/res)")
 
-    # --- Camera setup ---
+    # --- Load ribosome coords for MD wall repulsion ---
+    import time as _time
+    t_md_start = _time.time()
+    ribo_coords_A = None
+    try:
+        from biotite.structure import AtomArrayStack
+        import biotite.structure.io.pdbx as pdbx
+        from pathlib import Path
+        cache_dir = Path.home() / "MolecularNodesCache"
+        bcif_path = cache_dir / "6Y0G.bcif"
+        if not bcif_path.exists():
+            import biotite.database.rcsb as rcsb_db
+            rcsb_db.fetch("6Y0G", "bcif", target_path=str(cache_dir))
+        cif = pdbx.BinaryCIFFile.read(str(bcif_path))
+        full_arr = pdbx.get_structure(cif, model=1)
+        if isinstance(full_arr, AtomArrayStack):
+            full_arr = full_arr[0]
+        mask_ribo = np.isin(full_arr.chain_id, RIBOSOME_CHAINS)
+        ribo_coords_A = full_arr[mask_ribo].coord
+        print(f"  Ribosome context: {len(ribo_coords_A)} atoms for wall repulsion")
+    except Exception as e:
+        print(f"  WARNING: Could not load ribosome coords ({e}), MD without wall repulsion")
+
+    # --- Initialize per-frame MD simulations for mobile molecules ---
+    print("  Initializing OpenMM MD simulations...")
+    md_sims = {}
+    for name, pdb, mol_type in [
+        ('mrna', 'extended_mrna.pdb', 'rna'),
+        ('trna_p', 'trna_b4.pdb', 'rna'),
+        ('trna_a', 'trna_d4.pdb', 'rna'),
+        ('peptide', peptide_pdb, 'protein'),
+    ]:
+        try:
+            md_sims[name] = MolecularDynamics(
+                name, pdb, ribo_coords_A, mol_type=mol_type)
+        except Exception as e:
+            print(f"  WARNING: {name} MD failed ({e}), static fallback")
+            md_sims[name] = None
+
+    # --- Load pre-computed ribosome thermal motion (if available) ---
+    ribo_thermal = None
+    ribo_thermal_res_ids = None
+    ribo_thermal_path = "ribosome_thermal.npz"
+    if os.path.exists(ribo_thermal_path):
+        ribo_data = np.load(ribo_thermal_path)
+        ribo_thermal = ribo_data['deltas']  # (n_frames, n_residues, 3) in BU
+        ribo_thermal_res_ids = ribo_data['residue_ids']
+        print(f"  Ribosome thermal: {ribo_thermal.shape[0]} frames, "
+              f"{ribo_thermal.shape[1]} residues from {ribo_thermal_path}")
+    else:
+        print(f"  Ribosome thermal: {ribo_thermal_path} not found, ribosome static")
+
+    # Store ribosome orig verts if thermal motion available
+    if ribo_thermal is not None:
+        n_ribo = len(obj_surface.data.vertices)
+        co_ribo = np.empty(n_ribo * 3, dtype=np.float64)
+        obj_surface.data.vertices.foreach_get('co', co_ribo)
+        orig_verts[obj_surface.name] = co_ribo.reshape(-1, 3).copy()
+        surface_res_ids = get_mesh_res_ids(obj_surface)
+        print(f"  Stored {n_ribo} ribosome vertices for thermal deformation")
+
+    dt_md = _time.time() - t_md_start
+    print(f"  MD initialization: {dt_md:.1f}s")
+
+    # --- Orthographic camera (matched to render_single_frame.py) ---
+    import mathutils
     canvas.frame_object(mol_surface)
     cam = scene.camera
-    cam_loc_orig = np.array(cam.location)
-    print(f"  Camera: loc={tuple(cam_loc_orig)}, lens={cam.data.lens}")
-
-    bpy.ops.object.empty_add(type="PLAIN_AXES", location=tuple(RIBO_CENTROID))
-    orbit_empty = bpy.context.active_object
-    orbit_empty.name = "CameraOrbit"
-    cam.parent = orbit_empty
-    cam.matrix_parent_inverse = orbit_empty.matrix_world.inverted()
+    # Rotation from Blender viewport (see render_single_frame.py docstring)
+    cam_rot = mathutils.Euler((2.2480, 0.0, 0.0489), 'XYZ')
+    target = mathutils.Vector((-2.66, 1.71, 1.72))
+    forward = mathutils.Vector((0, 0, -1))
+    forward.rotate(cam_rot)
+    cam.location = target - forward * 50.0
+    cam.rotation_euler = cam_rot
+    cam.data.type = 'ORTHO'
+    cam.data.ortho_scale = 10.5  # slightly wider than 9.0 for jitter margin
+    cam.data.shift_x = 0.0
+    cam.data.shift_y = 0.0
+    print(f"  Camera (ortho): scale={cam.data.ortho_scale}, "
+          f"rot={tuple(cam.rotation_euler)}")
 
     # --- Save .blend for GPU rendering (scene only, no animation) ---
     if SAVE_BLEND:
@@ -957,88 +1079,165 @@ def main():
         print("=== Done (scene saved, no render) ===")
         return
 
-    # --- Render loop (single-pass) ---
+    # --- 2-pass composite constants ---
+    OUTLINE_COLOR = (70, 120, 200)
+    OUTLINE_THICKNESS = 3
+    internal_objs = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+
+    # --- Render loop (2-pass composite per frame) ---
+    import time
     print(f"\n=== Rendering {TOTAL_FRAMES} frames ({N_CYCLES} cycles) ===")
 
     for cycle in range(N_CYCLES):
         for local_frame in range(FRAMES_PER_CYCLE):
             global_frame = cycle * FRAMES_PER_CYCLE + local_frame
+            t_frame_start = time.time()
             print(f"\n--- Cycle {cycle}, Frame {local_frame}/{FRAMES_PER_CYCLE - 1} "
                   f"(global {global_frame}/{TOTAL_FRAMES - 1}) ---")
 
-            # Single-cycle deltas
-            mrna_d, trna_p_d, trna_a_d = get_positions(local_frame)
+            # Single-cycle choreographic deltas
+            _, trna_p_d, trna_a_d = get_positions(local_frame)
 
-            # Cumulative mRNA offset (slides further each cycle)
-            mrna_d = mrna_d + cycle * CODON_SHIFT
+            # --- Ribosome: static pose + optional pre-computed thermal ---
+            obj_surface.location = (0, 0, 0)
+            obj_surface.rotation_euler = (0, 0, math.pi / 2)
+            if ribo_thermal is not None:
+                ribo_frame = global_frame % len(ribo_thermal)
+                ribo_deltas = ribo_thermal[ribo_frame]
+                ribo_pos = apply_md_deltas_to_mesh(
+                    orig_verts[obj_surface.name], surface_res_ids,
+                    ribo_deltas, ribo_thermal_res_ids)
+                obj_surface.data.vertices.foreach_set('co', ribo_pos.ravel())
+                obj_surface.data.update()
 
-            # --- Ribosome jitter (5x increased from v3) ---
-            ribo_t, ribo_r = compute_jitter(
-                global_frame, 10, RIBO_JITTER_TRANS_AMP, RIBO_JITTER_ROT_AMP)
-            obj_surface.location = tuple(ribo_t)
-            obj_surface.rotation_euler = (ribo_r[0], ribo_r[1],
-                                          math.pi / 2 + ribo_r[2])
-
-            # --- mRNA: translation only, NO rigid-body rotation ---
-            obj_mrna.location = tuple(mrna_d)
+            # --- mRNA: smooth sliding + MD thermal ---
+            global_progress = cycle + local_frame / FRAMES_PER_CYCLE
+            mrna_offset = global_progress * MRNA_SLIDE_PER_CYCLE * MRNA_SLIDE_AXIS
+            obj_mrna.location = tuple(mrna_offset)
             obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
-            # --- tRNA jitter + tumbling ---
-            # P-site tRNA
-            trna_p_jitter_t, trna_p_jitter_r = compute_jitter(
-                global_frame, 1, TRNA_JITTER_TRANS_AMP, TRNA_JITTER_ROT_AMP)
+            # MD thermal deformation for mRNA
+            md_mrna = md_sims.get('mrna')
+            if md_mrna is not None:
+                raw_deltas = md_mrna.step_and_get_deltas(global_frame)
+                mrna_deltas = md_mrna.get_blended_deltas(
+                    global_frame, TOTAL_FRAMES, raw_deltas)
+                mrna_pos = apply_md_deltas_to_mesh(
+                    orig_verts[obj_mrna.name], mrna_mesh_res_ids,
+                    mrna_deltas, md_mrna.residue_ids)
+            else:
+                mrna_pos = orig_verts[obj_mrna.name]
+            obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
+            obj_mrna.data.update()
 
-            tumble_factor_p = get_trna_tumble_factor(local_frame, "P")
-            if tumble_factor_p > 0:
-                tumble_p = compute_tumble_rotation(global_frame, 1)
-                trna_p_jitter_r = trna_p_jitter_r + tumble_factor_p * np.array(tumble_p)
+            # --- P-site tRNA: choreographic position + MD thermal ---
+            obj_trna_p.location = tuple(trna_p_d)
+            obj_trna_p.rotation_euler = (0, 0, math.pi / 2)
 
-            obj_trna_p.location = tuple(trna_p_d + trna_p_jitter_t)
-            obj_trna_p.rotation_euler = (trna_p_jitter_r[0], trna_p_jitter_r[1],
-                                         math.pi / 2 + trna_p_jitter_r[2])
+            md_trna_p = md_sims.get('trna_p')
+            if md_trna_p is not None:
+                raw_deltas = md_trna_p.step_and_get_deltas(global_frame)
+                trna_p_deltas = md_trna_p.get_blended_deltas(
+                    global_frame, TOTAL_FRAMES, raw_deltas)
+                trna_p_pos = apply_md_deltas_to_mesh(
+                    orig_verts[obj_trna_p.name], trna_p_mesh_res_ids,
+                    trna_p_deltas, md_trna_p.residue_ids)
+            else:
+                trna_p_pos = orig_verts[obj_trna_p.name]
+            obj_trna_p.data.vertices.foreach_set('co', trna_p_pos.ravel())
+            obj_trna_p.data.update()
 
-            # A-site tRNA (tumbling during delivery)
-            trna_a_jitter_t, trna_a_jitter_r = compute_jitter(
-                global_frame, 2, TRNA_JITTER_TRANS_AMP, TRNA_JITTER_ROT_AMP)
+            # --- A-site tRNA: choreographic position + MD thermal ---
+            obj_trna_a.location = tuple(trna_a_d)
+            obj_trna_a.rotation_euler = (0, 0, math.pi / 2)
 
-            tumble_factor_a = get_trna_tumble_factor(local_frame, "A")
-            if tumble_factor_a > 0:
-                tumble_a = compute_tumble_rotation(global_frame, 2)
-                trna_a_jitter_r = trna_a_jitter_r + tumble_factor_a * np.array(tumble_a)
+            md_trna_a = md_sims.get('trna_a')
+            if md_trna_a is not None:
+                raw_deltas = md_trna_a.step_and_get_deltas(global_frame)
+                trna_a_deltas = md_trna_a.get_blended_deltas(
+                    global_frame, TOTAL_FRAMES, raw_deltas)
+                trna_a_pos = apply_md_deltas_to_mesh(
+                    orig_verts[obj_trna_a.name], trna_a_mesh_res_ids,
+                    trna_a_deltas, md_trna_a.residue_ids)
+            else:
+                trna_a_pos = orig_verts[obj_trna_a.name]
+            obj_trna_a.data.vertices.foreach_set('co', trna_a_pos.ravel())
+            obj_trna_a.data.update()
 
-            obj_trna_a.location = tuple(trna_a_d + trna_a_jitter_t)
-            obj_trna_a.rotation_euler = (trna_a_jitter_r[0], trna_a_jitter_r[1],
-                                         math.pi / 2 + trna_a_jitter_r[2])
-
-            # --- Polypeptide: NO rigid-body jitter, NO choreographic motion ---
+            # --- Polypeptide: morph + MD thermal ---
             obj_peptide.location = (0, 0, 0)
             obj_peptide.rotation_euler = (0, 0, math.pi / 2)
 
-            # --- Polypeptide folding morph + scroll ---
             pep_orig = orig_verts[obj_peptide.name]
             if FOLD_DATA is not None:
                 morphed = compute_polypeptide_morph(
                     pep_orig, pep_res_ids, FOLD_DATA,
                     cycle, local_frame, FRAMES_PER_CYCLE)
             else:
-                # Fallback to legacy progressive reveal
                 morphed = compute_peptide_positions(
                     pep_orig, pep_res_ids, cycle, local_frame)
+
+            # Add MD thermal on top of morph
+            md_pep = md_sims.get('peptide')
+            if md_pep is not None:
+                raw_deltas = md_pep.step_and_get_deltas(global_frame)
+                pep_deltas = md_pep.get_blended_deltas(
+                    global_frame, TOTAL_FRAMES, raw_deltas)
+                morphed = apply_md_deltas_to_mesh(
+                    morphed, pep_res_ids, pep_deltas, md_pep.residue_ids)
             obj_peptide.data.vertices.foreach_set('co', morphed.ravel())
             obj_peptide.data.update()
 
-            # Camera orbit
-            orbit_t = global_frame / max(TOTAL_FRAMES - 1, 1)
-            orbit_angle = math.radians(CAMERA_ORBIT_DEGREES) * orbit_t
-            orbit_empty.rotation_euler.z = orbit_angle
-
             bpy.context.view_layer.update()
 
-            # --- Single-pass render (all objects visible) ---
-            scene.cycles.samples = SAMPLES
+            # --- 2-pass composite render ---
             frame_path = os.path.join(FRAMES_DIR, f"frame_{global_frame:04d}.png")
-            canvas.snapshot(frame_path)
-            print(f"  Frame saved: {frame_path}")
+            pass1_path = os.path.join(FRAMES_DIR, "_pass_ribo.png")
+            pass2_path = os.path.join(FRAMES_DIR, "_pass_internal.png")
+
+            # Pass 1: Ribosome silhouette (transparent bg → alpha = shape mask)
+            for o in internal_objs:
+                o.hide_render = True
+            obj_surface.hide_render = False
+            scene.render.film_transparent = True
+            canvas.snapshot(pass1_path)
+
+            # Pass 2: Internal components (no ribosome, dark bg)
+            obj_surface.hide_render = True
+            for o in internal_objs:
+                o.hide_render = False
+            scene.render.film_transparent = False
+            canvas.snapshot(pass2_path)
+
+            # Restore visibility for next frame
+            obj_surface.hide_render = False
+
+            # Composite: edge-detect ribosome alpha → outline overlay
+            internal_img = Image.open(pass2_path).convert("RGBA")
+            ribo_img = Image.open(pass1_path).convert("RGBA")
+            alpha = np.array(ribo_img)[:, :, 3]
+            mask_arr = (alpha > 10).astype(np.uint8) * 255
+            mask_img = Image.fromarray(mask_arr).filter(
+                ImageFilter.GaussianBlur(radius=2))
+            mask_img = Image.fromarray(
+                (np.array(mask_img) > 128).astype(np.uint8) * 255)
+            edges = mask_img.filter(ImageFilter.FIND_EDGES)
+            sil = Image.fromarray((np.array(edges) > 30).astype(np.uint8) * 255)
+            for _ in range(OUTLINE_THICKNESS // 2):
+                sil = sil.filter(ImageFilter.MaxFilter(3))
+            edges_np = np.array(sil)
+            overlay = np.zeros((*edges_np.shape, 4), dtype=np.uint8)
+            edge_mask = edges_np > 100
+            overlay[edge_mask, 0] = OUTLINE_COLOR[0]
+            overlay[edge_mask, 1] = OUTLINE_COLOR[1]
+            overlay[edge_mask, 2] = OUTLINE_COLOR[2]
+            overlay[edge_mask, 3] = 255
+            result = Image.alpha_composite(internal_img,
+                                           Image.fromarray(overlay, "RGBA"))
+            result.save(frame_path)
+
+            dt = time.time() - t_frame_start
+            print(f"  Frame saved: {frame_path} [{dt:.1f}s]")
 
     print(f"\n=== Done! {TOTAL_FRAMES} frames rendered to {FRAMES_DIR}/ ===")
     print("Next: python3.11 encode.py [--debug]")
