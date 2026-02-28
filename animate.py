@@ -3,7 +3,7 @@
 v7: Physics-based thermal motion via per-frame OpenMM MD.
 - Replaces sinusoidal jitter/PCA with Langevin dynamics (310K, position restraints)
 - mRNA stationary at origin (tRNA choreography implies codon reading)
-- 3 mobile molecules (mRNA, tRNA-P, tRNA-A): per-frame CPU MD (k=500)
+- 3 mobile molecules (mRNA, tRNA-P, tRNA-A): per-frame CPU MD (k=100)
 - Polypeptide: folding morph animation (no MD — backbone-only PDB)
 - Ribosome: pre-computed ENM trajectory from Modal GPU (ribosome_thermal.npz)
 - Cross-fade last 12 frames for seamless loop blending
@@ -37,6 +37,8 @@ import os
 import sys
 import math
 from PIL import Image, ImageFilter
+
+ANG_TO_BU = 0.01  # MolecularNodes world_scale: 1 Å = 0.01 BU
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -300,7 +302,7 @@ class MolecularDynamics:
     """
 
     def __init__(self, label, pdb_path, ribo_coords_A,
-                 k_restraint=500.0, k_wall=1000.0, temperature=310,
+                 k_restraint=100.0, k_wall=1000.0, temperature=310,
                  steps_per_frame=500, mol_type="rna"):
         import tempfile
         from openmm.app import (
@@ -457,8 +459,8 @@ class MolecularDynamics:
             atom_idx = self._residue_atoms[res_id]
             centroids[ri] = pos_A[atom_idx].mean(axis=0)
 
-        # Deltas in Angstroms, convert to BU (1 BU = 10 A)
-        deltas_BU = (centroids - self._rest_centroids) * 0.1
+        # Deltas in Angstroms, convert to BU (MN world_scale = 0.01)
+        deltas_BU = (centroids - self._rest_centroids) * ANG_TO_BU
 
         # Store early frames for cross-fade
         if len(self._early_deltas) < LOOP_BLEND_FRAMES:
@@ -649,8 +651,8 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
     for di in range(n_domains):
         start_res = int(fold_data[f'domain_{di}_start_res'])
         end_res = int(fold_data[f'domain_{di}_end_res'])
-        folded_coords = fold_data[f'domain_{di}_folded'] * 0.1    # Å → BU
-        extended_coords = fold_data[f'domain_{di}_extended'] * 0.1  # Å → BU
+        folded_coords = fold_data[f'domain_{di}_folded'] * ANG_TO_BU    # Å → BU
+        extended_coords = fold_data[f'domain_{di}_extended'] * ANG_TO_BU  # Å → BU
 
         # Domain mask: vertices belonging to this domain
         domain_mask = (res_ids >= start_res) & (res_ids <= end_res)
@@ -706,13 +708,10 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                 folded_centroid = folded_coords[atom_start:atom_end].mean(axis=0)
                 extended_centroid = extended_coords[atom_start:atom_end].mean(axis=0)
 
-                # Current centroid from mesh
-                current_centroid = orig_positions[res_mask].mean(axis=0)
-
-                # Target position: interpolate centroids
-                target_centroid = extended_centroid + eased_t * (folded_centroid - extended_centroid)
-                delta = target_centroid - current_centroid
-                positions[res_mask] += delta
+                # Apply only the folding displacement (extended→folded delta)
+                # Using relative displacement avoids drift from coord misalignment
+                displacement = eased_t * (folded_centroid - extended_centroid)
+                positions[res_mask] += displacement
         else:
             # Direct 1:1 mapping between mesh vertices and domain atoms
             for vi, idx in enumerate(domain_indices):
@@ -724,12 +723,13 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                 eased_t = smoothstep(per_res_t)
 
                 if eased_t > 0.0 and vi < n_domain_atoms:
-                    interp = extended_coords[vi] + eased_t * (folded_coords[vi] - extended_coords[vi])
-                    positions[idx] = interp
+                    # Apply delta from extended baseline (relative displacement)
+                    delta = eased_t * (folded_coords[vi] - extended_coords[vi])
+                    positions[idx] = orig_positions[idx] + delta
 
     # Apply cumulative scroll: shift all vertices along scroll_vector
-    # Convert scroll from Angstroms to Blender units (1 BU = 10 A)
-    scroll_offset = global_progress * scroll_per_cycle * scroll_vector * 0.1  # A->BU
+    # Convert scroll from Angstroms to Blender units (MN world_scale = 0.01)
+    scroll_offset = global_progress * scroll_per_cycle * scroll_vector * ANG_TO_BU
     positions += scroll_offset
 
     return positions

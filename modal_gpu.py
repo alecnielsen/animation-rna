@@ -566,8 +566,8 @@ def compute_ribosome_thermal(
         sim.step(steps_per_frame)
         state = sim.context.getState(getPositions=True)
         pos = state.getPositions(asNumpy=True).value_in_unit(angstrom)
-        # Delta in Angstroms -> BU (1 BU = 10 A)
-        deltas[fi] = (pos - rest_pos) * 0.1
+        # Delta in Angstroms -> BU (MN world_scale = 0.01)
+        deltas[fi] = (pos - rest_pos) * 0.01
 
     # Cross-fade last 12 frames for seamless loop
     BLEND_N = 12
