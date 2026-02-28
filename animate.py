@@ -1,5 +1,11 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v8: Polypeptide anchoring + GLY-aware folding.
+- Gradient scroll: tunnel residues anchored at PTC, smooth ramp to full scroll
+  for external residues (fixes unfolding-back-into-ribosome and tRNA detachment)
+- GLY-aware folded residue ranges (4 atoms for GLY vs 5 for others)
+- Extended tail from 10→40 residues for complete distal polypeptide
+
 v7: Physics-based thermal motion via per-frame OpenMM MD.
 - Replaces sinusoidal jitter/PCA with Langevin dynamics (310K, position restraints)
 - mRNA stationary at origin (tRNA choreography implies codon reading)
@@ -621,13 +627,41 @@ def smoothstep(t):
     return t * t * (3.0 - 2.0 * t)
 
 
+def _build_folded_residue_ranges(fold_data, domain_idx):
+    """Build per-residue atom ranges for a folded domain using atom_names.
+
+    HP35 contains glycines (4 atoms: N,CA,C,O — no CB), so the simple
+    `ri * 5` indexing is wrong.  Instead, detect residue boundaries from
+    the atom_names array where 'N' marks the start of each residue.
+
+    Returns: list of (start, end) index tuples into the folded coord array.
+    """
+    key = f'domain_{domain_idx}_atom_names'
+    if key not in fold_data:
+        # Fallback: assume 5 atoms per residue (all ALA)
+        n = len(fold_data[f'domain_{domain_idx}_folded'])
+        n_res = n // 5
+        return [(i * 5, min(i * 5 + 5, n)) for i in range(n_res)]
+
+    atom_names = fold_data[key]
+    ranges = []
+    cur_start = 0
+    for j in range(1, len(atom_names)):
+        if atom_names[j] == 'N':
+            ranges.append((cur_start, j))
+            cur_start = j
+    ranges.append((cur_start, len(atom_names)))
+    return ranges
+
+
 def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                                cycle, local_frame, frames_per_cycle):
     """Per-frame polypeptide vertex positions with folding + scrolling.
 
     1. Compute global progress (fractional cycles elapsed)
     2. For each domain: determine fold_t, interpolate extended<->folded
-    3. Apply cumulative scroll to all vertices
+    3. Apply gradient scroll: tunnel residues anchored at PTC, external
+       residues scroll at full rate, smooth ramp in between
 
     Args:
         orig_positions: (N, 3) original vertex positions (extended conformation)
@@ -647,6 +681,14 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
 
     # Global progress in fractional cycles
     global_progress = cycle + local_frame / frames_per_cycle
+
+    # --- Tunnel exit residue: infer from domain 0 start ---
+    # Tunnel residues are numbered 1..(domain_0_start - 1).
+    # They should stay anchored at the PTC (no scroll).
+    tunnel_exit_res = int(fold_data['domain_0_start_res']) - 1
+    # Transition zone: ramp scroll factor from 0→1 over a few residues
+    # around the tunnel exit so the chain doesn't have a hard kink.
+    SCROLL_RAMP_RESIDUES = 8
 
     for di in range(n_domains):
         start_res = int(fold_data[f'domain_{di}_start_res'])
@@ -674,14 +716,15 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
         domain_indices = np.where(domain_mask)[0]
 
         # Map mesh vertices to domain atom coordinates by residue ID
-        # The folded/extended coords arrays have one set per backbone atom
-        # (N, CA, C, O, CB) per residue, matching the PDB atom order
         domain_res_unique = np.unique(res_ids[domain_mask])
         n_domain_atoms = len(folded_coords)
         n_domain_verts = len(domain_indices)
 
-        # Build mapping: for each mesh vertex, find corresponding atom index
-        # in the domain coordinate arrays
+        # Build proper per-residue atom ranges (handles GLY with 4 atoms)
+        folded_res_ranges = _build_folded_residue_ranges(fold_data, di)
+        # Extended always has 5 atoms/res (all ALA backbone)
+        n_ext_atoms = len(extended_coords)
+
         if n_domain_verts != n_domain_atoms:
             # MN mesh may have different vertex count than PDB atoms
             # Fall back to per-residue centroid morphing
@@ -699,17 +742,21 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                 if eased_t <= 0.0:
                     continue
 
-                # Find centroid of folded/extended for this residue
-                atom_start = ri * 5  # 5 atoms per res (N, CA, C, O, CB)
-                atom_end = min(atom_start + 5, n_domain_atoms)
-                if atom_start >= n_domain_atoms:
+                # Folded centroid: use proper atom ranges (handles GLY)
+                if ri < len(folded_res_ranges):
+                    f_start, f_end = folded_res_ranges[ri]
+                    folded_centroid = folded_coords[f_start:f_end].mean(axis=0)
+                else:
                     continue
 
-                folded_centroid = folded_coords[atom_start:atom_end].mean(axis=0)
-                extended_centroid = extended_coords[atom_start:atom_end].mean(axis=0)
+                # Extended centroid: always 5 atoms/res
+                ext_start = ri * 5
+                ext_end = min(ext_start + 5, n_ext_atoms)
+                if ext_start >= n_ext_atoms:
+                    continue
+                extended_centroid = extended_coords[ext_start:ext_end].mean(axis=0)
 
                 # Apply only the folding displacement (extended→folded delta)
-                # Using relative displacement avoids drift from coord misalignment
                 displacement = eased_t * (folded_centroid - extended_centroid)
                 positions[res_mask] += displacement
         else:
@@ -723,14 +770,35 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                 eased_t = smoothstep(per_res_t)
 
                 if eased_t > 0.0 and vi < n_domain_atoms:
-                    # Apply delta from extended baseline (relative displacement)
                     delta = eased_t * (folded_coords[vi] - extended_coords[vi])
                     positions[idx] = orig_positions[idx] + delta
 
-    # Apply cumulative scroll: shift all vertices along scroll_vector
-    # Convert scroll from Angstroms to Blender units (MN world_scale = 0.01)
+    # --- Gradient scroll: anchor tunnel at PTC, full scroll for external ---
+    # Scroll offset at full rate (what external residues get)
     scroll_offset = global_progress * scroll_per_cycle * scroll_vector * ANG_TO_BU
-    positions += scroll_offset
+
+    # Compute per-vertex scroll factor based on residue position
+    unique_res = np.sort(np.unique(res_ids))
+    scroll_factors = np.zeros(len(positions))
+    for res in unique_res:
+        mask = res_ids == res
+        if res <= tunnel_exit_res - SCROLL_RAMP_RESIDUES:
+            # Deep in tunnel: no scroll (anchored at PTC/tRNA)
+            factor = 0.0
+        elif res <= tunnel_exit_res:
+            # Transition zone: smooth ramp from 0 to ~0.5
+            t = (res - (tunnel_exit_res - SCROLL_RAMP_RESIDUES)) / SCROLL_RAMP_RESIDUES
+            factor = smoothstep(t) * 0.5
+        elif res <= tunnel_exit_res + SCROLL_RAMP_RESIDUES:
+            # Just past exit: ramp from 0.5 to 1.0
+            t = (res - tunnel_exit_res) / SCROLL_RAMP_RESIDUES
+            factor = 0.5 + smoothstep(t) * 0.5
+        else:
+            # External chain: full scroll
+            factor = 1.0
+        scroll_factors[mask] = factor
+
+    positions += scroll_factors[:, np.newaxis] * scroll_offset
 
     return positions
 
