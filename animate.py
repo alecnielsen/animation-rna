@@ -2,10 +2,12 @@
 
 v7: Physics-based thermal motion via per-frame OpenMM MD.
 - Replaces sinusoidal jitter/PCA with Langevin dynamics (310K, position restraints)
-- mRNA slides smoothly along SVD backbone axis (was stationary)
-- 4 mobile molecules (mRNA, tRNA-P, tRNA-A, polypeptide): per-frame CPU MD
+- mRNA stationary at origin (tRNA choreography implies codon reading)
+- 3 mobile molecules (mRNA, tRNA-P, tRNA-A): per-frame CPU MD (k=500)
+- Polypeptide: folding morph animation (no MD — backbone-only PDB)
 - Ribosome: pre-computed ENM trajectory from Modal GPU (ribosome_thermal.npz)
 - Cross-fade last 12 frames for seamless loop blending
+- Polypeptide morph coords converted Å→BU to match mesh vertex space
 
 v6: Repeating HP35 domain polypeptide with folding morph animation.
 - 38 cycles (one repeat unit = 35 res domain + 3 res linker) for seamless loop
@@ -298,7 +300,7 @@ class MolecularDynamics:
     """
 
     def __init__(self, label, pdb_path, ribo_coords_A,
-                 k_restraint=100.0, k_wall=1000.0, temperature=310,
+                 k_restraint=500.0, k_wall=1000.0, temperature=310,
                  steps_per_frame=500, mol_type="rna"):
         import tempfile
         from openmm.app import (
@@ -647,8 +649,8 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
     for di in range(n_domains):
         start_res = int(fold_data[f'domain_{di}_start_res'])
         end_res = int(fold_data[f'domain_{di}_end_res'])
-        folded_coords = fold_data[f'domain_{di}_folded']
-        extended_coords = fold_data[f'domain_{di}_extended']
+        folded_coords = fold_data[f'domain_{di}_folded'] * 0.1    # Å → BU
+        extended_coords = fold_data[f'domain_{di}_extended'] * 0.1  # Å → BU
 
         # Domain mask: vertices belonging to this domain
         domain_mask = (res_ids >= start_res) & (res_ids <= end_res)
@@ -941,27 +943,6 @@ def main():
     obj_mrna.data.vertices.foreach_set('co', orig_verts[obj_mrna.name].ravel())
     obj_mrna.data.update()
 
-    # --- mRNA slide axis (SVD principal axis, 5'→3' oriented) ---
-    _mrna_pos = orig_verts[obj_mrna.name]
-    _, _, _vt = np.linalg.svd(_mrna_pos - _mrna_pos.mean(axis=0), full_matrices=False)
-    _local_axis = _vt[0]
-
-    # Orient 5'→3' via residue IDs
-    _unique_res = np.unique(mrna_mesh_res_ids) if mrna_mesh_res_ids is not None else np.array([0])
-    _first = _mrna_pos[mrna_mesh_res_ids == _unique_res[0]].mean(axis=0) if mrna_mesh_res_ids is not None else _mrna_pos[0]
-    _last = _mrna_pos[mrna_mesh_res_ids == _unique_res[-1]].mean(axis=0) if mrna_mesh_res_ids is not None else _mrna_pos[-1]
-    if np.dot(_last - _first, _local_axis) < 0:
-        _local_axis = -_local_axis
-
-    # Local → world space (Z rotation = pi/2): (x,y,z) → (-y,x,z)
-    _world_axis = np.array([-_local_axis[1], _local_axis[0], _local_axis[2]])
-    _world_axis /= np.linalg.norm(_world_axis)
-
-    # mRNA slides 3'→5' (ribosome reads 5'→3')
-    MRNA_SLIDE_AXIS = -_world_axis
-    MRNA_SLIDE_PER_CYCLE = np.linalg.norm(CODON_SHIFT)  # ≈1.0 BU
-    print(f"  mRNA slide: axis={MRNA_SLIDE_AXIS}, per_cycle={MRNA_SLIDE_PER_CYCLE:.3f} BU")
-
     # --- Get mesh res_ids for MD mapping ---
     trna_p_mesh_res_ids = get_mesh_res_ids(obj_trna_p)
     trna_a_mesh_res_ids = get_mesh_res_ids(obj_trna_a)
@@ -1104,10 +1085,8 @@ def main():
                 obj_surface.data.vertices.foreach_set('co', ribo_pos.ravel())
                 obj_surface.data.update()
 
-            # --- mRNA: smooth sliding + MD thermal ---
-            global_progress = cycle + local_frame / FRAMES_PER_CYCLE
-            mrna_offset = global_progress * MRNA_SLIDE_PER_CYCLE * MRNA_SLIDE_AXIS
-            obj_mrna.location = tuple(mrna_offset)
+            # --- mRNA: stationary + MD thermal ---
+            obj_mrna.location = (0, 0, 0)
             obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
             # MD thermal deformation for mRNA
