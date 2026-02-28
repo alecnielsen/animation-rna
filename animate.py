@@ -333,25 +333,18 @@ class MolecularDynamics:
 
         modeller = Modeller(pdb.topology, pdb.positions)
 
-        # RNA: remove P/OP1/OP2 from 5' terminus (AMBER14 compatibility)
+        # RNA 5' terminus: remove OP3/P/OP1/OP2 so AMBER14 recognizes
+        # the 5' end (crystal structures have OP3, tiled mRNA has P)
         if mol_type == "rna":
             first_res = list(modeller.topology.residues())[0]
             to_remove = [a for a in first_res.atoms()
-                         if a.name in ("P", "OP1", "OP2")]
+                         if a.name in ("P", "OP1", "OP2", "OP3")]
             if to_remove:
                 modeller.delete(to_remove)
+            modeller.addHydrogens(ff)
 
-        # Add hydrogens
+        # Protein: add hydrogens (terminal residues handled automatically)
         if mol_type == "protein":
-            try:
-                modeller.addHydrogens(ff)
-            except ValueError:
-                residues = list(modeller.topology.residues())
-                variants = [None] * len(residues)
-                variants[0] = 'ACE'
-                variants[-1] = 'NME'
-                modeller.addHydrogens(ff, variants=variants)
-        else:
             modeller.addHydrogens(ff)
 
         n_atoms = modeller.topology.getNumAtoms()
@@ -1017,7 +1010,8 @@ def main():
         ('mrna', 'extended_mrna.pdb', 'rna'),
         ('trna_p', 'trna_b4.pdb', 'rna'),
         ('trna_a', 'trna_d4.pdb', 'rna'),
-        ('peptide', peptide_pdb, 'protein'),
+        # Polypeptide PDB is backbone-only — can't parameterize for MD.
+        # The folding morph animation provides its motion instead.
     ]:
         try:
             md_sims[name] = MolecularDynamics(
