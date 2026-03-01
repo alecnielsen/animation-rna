@@ -1,5 +1,12 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v9: Emergence-based polypeptide folding.
+- Residues progressively "emerge" from tunnel and fold quickly (6-cycle window)
+- Only ~6 residues extended at any time (~23 Å ≈ 1 repeat distance)
+- Unemerged residues collapse to tunnel exit (no long linear overlap with
+  folded domains). Fixes v8 bug where 131 Å extended chain spanned 6 domains.
+- Gradient scroll + GLY-aware ranges preserved from v8
+
 v8: Polypeptide anchoring + GLY-aware folding.
 - Gradient scroll: tunnel residues anchored at PTC, smooth ramp to full scroll
   for external residues (fixes unfolding-back-into-ribosome and tRNA detachment)
@@ -659,12 +666,15 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
     """Per-frame polypeptide vertex positions with folding + scrolling.
 
     1. Compute global progress (fractional cycles elapsed)
-    2. For each domain: determine fold_t, interpolate extended<->folded
+    2. Domain_0: emergence-based folding — residues emerge from the tunnel
+       progressively and fold quickly, keeping the extended region short
+       (~6 residues). Unemerged residues collapse to tunnel exit.
+       Domains 1-7: stay fully folded (no morph).
     3. Apply gradient scroll: tunnel residues anchored at PTC, external
        residues scroll at full rate, smooth ramp in between
 
     Args:
-        orig_positions: (N, 3) original vertex positions (extended conformation)
+        orig_positions: (N, 3) original vertex positions (folded conformation)
         res_ids: (N,) per-vertex residue IDs
         fold_data: dict from NPZ with domain coords and metadata
         cycle: current cycle index (0 to N_CYCLES-1)
@@ -690,6 +700,11 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
     # around the tunnel exit so the chain doesn't have a hard kink.
     SCROLL_RAMP_RESIDUES = 8
 
+    # Tunnel exit anchor (collapse unemerged domain_0 residues here)
+    tunnel_exit_mask = res_ids == tunnel_exit_res
+    tunnel_anchor = (orig_positions[tunnel_exit_mask].mean(axis=0)
+                     if np.any(tunnel_exit_mask) else None)
+
     for di in range(n_domains):
         start_res = int(fold_data[f'domain_{di}_start_res'])
         end_res = int(fold_data[f'domain_{di}_end_res'])
@@ -701,83 +716,61 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
         if not np.any(domain_mask):
             continue
 
-        # Domain fold scheduling:
-        # fold_t: 0 = extended, 1 = folded (mesh starts folded from PDB)
-        # - Domain 0 (nearest tunnel exit): fold_t ramps 0->1 over 38 cycles
-        # - All other domains: fold_t = 1.0 (fully folded, no morph needed)
-        if di == 0:
-            fold_t = np.clip(global_progress / N_CYCLES, 0.0, 1.0)
-        else:
-            fold_t = 1.0
+        # Only domain_0 (nearest tunnel exit) animates; others stay folded
+        if di != 0:
+            continue
 
-        if fold_t >= 1.0:
-            continue  # fully folded, mesh already in correct position
-
-        # Get domain vertex indices
-        domain_indices = np.where(domain_mask)[0]
-
-        # Map mesh vertices to domain atom coordinates by residue ID
+        # --- Emergence-based folding for domain_0 ---
+        # Each residue "emerges" from the tunnel progressively and folds
+        # quickly, keeping the extended region short (~6 residues ≈ 23 Å,
+        # roughly 1 repeat distance). Unemerged residues collapse to
+        # the tunnel exit so no long linear chain overlaps folded domains.
+        FOLD_WINDOW = 6  # cycles for each residue to fold after emerging
         domain_res_unique = np.unique(res_ids[domain_mask])
-        n_domain_atoms = len(folded_coords)
-        n_domain_verts = len(domain_indices)
+        n_res = len(domain_res_unique)
+        # Spread emergence so last residue finishes folding at end of animation
+        emerge_span = max(N_CYCLES - FOLD_WINDOW, 1)
 
-        # Build proper per-residue atom ranges (handles GLY with 4 atoms)
         folded_res_ranges = _build_folded_residue_ranges(fold_data, di)
-        # Extended always has 5 atoms/res (all ALA backbone)
         n_ext_atoms = len(extended_coords)
 
-        if n_domain_verts != n_domain_atoms:
-            # MN mesh may have different vertex count than PDB atoms
-            # Fall back to per-residue centroid morphing
-            for ri, res in enumerate(domain_res_unique):
-                res_mask = domain_mask & (res_ids == res)
-                if not np.any(res_mask):
-                    continue
+        for ri, res in enumerate(domain_res_unique):
+            res_mask = domain_mask & (res_ids == res)
+            if not np.any(res_mask):
+                continue
 
-                # Per-residue fold_t with N-to-C wave
-                n_res = len(domain_res_unique)
-                residue_frac = ri / max(n_res - 1, 1)
-                per_res_t = np.clip((fold_t - residue_frac * 0.5) / 0.5, 0.0, 1.0)
-                eased_t = smoothstep(per_res_t)
+            # When does this residue emerge from the tunnel?
+            emergence_cycle = ri * emerge_span / max(n_res - 1, 1)
+            cycles_since = global_progress - emergence_cycle
 
-                # Mesh is loaded in FOLDED conformation from the PDB.
-                # unfold_t=1 → fully extended, unfold_t=0 → stay folded.
-                unfold_t = 1.0 - eased_t
-                if unfold_t <= 0.0:
-                    continue  # fully folded, no displacement needed
+            if cycles_since <= 0:
+                # Not yet emerged — collapse to tunnel exit
+                if tunnel_anchor is not None:
+                    positions[res_mask] = tunnel_anchor
+                continue
 
-                # Folded centroid: use proper atom ranges (handles GLY)
-                if ri < len(folded_res_ranges):
-                    f_start, f_end = folded_res_ranges[ri]
-                    folded_centroid = folded_coords[f_start:f_end].mean(axis=0)
-                else:
-                    continue
+            # Fold progress: 0 (just emerged, extended) → 1 (folded)
+            fold_frac = min(cycles_since / FOLD_WINDOW, 1.0)
+            unfold_t = 1.0 - smoothstep(fold_frac)
 
-                # Extended centroid: always 5 atoms/res
-                ext_start = ri * 5
-                ext_end = min(ext_start + 5, n_ext_atoms)
-                if ext_start >= n_ext_atoms:
-                    continue
-                extended_centroid = extended_coords[ext_start:ext_end].mean(axis=0)
+            if unfold_t <= 0.0:
+                continue  # fully folded, keep orig (PDB) position
 
-                # Unfold displacement: move from folded mesh toward extended
-                displacement = unfold_t * (extended_centroid - folded_centroid)
-                positions[res_mask] += displacement
-        else:
-            # Direct 1:1 mapping between mesh vertices and domain atoms
-            for vi, idx in enumerate(domain_indices):
-                res = res_ids[idx]
-                ri = np.searchsorted(domain_res_unique, res)
-                n_res = len(domain_res_unique)
-                residue_frac = ri / max(n_res - 1, 1)
-                per_res_t = np.clip((fold_t - residue_frac * 0.5) / 0.5, 0.0, 1.0)
-                eased_t = smoothstep(per_res_t)
-                unfold_t = 1.0 - eased_t
+            # Centroid-based displacement toward extended conformation
+            if ri < len(folded_res_ranges):
+                f_start, f_end = folded_res_ranges[ri]
+                folded_centroid = folded_coords[f_start:f_end].mean(axis=0)
+            else:
+                continue
 
-                if unfold_t > 0.0 and vi < n_domain_atoms:
-                    # Mesh starts folded; displace toward extended
-                    delta = unfold_t * (extended_coords[vi] - folded_coords[vi])
-                    positions[idx] = orig_positions[idx] + delta
+            ext_start = ri * 5
+            ext_end = min(ext_start + 5, n_ext_atoms)
+            if ext_start >= n_ext_atoms:
+                continue
+            extended_centroid = extended_coords[ext_start:ext_end].mean(axis=0)
+
+            displacement = unfold_t * (extended_centroid - folded_centroid)
+            positions[res_mask] += displacement
 
     # --- Gradient scroll: anchor tunnel at PTC, full scroll for external ---
     # Scroll offset at full rate (what external residues get)
