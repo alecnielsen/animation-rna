@@ -702,15 +702,16 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
             continue
 
         # Domain fold scheduling:
+        # fold_t: 0 = extended, 1 = folded (mesh starts folded from PDB)
         # - Domain 0 (nearest tunnel exit): fold_t ramps 0->1 over 38 cycles
-        # - All other domains: fold_t = 1.0 (fully folded, static)
+        # - All other domains: fold_t = 1.0 (fully folded, no morph needed)
         if di == 0:
             fold_t = np.clip(global_progress / N_CYCLES, 0.0, 1.0)
         else:
             fold_t = 1.0
 
-        if fold_t <= 0.0:
-            continue  # still fully extended, use orig_positions
+        if fold_t >= 1.0:
+            continue  # fully folded, mesh already in correct position
 
         # Get domain vertex indices
         domain_indices = np.where(domain_mask)[0]
@@ -739,8 +740,11 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                 per_res_t = np.clip((fold_t - residue_frac * 0.5) / 0.5, 0.0, 1.0)
                 eased_t = smoothstep(per_res_t)
 
-                if eased_t <= 0.0:
-                    continue
+                # Mesh is loaded in FOLDED conformation from the PDB.
+                # unfold_t=1 → fully extended, unfold_t=0 → stay folded.
+                unfold_t = 1.0 - eased_t
+                if unfold_t <= 0.0:
+                    continue  # fully folded, no displacement needed
 
                 # Folded centroid: use proper atom ranges (handles GLY)
                 if ri < len(folded_res_ranges):
@@ -756,8 +760,8 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                     continue
                 extended_centroid = extended_coords[ext_start:ext_end].mean(axis=0)
 
-                # Apply only the folding displacement (extended→folded delta)
-                displacement = eased_t * (folded_centroid - extended_centroid)
+                # Unfold displacement: move from folded mesh toward extended
+                displacement = unfold_t * (extended_centroid - folded_centroid)
                 positions[res_mask] += displacement
         else:
             # Direct 1:1 mapping between mesh vertices and domain atoms
@@ -768,9 +772,11 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                 residue_frac = ri / max(n_res - 1, 1)
                 per_res_t = np.clip((fold_t - residue_frac * 0.5) / 0.5, 0.0, 1.0)
                 eased_t = smoothstep(per_res_t)
+                unfold_t = 1.0 - eased_t
 
-                if eased_t > 0.0 and vi < n_domain_atoms:
-                    delta = eased_t * (folded_coords[vi] - extended_coords[vi])
+                if unfold_t > 0.0 and vi < n_domain_atoms:
+                    # Mesh starts folded; displace toward extended
+                    delta = unfold_t * (extended_coords[vi] - folded_coords[vi])
                     positions[idx] = orig_positions[idx] + delta
 
     # --- Gradient scroll: anchor tunnel at PTC, full scroll for external ---
@@ -1134,6 +1140,13 @@ def main():
     for cycle in range(N_CYCLES):
         for local_frame in range(FRAMES_PER_CYCLE):
             global_frame = cycle * FRAMES_PER_CYCLE + local_frame
+
+            # Skip already-rendered frames (resume support)
+            frame_out = os.path.join(FRAMES_DIR, f"frame_{global_frame:04d}.png")
+            if os.path.exists(frame_out):
+                print(f"  Skipping frame {global_frame} (already exists)")
+                continue
+
             t_frame_start = time.time()
             print(f"\n--- Cycle {cycle}, Frame {local_frame}/{FRAMES_PER_CYCLE - 1} "
                   f"(global {global_frame}/{TOTAL_FRAMES - 1}) ---")

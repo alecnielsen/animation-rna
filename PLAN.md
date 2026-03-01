@@ -70,22 +70,16 @@ stays near-static (subtle jitter only). Moving parts:
 4. **tRNA (A→P)** — translocates A→P site (becomes new P-site tRNA)
 5. **Polypeptide** — progressive reveal of one residue per cycle (no rigid-body motion)
 
-### Layer 2: Structural deformation + thermal motion
+### Layer 2: Per-frame OpenMM thermal motion
 
-- **PCA modes:** Pre-computed from MD trajectories, applied as per-residue
-  displacement via integer-harmonic sines. Gives physically realistic
-  backbone undulation that loops perfectly. Amplitude 1.5 BU (30:1 ratio
-  over residue jitter).
-- **Per-residue jitter:** Coherent sum-of-sines displacement grouped by
-  residue (all atoms in a residue move together). Surface meshes re-evaluate
-  cleanly.
-- **Ribosome jitter:** Visible rigid-body translation (0.15 BU) + rotation (5deg).
+- **Elastic network MD:** Per-frame OpenMM simulation with harmonic restraints
+  (k=100 kJ/mol/nm²) for mRNA and tRNAs. Produces physically realistic
+  thermal breathing without tearing surface meshes.
+- **Ribosome ENM trajectory:** Pre-computed 456-frame elastic network mode
+  trajectory (16938 residues) loaded from `ribosome_thermal.npz`.
+  Computed on Modal GPU for performance.
 - **tRNA tumbling:** Full rotational freedom during approach/departure,
   smooth decay during accommodation, 5% residual tumble when bound.
-
-For seamless looping, all frequencies are integer harmonics of the total
-animation period (k/T) so every component returns to its exact starting
-phase at the loop point.
 
 ### Sequence (one elongation cycle, frames scaled to total)
 
@@ -165,18 +159,35 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Enhanced mRNA MD: 500K steps, 3-stage anneal, sequence randomization
 - [x] Eliminate composite.py from pipeline (single-pass handles occlusion)
 
-### v5 (current)
+### v5 (complete)
 - [x] Ribosome translucency: switch to Principled BSDF Alpha=0.06 (HASHED blend mode)
 - [x] Tested and rejected alternative translucency approaches (mix-shader, Transmission, Fresnel, Glass BSDF)
 - [x] Tunnel-threaded polypeptide: C4 path + forward-biased scoring, extended 100 steps (200 A) past exit
 - [x] Single-frame renderer (`render_single_frame.py`) for validating molecule placements
 - [x] Camera zoom tuned to 85% auto-frame distance
-- [ ] Per-residue jitter + PCA vertex deformation (disabled — tears StyleSurface meshes at residue boundaries)
-- [ ] mRNA codon translocation: logic exists, not yet verified in rendered output
-- [ ] Polypeptide progressive reveal: logic exists, not yet verified in rendered output
-- [ ] Seamless loop verification (integer-harmonic math correct, visual verification pending)
-- [ ] Debug render validation
-- [ ] Full production render
+
+### v6 (complete)
+- [x] Repeating HP35 polypeptide domains (8x Villin HP35 with GSG linkers)
+- [x] Dual-coordinate NPZ for polypeptide morph animation (extended + folded per domain)
+- [x] mRNA decoding center alignment (shift extended mRNA to match tRNA-mRNA base pairing)
+- [x] Camera angle from Blender viewport: polypeptide parallel to view plane
+- [x] 5M-step GPU relaxation (Modal) for mRNA
+- [x] CONECT record handling: strip bad CONECT records so MN infers bonds by template
+
+### v7 (complete)
+- [x] Per-frame OpenMM thermal motion (replaces PCA modes — no more mesh tearing)
+  - [x] Elastic network restraints (k=100 kJ/mol/nm²) for mRNA, tRNAs
+  - [x] Pre-computed ENM thermal trajectory for ribosome (456 frames, 16938 residues)
+  - [x] MD parameterization fix: remove OP3 from tRNA 5' terminus
+- [x] 2-pass composite rendering: cartoon for ribosome (outline via dilated silhouette), ribbon for tRNA, cartoon for mRNA/peptide backbone
+- [x] mRNA stationary (no rigid-body sliding — ratchet absorbed off-screen)
+- [x] Å→BU scale fix: world_scale=0.01 (not 0.1), relative polypeptide morph
+- [x] Polypeptide folding morph: domain 0 unfolds N→C wave over 38 cycles, domains 1-7 stay folded
+- [x] Gradient scroll: anchor tunnel residues at PTC, smooth ramp to full scroll for external residues
+- [x] GLY-aware folded residue ranges (4 atoms vs 5 for standard amino acids)
+- [x] Double-folding morph inversion: mesh starts folded from PDB, apply unfold displacement (not fold)
+- [x] Distal tail extended from 10 to 40 residues
+- [x] Resume rendering support (skip already-rendered frames)
 
 ## Tech stack
 

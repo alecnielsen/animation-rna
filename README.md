@@ -2,7 +2,7 @@
 
 Molecular visualization of protein translation, rendered with Blender and [Molecular Nodes](https://github.com/BradyAJohnston/MolecularNodes).
 
-Shows a seamless-looping animation of amino acid incorporation with real PDB structures: mRNA threaded through a ribosome, tRNA delivery/accommodation/departure choreography, and a nascent polypeptide chain of repeating Villin HP35 folded domains scrolling away from the ribosome exit tunnel.
+Shows a seamless-looping animation of amino acid incorporation with real PDB structures: mRNA threaded through a ribosome, tRNA delivery/accommodation/departure choreography, and a nascent polypeptide chain of repeating Villin HP35 folded domains scrolling away from the ribosome exit tunnel. Per-frame OpenMM thermal motion gives physically realistic molecular breathing.
 
 ## Setup
 
@@ -67,13 +67,14 @@ python3.11 build_extended_mrna.py
 #     Writes repeating_polypeptide.pdb, repeating_polypeptide_folds.npz (~5 min)
 python3.11 build_tunnel_polypeptide.py
 
-# 0c. Compute PCA structural modes from MD trajectories
-#     Writes mrna_modes.npz, trna_modes.npz (~30-60 min)
-python3.11 compute_md_modes.py
+# 0c. Pre-compute ribosome ENM thermal trajectory on Modal GPU
+#     Writes ribosome_thermal.npz (456 frames, 16938 residues)
+/Users/alec/Library/Python/3.9/bin/modal run modal_gpu.py::compute_ribosome_thermal
 
 # 1. Render all frames (38 elongation cycles for seamless loop)
+#    Includes per-frame OpenMM thermal motion for mRNA + tRNAs
 python3.11 animate.py          # 1920x1080, 456 frames (production, 19s @ 24fps)
-python3.11 animate.py --debug  # 480x270, 228 frames (fast preview, 9.5s @ 24fps)
+python3.11 animate.py --debug  # 480x270, 456 frames (fast preview, 19s @ 24fps)
 
 # 2. Encode to video
 python3.11 encode.py
@@ -92,8 +93,8 @@ Output:
 | `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x20, 500K-step 3-stage MD annealing with ribosome wall repulsion, shift to decoding center |
 | `build_tunnel_polypeptide.py` | `repeating_polypeptide.pdb`, `repeating_polypeptide_folds.npz` | Trace exit tunnel, place 8 repeating Villin HP35 (1YRF) folded domains with GSG linkers. NPZ stores dual extended/folded coordinates per domain for morph animation |
 | `render_single_frame.py` | `renders/single_frame.png` | Single-frame render of full translation complex (ribosome, mRNA, tRNAs, polypeptide) |
-| `compute_md_modes.py` | `mrna_modes.npz`, `trna_modes.npz` | PCA modes from MD for structural deformation |
-| `animate.py` | `renders/frames/` | 38-cycle seamless loop: 6-phase tRNA choreography, polypeptide folding morph (extended→folded with N-to-C wave), domain scrolling |
+| `modal_gpu.py` | `ribosome_thermal.npz` | Modal GPU: MD relaxation, ribosome ENM thermal trajectory (456 frames), production renders |
+| `animate.py` | `renders/frames/` | 38-cycle seamless loop: 6-phase tRNA choreography, per-frame OpenMM thermal motion, polypeptide folding morph with gradient scroll, 2-pass composite (cartoon + ribosome outline) |
 | `encode.py` | `renders/ribosome_animation.mp4`, `.webm` | Encode rendered frames to H.264 and VP9 video |
 
 ## Visual style spec
