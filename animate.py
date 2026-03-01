@@ -665,10 +665,13 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
                                cycle, local_frame, frames_per_cycle):
     """Per-frame polypeptide vertex positions with folding + scrolling.
 
+    v10: Compact unfold toward tunnel. Instead of morphing toward pre-computed
+    extended coordinates, displace each unfolded residue from its folded
+    position along -scroll_vector (toward tunnel). Cap at 15 Å so the
+    unfolded region stays compact and local.
+
     1. Compute global progress (fractional cycles elapsed)
-    2. Domain_0: emergence-based folding — residues emerge from the tunnel
-       progressively and fold quickly, keeping the extended region short
-       (~6 residues). Unemerged residues collapse to tunnel exit.
+    2. Domain_0: N-to-C wave fold with directional displacement.
        Domains 1-7: stay fully folded (no morph).
     3. Apply gradient scroll: tunnel residues anchored at PTC, external
        residues scroll at full rate, smooth ramp in between
@@ -693,23 +696,18 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
     global_progress = cycle + local_frame / frames_per_cycle
 
     # --- Tunnel exit residue: infer from domain 0 start ---
-    # Tunnel residues are numbered 1..(domain_0_start - 1).
-    # They should stay anchored at the PTC (no scroll).
     tunnel_exit_res = int(fold_data['domain_0_start_res']) - 1
-    # Transition zone: ramp scroll factor from 0→1 over a few residues
-    # around the tunnel exit so the chain doesn't have a hard kink.
     SCROLL_RAMP_RESIDUES = 8
 
-    # Tunnel exit anchor (collapse unemerged domain_0 residues here)
-    tunnel_exit_mask = res_ids == tunnel_exit_res
-    tunnel_anchor = (orig_positions[tunnel_exit_mask].mean(axis=0)
-                     if np.any(tunnel_exit_mask) else None)
+    # Unfold direction: toward tunnel exit (opposite of scroll direction)
+    scroll_norm = scroll_vector / np.linalg.norm(scroll_vector)
+    unfold_direction = -scroll_norm  # toward tunnel
+    MAX_UNFOLD_BU = 0.15  # 15 Å cap in BU (ANG_TO_BU = 0.01)
+    WAVE_WINDOW = 0.5  # fraction of cycle for N-to-C wave
 
     for di in range(n_domains):
         start_res = int(fold_data[f'domain_{di}_start_res'])
         end_res = int(fold_data[f'domain_{di}_end_res'])
-        folded_coords = fold_data[f'domain_{di}_folded'] * ANG_TO_BU    # Å → BU
-        extended_coords = fold_data[f'domain_{di}_extended'] * ANG_TO_BU  # Å → BU
 
         # Domain mask: vertices belonging to this domain
         domain_mask = (res_ids >= start_res) & (res_ids <= end_res)
@@ -720,56 +718,32 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
         if di != 0:
             continue
 
-        # --- Emergence-based folding for domain_0 ---
-        # Each residue "emerges" from the tunnel progressively and folds
-        # quickly, keeping the extended region short (~6 residues ≈ 23 Å,
-        # roughly 1 repeat distance). Unemerged residues collapse to
-        # the tunnel exit so no long linear chain overlaps folded domains.
-        FOLD_WINDOW = 6  # cycles for each residue to fold after emerging
+        # --- v10: Directional displacement fold for domain_0 ---
         domain_res_unique = np.unique(res_ids[domain_mask])
         n_res = len(domain_res_unique)
-        # Spread emergence so last residue finishes folding at end of animation
-        emerge_span = max(N_CYCLES - FOLD_WINDOW, 1)
 
-        folded_res_ranges = _build_folded_residue_ranges(fold_data, di)
-        n_ext_atoms = len(extended_coords)
+        # Cycle-local fold progress: 0 at cycle start → 1 at cycle end
+        cycle_t = local_frame / frames_per_cycle
 
         for ri, res in enumerate(domain_res_unique):
             res_mask = domain_mask & (res_ids == res)
             if not np.any(res_mask):
                 continue
 
-            # When does this residue emerge from the tunnel?
-            emergence_cycle = ri * emerge_span / max(n_res - 1, 1)
-            cycles_since = global_progress - emergence_cycle
+            # N-to-C wave: each residue folds over a window,
+            # staggered so N-term folds first, C-term last
+            wave_center = ri / max(n_res - 1, 1)  # 0..1 along chain
+            wave_start = wave_center - WAVE_WINDOW / 2
+            wave_end = wave_center + WAVE_WINDOW / 2
+            fold_t = np.clip((cycle_t - wave_start) / (wave_end - wave_start), 0.0, 1.0)
+            unfold_t = smoothstep(1.0 - fold_t)
 
-            if cycles_since <= 0:
-                # Not yet emerged — collapse to tunnel exit
-                if tunnel_anchor is not None:
-                    positions[res_mask] = tunnel_anchor
-                continue
+            if unfold_t <= 1e-6:
+                continue  # fully folded, keep orig position
 
-            # Fold progress: 0 (just emerged, extended) → 1 (folded)
-            fold_frac = min(cycles_since / FOLD_WINDOW, 1.0)
-            unfold_t = 1.0 - smoothstep(fold_frac)
-
-            if unfold_t <= 0.0:
-                continue  # fully folded, keep orig (PDB) position
-
-            # Centroid-based displacement toward extended conformation
-            if ri < len(folded_res_ranges):
-                f_start, f_end = folded_res_ranges[ri]
-                folded_centroid = folded_coords[f_start:f_end].mean(axis=0)
-            else:
-                continue
-
-            ext_start = ri * 5
-            ext_end = min(ext_start + 5, n_ext_atoms)
-            if ext_start >= n_ext_atoms:
-                continue
-            extended_centroid = extended_coords[ext_start:ext_end].mean(axis=0)
-
-            displacement = unfold_t * (extended_centroid - folded_centroid)
+            # Displace along unfold_direction, scaled by chain position
+            chain_frac = ri / max(n_res - 1, 1)  # 0=N-term, 1=C-term
+            displacement = unfold_t * chain_frac * MAX_UNFOLD_BU * unfold_direction
             positions[res_mask] += displacement
 
     # --- Gradient scroll: anchor tunnel at PTC, full scroll for external ---

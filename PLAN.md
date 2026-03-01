@@ -189,6 +189,22 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Distal tail extended from 10 to 40 residues
 - [x] Resume rendering support (skip already-rendered frames)
 
+### v8 (complete)
+- [x] N-to-C wave fold timing: each residue folds within a WAVE_WINDOW=0.5 window, staggered along chain
+- [x] Replaced global fold progress with per-cycle local timing (cycle_t = local_frame / frames_per_cycle)
+
+### v9 (complete)
+- [x] Emergence-based polypeptide folding: residues emerge from tunnel progressively, fold within 6-cycle window
+- [x] Tunnel anchor collapse: unemerged residues collapse to tunnel exit point
+- [x] Kept only ~6 residues extended at any time (~23 Å) to reduce overlap with folded domains
+
+### v10 (complete)
+- [x] Compact unfold toward tunnel: replace extended-coord morph with directional displacement
+- [x] Per-residue displacement along -scroll_vector (toward tunnel), capped at 15 Å (MAX_UNFOLD_BU=0.15)
+- [x] chain_frac scaling: N-terminal residues barely move, C-terminal residues move most (accordion effect)
+- [x] Reverted to v8 N-to-C wave timing (removed v9 emergence/cycle logic)
+- [x] Eliminated all extended coordinate usage for domain_0 — no more 131 Å extended chain
+
 ## Tech stack
 
 - **Python 3.11** — required by Blender
