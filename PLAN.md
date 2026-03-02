@@ -201,9 +201,11 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 ### v10 (complete)
 - [x] Compact unfold toward tunnel: replace extended-coord morph with directional displacement
 - [x] Per-residue displacement along -scroll_vector (toward tunnel), capped at 15 Å (MAX_UNFOLD_BU=0.15)
-- [x] chain_frac scaling: N-terminal residues barely move, C-terminal residues move most (accordion effect)
+- [x] chain_frac scaling: N-terminal residues (near tunnel) move most, C-terminal (near folded stack) stays anchored
 - [x] Reverted to v8 N-to-C wave timing (removed v9 emergence/cycle logic)
 - [x] Eliminated all extended coordinate usage for domain_0 — no more 131 Å extended chain
+- [x] Fix: inverted chain_frac so displacement anchors at folded stack (not tunnel)
+- [x] Fix: global fold timing (single fold across animation, not per-cycle repetition)
 
 ## Tech stack
 

@@ -722,8 +722,9 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
         domain_res_unique = np.unique(res_ids[domain_mask])
         n_res = len(domain_res_unique)
 
-        # Cycle-local fold progress: 0 at cycle start → 1 at cycle end
-        cycle_t = local_frame / frames_per_cycle
+        # Global fold progress: 0 at animation start → 1 at end
+        # Single fold across entire animation (not per-cycle)
+        global_t = global_progress / N_CYCLES
 
         for ri, res in enumerate(domain_res_unique):
             res_mask = domain_mask & (res_ids == res)
@@ -735,14 +736,15 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
             wave_center = ri / max(n_res - 1, 1)  # 0..1 along chain
             wave_start = wave_center - WAVE_WINDOW / 2
             wave_end = wave_center + WAVE_WINDOW / 2
-            fold_t = np.clip((cycle_t - wave_start) / (wave_end - wave_start), 0.0, 1.0)
+            fold_t = np.clip((global_t - wave_start) / (wave_end - wave_start), 0.0, 1.0)
             unfold_t = smoothstep(1.0 - fold_t)
 
             if unfold_t <= 1e-6:
                 continue  # fully folded, keep orig position
 
             # Displace along unfold_direction, scaled by chain position
-            chain_frac = ri / max(n_res - 1, 1)  # 0=N-term, 1=C-term
+            # N-term (near tunnel) moves most, C-term (near folded stack) stays anchored
+            chain_frac = 1.0 - ri / max(n_res - 1, 1)  # 1=N-term, 0=C-term
             displacement = unfold_t * chain_frac * MAX_UNFOLD_BU * unfold_direction
             positions[res_mask] += displacement
 
