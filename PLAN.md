@@ -207,6 +207,12 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Fix: inverted chain_frac so displacement anchors at folded stack (not tunnel)
 - [x] Fix: global fold timing (single fold across animation, not per-cycle repetition)
 
+### v11 (in progress)
+- [ ] Polypeptide thermal jitter via OpenMM elastic network MD
+  - [ ] Initialize MolecularDynamics for polypeptide PDB (same pattern as mRNA/tRNAs)
+  - [ ] Layer MD deltas on top of morph+scroll positions (not static orig_verts)
+  - [ ] Loop-blend for seamless looping
+
 ## Tech stack
 
 - **Python 3.11** — required by Blender
