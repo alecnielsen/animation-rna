@@ -54,6 +54,15 @@ TAIL_RESIDUES = 40
 
 CA_CA_DIST = 3.8  # standard protein CA-CA distance (Angstroms)
 
+# HP35 sequence (Villin headpiece, PDB 1YRF) — cycled for non-domain regions
+HP35_SEQUENCE = "LSDEDFKAVFGMTRSAFANLPLWKQQHLKKEKGLF"
+AA1TO3 = {
+    'A': 'ALA', 'R': 'ARG', 'N': 'ASN', 'D': 'ASP', 'C': 'CYS',
+    'E': 'GLU', 'Q': 'GLN', 'G': 'GLY', 'H': 'HIS', 'I': 'ILE',
+    'L': 'LEU', 'K': 'LYS', 'M': 'MET', 'F': 'PHE', 'P': 'PRO',
+    'S': 'SER', 'T': 'THR', 'W': 'TRP', 'Y': 'TYR', 'V': 'VAL',
+}
+
 # 60S chain IDs
 CHAINS_60S = [
     "L5", "L7", "L8", "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI",
@@ -337,13 +346,20 @@ def smooth_centerline(centerline, exit_arc_length):
     return smooth, tunnel_exit_residue, cs, total_len
 
 
-def build_backbone_along_spline(spline_points, tunnel_exit_residue):
-    """Build polyalanine backbone atoms along the spline centerline.
+def build_backbone_along_spline(spline_points, tunnel_exit_residue,
+                                 sequence=None):
+    """Build backbone atoms along the spline centerline using HP35 sequence.
+
+    If sequence is None, cycles through HP35_SEQUENCE.
+    GLY residues get 4 atoms (no CB), all others get 5.
 
     Returns: AtomArray
     """
     n_res = len(spline_points)
-    print(f"  Building {n_res}-residue polyalanine along tunnel spline...")
+    if sequence is None:
+        sequence = [AA1TO3[HP35_SEQUENCE[i % len(HP35_SEQUENCE)]]
+                    for i in range(n_res)]
+    print(f"  Building {n_res}-residue backbone along spline (HP35 sequence)...")
     print(f"    Residues 1-{tunnel_exit_residue}: extended conformation (tunnel)")
     print(f"    Residues {tunnel_exit_residue+1}-{n_res}: alpha helix (post-exit)")
 
@@ -354,8 +370,8 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
         tangents[i] = spline_points[i + 1] - spline_points[i - 1]
     tangents = tangents / np.linalg.norm(tangents, axis=1, keepdims=True)
 
-    atoms_per_res = 5  # N, CA, C, O, CB
-    total_atoms = n_res * atoms_per_res
+    # Count total atoms (GLY=4, others=5)
+    total_atoms = sum(4 if res == "GLY" else 5 for res in sequence)
     arr = AtomArray(total_atoms)
 
     offsets_extended = {
@@ -374,13 +390,12 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
         "CB": np.array([-1.52, 0.0, 0.22]),
     }
 
-    atom_names = ["N", "CA", "C", "O", "CB"]
-    elements = ["N", "C", "C", "O", "C"]
-
     idx = 0
     for i in range(n_res):
         ca_pos = spline_points[i]
         t = tangents[i]
+        res_name = sequence[i]
+        is_gly = res_name == "GLY"
 
         if abs(t[0]) < 0.9:
             n_vec = np.cross(t, np.array([1, 0, 0]))
@@ -402,11 +417,14 @@ def build_backbone_along_spline(spline_points, tunnel_exit_residue):
 
         R = np.column_stack([n_rot, b_rot, t])
 
-        for j, (aname, elem) in enumerate(zip(atom_names, elements)):
+        atom_names = ["N", "CA", "C", "O"] if is_gly else ["N", "CA", "C", "O", "CB"]
+        elements = ["N", "C", "C", "O"] if is_gly else ["N", "C", "C", "O", "C"]
+
+        for aname, elem in zip(atom_names, elements):
             pos = ca_pos + R @ offsets[aname]
             arr.coord[idx] = pos
             arr.atom_name[idx] = aname
-            arr.res_name[idx] = "ALA"
+            arr.res_name[idx] = res_name
             arr.res_id[idx] = i + 1
             arr.chain_id[idx] = "A"
             arr.element[idx] = elem
@@ -488,10 +506,11 @@ def align_domain_to_position(domain, attach_pos, attach_dir):
     return domain
 
 
-def build_extended_segment(n_residues, start_pos, direction, res_name="ALA"):
+def build_extended_segment(n_residues, start_pos, direction, sequence=None):
     """Build an extended backbone segment along a direction.
 
-    Returns: AtomArray with backbone atoms (N, CA, C, O, CB) per residue.
+    sequence: list of 3-letter residue names, or None to cycle HP35.
+    Returns: AtomArray with backbone atoms per residue.
     """
     direction = direction / np.linalg.norm(direction)
 
@@ -500,17 +519,15 @@ def build_extended_segment(n_residues, start_pos, direction, res_name="ALA"):
                               for i in range(n_residues)])
 
     # Use build_backbone_along_spline with all-extended conformation
-    arr = build_backbone_along_spline(ca_positions, n_residues)
-
-    # Overwrite residue names
-    arr.res_name[:] = res_name
+    arr = build_backbone_along_spline(ca_positions, n_residues,
+                                       sequence=sequence)
     return arr
 
 
 def build_random_walk_extension(start_pos, start_dir, n_residues=10,
                                  ca_spacing=3.8, angular_std=0.10, seed=42,
                                  repel_center=None, repel_strength=0.3):
-    """Build a smooth random-walk polyalanine extension.
+    """Build a smooth random-walk extension using HP35 sequence.
 
     Returns: AtomArray
     """
@@ -642,10 +659,12 @@ def build_repeating_domain_chain(spline_points, tunnel_exit_residue,
         fold_data[f'domain_{di}_atom_names'] = domain.atom_name.copy()
 
         # Build extended conformation for the same residues
-        # (backbone stretched along chain direction)
+        # (backbone stretched along chain direction, matching domain sequence)
         n_domain_res = len(domain_res_orig)
+        domain_seq = [domain.res_name[domain.res_id == res_remap[int(r)]][0]
+                      for r in domain_res_orig]
         ext_segment = build_extended_segment(
-            n_domain_res, current_pos, chain_dir)
+            n_domain_res, current_pos, chain_dir, sequence=domain_seq)
         # Match residue IDs to the folded domain
         ext_res_orig = np.unique(ext_segment.res_id)
         for ai in range(len(ext_segment)):
@@ -674,7 +693,8 @@ def build_repeating_domain_chain(spline_points, tunnel_exit_residue,
         # Add GSG linker (except after last domain)
         if di < N_DOMAINS - 1:
             linker = build_extended_segment(
-                LINKER_RESIDUES, current_pos, chain_dir, res_name="GLY")
+                LINKER_RESIDUES, current_pos, chain_dir,
+                sequence=["GLY"] * LINKER_RESIDUES)
             current_res_id += 1
             linker_start = current_res_id
             linker_res_orig = np.unique(linker.res_id)

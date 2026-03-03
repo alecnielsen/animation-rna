@@ -213,6 +213,10 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Initialize MolecularDynamics for polypeptide (same pattern as mRNA/tRNAs)
   - [x] MD deltas layered on top of morph+scroll positions (existing wiring at line ~1203)
   - [x] Loop-blend for seamless looping (inherited from MolecularDynamics class)
+- [x] Swap polyalanine to HP35 sequence throughout entire chain
+  - [x] Tunnel region, tail, extended segments all use cycling HP35 sequence
+  - [x] GLY residues correctly have 4 atoms (no CB)
+  - [x] Rebuilt all-atom PDB with proper diverse sidechains (6158 atoms)
 
 ## Tech stack
 
