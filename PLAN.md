@@ -208,10 +208,11 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Fix: global fold timing (single fold across animation, not per-cycle repetition)
 
 ### v11 (in progress)
-- [ ] Polypeptide thermal jitter via OpenMM elastic network MD
-  - [ ] Initialize MolecularDynamics for polypeptide PDB (same pattern as mRNA/tRNAs)
-  - [ ] Layer MD deltas on top of morph+scroll positions (not static orig_verts)
-  - [ ] Loop-blend for seamless looping
+- [x] Polypeptide thermal jitter via OpenMM elastic network MD
+  - [x] Build all-atom PDB via PDBFixer (add missing sidechains to backbone-only PDB, fix GLY CB)
+  - [x] Initialize MolecularDynamics for polypeptide (same pattern as mRNA/tRNAs)
+  - [x] MD deltas layered on top of morph+scroll positions (existing wiring at line ~1203)
+  - [x] Loop-blend for seamless looping (inherited from MolecularDynamics class)
 
 ## Tech stack
 

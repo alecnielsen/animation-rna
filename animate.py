@@ -1034,8 +1034,7 @@ def main():
         ('mrna', 'extended_mrna.pdb', 'rna'),
         ('trna_p', 'trna_b4.pdb', 'rna'),
         ('trna_a', 'trna_d4.pdb', 'rna'),
-        # Polypeptide PDB is backbone-only — can't parameterize for MD.
-        # The folding morph animation provides its motion instead.
+        ('peptide', 'repeating_polypeptide_allatom.pdb', 'protein'),
     ]:
         try:
             md_sims[name] = MolecularDynamics(
