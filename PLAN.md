@@ -207,7 +207,7 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Fix: inverted chain_frac so displacement anchors at folded stack (not tunnel)
 - [x] Fix: global fold timing (single fold across animation, not per-cycle repetition)
 
-### v11 (in progress)
+### v11 (complete)
 - [x] Polypeptide thermal jitter via OpenMM elastic network MD
   - [x] Build all-atom PDB via PDBFixer (add missing sidechains to backbone-only PDB, fix GLY CB)
   - [x] Initialize MolecularDynamics for polypeptide (same pattern as mRNA/tRNAs)
