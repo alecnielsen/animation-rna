@@ -217,6 +217,8 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Tunnel region, tail, extended segments all use cycling HP35 sequence
   - [x] GLY residues correctly have 4 atoms (no CB)
   - [x] Rebuilt all-atom PDB with proper diverse sidechains (6158 atoms)
+- Note: peptide MD (6158 atoms) causes occasional slow frames (~300-900s vs ~30s normal),
+  likely from OpenMM resolving bad sidechain states. Render still completes, ~5h total.
 
 ## Tech stack
 
