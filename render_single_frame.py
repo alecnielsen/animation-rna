@@ -391,9 +391,13 @@ def main():
         name="surface",
     )
 
-    # 2. mRNA (extended, from preprocessed PDB) — backbone cartoon (gaps = breaks)
-    _write_backbone("extended_mrna.pdb", "extended_mrna_bb.pdb", mol_type="rna")
-    mol_mrna = mn.Molecule.load("extended_mrna_bb.pdb")
+    # 2. mRNA (extended, from preprocessed PDB)
+    if MOL_STYLE == "surface":
+        mrna_pdb = "extended_mrna.pdb"  # full atoms for surface mesh
+    else:
+        _write_backbone("extended_mrna.pdb", "extended_mrna_bb.pdb", mol_type="rna")
+        mrna_pdb = "extended_mrna_bb.pdb"  # backbone only for cartoon
+    mol_mrna = mn.Molecule.load(mrna_pdb)
     mol_mrna.add_style(
         style="cartoon" if MOL_STYLE != "surface" else mn.StyleSurface(),
         material=make_solid_material((0.05, 0.25, 0.95)),

@@ -228,7 +228,8 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] mRNA: backbone straightening via P-P-P angle restraints during relaxation
   - [x] Added CustomAngleForce (k=50 kJ/mol/rad², theta0=pi) on 337 P-P-P triplets
   - [x] Local 500K-step relaxation complete (mean angle: 63.9° → 16.1°, max: 131.8° → 59.5°)
-- [ ] Surface mesh test render (--style=surface)
+- [x] Load full mRNA atoms for surface mesh (skip backbone stripping when style=surface)
+- [ ] Surface mesh test render (--style=surface, full atoms)
 
 ## Tech stack
 
