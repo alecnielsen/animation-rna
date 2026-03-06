@@ -225,9 +225,10 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Generate repeating HP35 codons (A=75, U=51, G=111, C=103 across 340 nt)
   - [x] Strip base atoms from tiled backbone, reconstruct via PDBFixer
   - [x] OpenMM parameterization verified (10971 atoms with H)
-- [ ] mRNA: backbone straightening via P-P-P angle restraints during relaxation
+- [x] mRNA: backbone straightening via P-P-P angle restraints during relaxation
   - [x] Added CustomAngleForce (k=50 kJ/mol/rad², theta0=pi) on 337 P-P-P triplets
-  - [ ] Local 500K-step relaxation running
+  - [x] Local 500K-step relaxation complete (mean angle: 63.9° → 16.1°, max: 131.8° → 59.5°)
+- [ ] Surface mesh test render (--style=surface)
 
 ## Tech stack
 
