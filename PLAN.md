@@ -220,6 +220,15 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - Note: peptide MD (6158 atoms) causes occasional slow frames (~300-900s vs ~30s normal),
   likely from OpenMM resolving bad sidechain states. Render still completes, ~5h total.
 
+### v12 (in progress)
+- [x] mRNA: HP35 coding sequence (replace poly-U)
+  - [x] Generate repeating HP35 codons (A=75, U=51, G=111, C=103 across 340 nt)
+  - [x] Strip base atoms from tiled backbone, reconstruct via PDBFixer
+  - [x] OpenMM parameterization verified (10971 atoms with H)
+- [ ] mRNA: backbone straightening via P-P-P angle restraints during relaxation
+  - [x] Added CustomAngleForce (k=50 kJ/mol/rad², theta0=pi) on 337 P-P-P triplets
+  - [ ] Local 500K-step relaxation running
+
 ## Tech stack
 
 - **Python 3.11** — required by Blender

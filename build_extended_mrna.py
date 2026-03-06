@@ -39,6 +39,22 @@ CENTER_INDEX = 10  # copy index that stays at crystallographic position
 OUTPUT = "extended_mrna.pdb"
 SKIP_MINIMIZE = "--skip-minimize" in sys.argv
 
+# HP35 coding sequence (mRNA encodes Villin HP35 protein)
+HP35_PROTEIN = "LSDEDFKAVFGMTRSAFANLPLWKQQHLKKEKGLF"
+CODON_TABLE = {
+    'A': 'GCC', 'R': 'CGG', 'N': 'AAC', 'D': 'GAC', 'C': 'UGC',
+    'E': 'GAG', 'Q': 'CAG', 'G': 'GGC', 'H': 'CAC', 'I': 'AUC',
+    'L': 'CUG', 'K': 'AAG', 'M': 'AUG', 'F': 'UUC', 'P': 'CCC',
+    'S': 'AGC', 'T': 'ACC', 'W': 'UGG', 'Y': 'UAC', 'V': 'GUG',
+}
+HP35_CODONS = ''.join(CODON_TABLE[aa] for aa in HP35_PROTEIN)  # 105 nt
+
+# RNA sugar-phosphate backbone atoms (shared by all 4 bases)
+BACKBONE_ATOMS = {
+    'P', 'OP1', 'OP2', 'OP3',
+    "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
+}
+
 # All ribosome chain IDs (40S + 60S) for wall detection
 CHAINS_40S = [
     "S2", "SA", "SB", "SC", "SD", "SE", "SF", "SG", "SH", "SI", "SJ", "SK",
@@ -222,35 +238,64 @@ def tile_mrna():
     print(f"  Residues per tile: {n_res}")
 
     # Create N_COPIES offset copies, centered so i=CENTER_INDEX is at origin
-    # Randomize sequence per tile and add perturbation to seed different pathways
     rng = np.random.default_rng(42)
     copies = []
     for i in range(N_COPIES):
         tile = a4.copy()
         tile.coord += (i - CENTER_INDEX) * tile_offset
         # 1.5A random perturbation per atom to seed divergent tile conformations
-        # (larger perturbation + high-T annealing breaks tile periodicity)
         tile.coord += rng.normal(0, 1.5, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
-        # Note: nucleotide names are NOT randomized — OpenMM template matching
-        # requires atom names to match residue names (U has O4, C has N4, etc).
-        # The 0.5A perturbation + high-T annealing is sufficient for symmetry
-        # breaking across tiles.
         copies.append(tile)
 
     extended = concatenate(copies)
-    print(f"  Extended: {len(extended)} atoms, "
-          f"{len(np.unique(extended.res_id))} residues")
+    total_res = len(np.unique(extended.res_id))
+    print(f"  Tiled: {len(extended)} atoms, {total_res} residues")
 
-    # Generate bonds
-    extended.bonds = connect_via_residue_names(extended, inter_residue=True)
+    # Assign HP35 coding sequence and strip base atoms (keep backbone only)
+    # PDBFixer will reconstruct the correct base atoms for each nucleotide
+    mrna_seq = list((HP35_CODONS * (total_res // len(HP35_CODONS) + 1))[:total_res])
+    unique_res_ids = np.unique(extended.res_id)
+    for i, rid in enumerate(unique_res_ids):
+        extended.res_name[extended.res_id == rid] = mrna_seq[i]
 
-    # Write raw tiled PDB
-    pdb = PDBFile()
-    pdb.set_structure(extended)
-    pdb.write(OUTPUT)
-    print(f"  Written: {OUTPUT}")
+    keep_mask = np.array([an in BACKBONE_ATOMS for an in extended.atom_name])
+    extended = extended[keep_mask]
+    print(f"  Backbone-only: {len(extended)} atoms ({total_res} residues, "
+          f"HP35 coding sequence)")
+    print(f"  Base composition: "
+          f"A={mrna_seq.count('A')} U={mrna_seq.count('U')} "
+          f"G={mrna_seq.count('G')} C={mrna_seq.count('C')}")
+
+    # Reconstruct base atoms via PDBFixer
+    from pdbfixer import PDBFixer
+    from openmm.app import PDBFile as OmmPDB
+    import tempfile as _tempfile
+
+    tmp_bb = _tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w")
+    pdb_bb = PDBFile()
+    pdb_bb.set_structure(extended)
+    pdb_bb.write(tmp_bb.name)
+    tmp_bb.close()
+
+    fixer = PDBFixer(filename=tmp_bb.name)
+    os.unlink(tmp_bb.name)
+    fixer.findMissingResidues()
+    fixer.findMissingAtoms()
+    n_missing = sum(len(v) for v in fixer.missingAtoms.values())
+    print(f"  PDBFixer: adding {n_missing} missing base atoms")
+    fixer.addMissingAtoms()
+
+    with open(OUTPUT, 'w') as fo:
+        OmmPDB.writeFile(fixer.topology, fixer.positions, fo)
+    print(f"  Written: {OUTPUT} ({fixer.topology.getNumAtoms()} atoms)")
+
+    # Reload as biotite array for downstream use
+    pdb_out = PDBFile.read(OUTPUT)
+    extended = pdb_out.get_structure(model=1)
+    if isinstance(extended, AtomArrayStack):
+        extended = extended[0]
 
     return extended, n_res, arr
 
@@ -326,6 +371,21 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
 
     system = ff.createSystem(modeller.topology, nonbondedMethod=CutoffNonPeriodic,
                              nonbondedCutoff=1.0 * nanometer, constraints=HBonds)
+
+    # Backbone straightening force: penalize sharp P-P-P angles
+    # Encourages smoother backbone without forcing it perfectly straight
+    from openmm import CustomAngleForce
+    p_indices = [a.index for a in modeller.topology.atoms() if a.name == 'P']
+    if len(p_indices) >= 3:
+        # k_angle in kJ/mol/rad², theta0 = pi (straight)
+        angle_force = CustomAngleForce("0.5*k_angle*(theta-theta0)^2")
+        angle_force.addGlobalParameter("k_angle", 50.0)  # gentle straightening
+        angle_force.addGlobalParameter("theta0", np.pi)
+        for i in range(len(p_indices) - 2):
+            angle_force.addAngle(p_indices[i], p_indices[i+1], p_indices[i+2], [])
+        system.addForce(angle_force)
+        print(f"  Backbone straightening: {len(p_indices)-2} P-P-P angle restraints "
+              f"(k=50 kJ/mol/rad²)")
 
     # Wall repulsion force (if ribosome context provided)
     if ribo_coords is not None:
