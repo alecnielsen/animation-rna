@@ -229,7 +229,9 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Added CustomAngleForce (k=50 kJ/mol/rad², theta0=pi) on 337 P-P-P triplets
   - [x] Local 500K-step relaxation complete (mean angle: 63.9° → 16.1°, max: 131.8° → 59.5°)
 - [x] Load full mRNA atoms for surface mesh (skip backbone stripping when style=surface)
-- [ ] Surface mesh test render (--style=surface, full atoms)
+- [x] Surface mesh test render (--style=surface, full atoms) — 6.6 min, looks good
+- [x] Disable thermal jitter for clean render (MD + ribosome ENM both off)
+- [ ] Full 456-frame re-render (no jitter, HP35 mRNA sequence, straightened backbone)
 
 ## Tech stack
 

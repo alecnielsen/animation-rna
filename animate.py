@@ -1028,33 +1028,14 @@ def main():
         print(f"  WARNING: Could not load ribosome coords ({e}), MD without wall repulsion")
 
     # --- Initialize per-frame MD simulations for mobile molecules ---
-    print("  Initializing OpenMM MD simulations...")
+    # Thermal jitter disabled for now (clean render without MD overhead)
     md_sims = {}
-    for name, pdb, mol_type in [
-        ('mrna', 'extended_mrna.pdb', 'rna'),
-        ('trna_p', 'trna_b4.pdb', 'rna'),
-        ('trna_a', 'trna_d4.pdb', 'rna'),
-        ('peptide', 'repeating_polypeptide_allatom.pdb', 'protein'),
-    ]:
-        try:
-            md_sims[name] = MolecularDynamics(
-                name, pdb, ribo_coords_A, mol_type=mol_type)
-        except Exception as e:
-            print(f"  WARNING: {name} MD failed ({e}), static fallback")
-            md_sims[name] = None
+    print("  Thermal jitter: DISABLED")
 
-    # --- Load pre-computed ribosome thermal motion (if available) ---
+    # --- Ribosome thermal motion disabled (clean render) ---
     ribo_thermal = None
     ribo_thermal_res_ids = None
-    ribo_thermal_path = "ribosome_thermal.npz"
-    if os.path.exists(ribo_thermal_path):
-        ribo_data = np.load(ribo_thermal_path)
-        ribo_thermal = ribo_data['deltas']  # (n_frames, n_residues, 3) in BU
-        ribo_thermal_res_ids = ribo_data['residue_ids']
-        print(f"  Ribosome thermal: {ribo_thermal.shape[0]} frames, "
-              f"{ribo_thermal.shape[1]} residues from {ribo_thermal_path}")
-    else:
-        print(f"  Ribosome thermal: {ribo_thermal_path} not found, ribosome static")
+    print("  Ribosome thermal: DISABLED")
 
     # Store ribosome orig verts if thermal motion available
     if ribo_thermal is not None:
