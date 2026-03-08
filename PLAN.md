@@ -234,6 +234,14 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Confirmed choreographic motion (tRNA swapping, polypeptide fold) works with and without jitter
 - Note: when re-rendering, MUST delete old frames first (resume support skips existing frames)
 
+### v13 (in progress)
+- [x] Surface mesh for all internal molecules in animate.py (`--style=surface`)
+  - [x] mRNA: full atoms (not backbone-stripped) when style=surface
+  - [x] tRNA: surface style (replaces ribbon)
+  - [x] Polypeptide: surface style (replaces spheres)
+  - [x] Ribosome: still cartoon (2-pass outline composite)
+- [ ] Full 456-frame production render with surface mesh + thermal jitter
+
 ## Tech stack
 
 - **Python 3.11** — required by Blender

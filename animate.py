@@ -870,8 +870,12 @@ def main():
 
     _extract_trna_pdbs()
 
-    # Write backbone-only mRNA PDB for cleaner rendering
-    _write_backbone("extended_mrna.pdb", "extended_mrna_bb.pdb", mol_type="rna")
+    # Backbone-only mRNA for cartoon; full atoms for surface mesh
+    if MOL_STYLE == "surface":
+        mrna_pdb = "extended_mrna.pdb"
+    else:
+        _write_backbone("extended_mrna.pdb", "extended_mrna_bb.pdb", mol_type="rna")
+        mrna_pdb = "extended_mrna_bb.pdb"
 
     # Flat opaque material for ribosome silhouette pass (rendered with
     # film_transparent=True, then PIL edge-detects the alpha channel)
@@ -896,31 +900,35 @@ def main():
         name="surface",
     )
 
-    # 2. mRNA (backbone-only for clean rendering)
-    mol_mrna = mn.Molecule.load("extended_mrna_bb.pdb")
+    # Internal molecule style: surface for production, cartoon/ribbon for dev
+    internal_style = MOL_STYLE if MOL_STYLE == "surface" else None
+
+    # 2. mRNA
+    mrna_search = os.path.splitext(os.path.basename(mrna_pdb))[0]
+    mol_mrna = mn.Molecule.load(mrna_pdb)
     mol_mrna.add_style(
-        style="cartoon",
+        style=internal_style or "cartoon",
         material=make_solid_material((0.05, 0.25, 0.95)),
         name="mRNA",
     )
 
-    # 3. P-site tRNA (chain B4) — ribbon
+    # 3. P-site tRNA (chain B4)
     mol_trna_p = mn.Molecule.load("trna_b4.pdb")
     mol_trna_p.add_style(
-        style="ribbon",
+        style=internal_style or "ribbon",
         material=make_solid_material((0.95, 0.4, 0.0)),
         name="tRNA_P",
     )
 
-    # 4. A-site tRNA (chain D4) — ribbon
+    # 4. A-site tRNA (chain D4)
     mol_trna_a = mn.Molecule.load("trna_d4.pdb")
     mol_trna_a.add_style(
-        style="ribbon",
+        style=internal_style or "ribbon",
         material=make_solid_material((0.95, 0.4, 0.0)),
         name="tRNA_A",
     )
 
-    # 5. Polypeptide (repeating domains) — spheres
+    # 5. Polypeptide (repeating domains)
     peptide_pdb = "repeating_polypeptide.pdb"
     if not os.path.exists(peptide_pdb):
         peptide_pdb = "tunnel_polypeptide.pdb"
@@ -929,7 +937,7 @@ def main():
         peptide_pdb = "extended_polypeptide.pdb"
     mol_peptide = mn.Molecule.load(peptide_pdb)
     mol_peptide.add_style(
-        style="spheres",
+        style=internal_style or "spheres",
         material=make_solid_material((0.85, 0.05, 0.55)),
         name="polypeptide",
     )
@@ -939,7 +947,7 @@ def main():
         return [o for o in bpy.data.objects if name_substr in o.name and o.type == "MESH"]
 
     objs_surface = find_mesh("6Y0G")
-    objs_mrna = find_mesh("extended_mrna_bb")
+    objs_mrna = find_mesh(mrna_search)
     objs_trna_p = find_mesh("trna_b4")
     objs_trna_a = find_mesh("trna_d4")
     pep_search = os.path.splitext(os.path.basename(peptide_pdb))[0]
