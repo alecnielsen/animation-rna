@@ -220,7 +220,7 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - Note: peptide MD (6158 atoms) causes occasional slow frames (~300-900s vs ~30s normal),
   likely from OpenMM resolving bad sidechain states. Render still completes, ~5h total.
 
-### v12 (in progress)
+### v12 (complete)
 - [x] mRNA: HP35 coding sequence (replace poly-U)
   - [x] Generate repeating HP35 codons (A=75, U=51, G=111, C=103 across 340 nt)
   - [x] Strip base atoms from tiled backbone, reconstruct via PDBFixer
@@ -230,8 +230,9 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Local 500K-step relaxation complete (mean angle: 63.9° → 16.1°, max: 131.8° → 59.5°)
 - [x] Load full mRNA atoms for surface mesh (skip backbone stripping when style=surface)
 - [x] Surface mesh test render (--style=surface, full atoms) — 6.6 min, looks good
-- [x] Disable thermal jitter for clean render (MD + ribosome ENM both off)
-- [ ] Full 456-frame re-render (no jitter, HP35 mRNA sequence, straightened backbone)
+- [x] `--no-jitter` CLI flag for animate.py (clean toggle, no code edits needed)
+- [x] Confirmed choreographic motion (tRNA swapping, polypeptide fold) works with and without jitter
+- Note: when re-rendering, MUST delete old frames first (resume support skips existing frames)
 
 ## Tech stack
 
