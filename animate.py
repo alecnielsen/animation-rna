@@ -1,5 +1,13 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v14: mRNA codon ratchet movement.
+- mRNA physically advances one codon per cycle (38 codons total) through ribosome
+- Empirical codon shift computed from mesh vertex centroids (no scale/rotation issues)
+- Per-frame: shift unbent vertices, rebend around fixed ribosome center, add MD thermal
+- Bend center/axis fixed so straight zone stays at ribosome channel as mRNA moves
+- Smoothstep cross-fade to frame-0 positions in last LOOP_BLEND_FRAMES for seamless loop
+- apply_mrna_bend() vectorized and accepts optional center/axis params
+
 v9: Emergence-based polypeptide folding.
 - Residues progressively "emerge" from tunnel and fold quickly (6-cycle window)
 - Only ~6 residues extended at any time (~23 Å ≈ 1 repeat distance)
@@ -132,7 +140,7 @@ MRNA_BEND_STRENGTH = 0.015    # BU per BU² beyond channel (quadratic droop)
 # ---------------------------------------------------------------------------
 # mRNA bend (organic curvature outside ribosome)
 # ---------------------------------------------------------------------------
-def apply_mrna_bend(positions, res_ids):
+def apply_mrna_bend(positions, res_ids, center=None, axis=None):
     """Apply a gentle quadratic droop to mRNA vertices outside the ribosome channel.
 
     Vertices within ±MRNA_CHANNEL_HALF_LEN of the mRNA centroid along the
@@ -140,18 +148,24 @@ def apply_mrna_bend(positions, res_ids):
     perpendicular to the axis, giving the mRNA an organic curved look
     instead of a rigid rod.
 
-    The principal axis is computed via SVD on the actual vertex positions
-    (local/object space), avoiding coordinate-space mismatches with any
-    world-space constants.
+    Args:
+        center: fixed centroid (if None, computed from positions)
+        axis: fixed principal axis (if None, computed via SVD)
 
     Modifies positions in-place and returns them.
     """
-    centroid = positions.mean(axis=0)
+    if center is not None:
+        centroid = center
+    else:
+        centroid = positions.mean(axis=0)
     relative = positions - centroid
 
-    # Compute principal axis from vertex positions via SVD (local space)
-    _, _, vt = np.linalg.svd(relative, full_matrices=False)
-    local_axis = vt[0]  # first principal component = mRNA long axis
+    if axis is not None:
+        local_axis = axis
+    else:
+        # Compute principal axis from vertex positions via SVD (local space)
+        _, _, vt = np.linalg.svd(relative, full_matrices=False)
+        local_axis = vt[0]  # first principal component = mRNA long axis
 
     # Project onto mRNA axis
     proj = relative @ local_axis  # scalar projection per vertex
@@ -171,13 +185,12 @@ def apply_mrna_bend(positions, res_ids):
     droop_dir = 0.7 * droop_dir + 0.3 * np.array([0.0, 0.0, -1.0])
     droop_dir = droop_dir / np.linalg.norm(droop_dir)
 
-    # Apply quadratic droop beyond the straight zone
-    for i in range(len(positions)):
-        d = abs(proj[i]) - MRNA_CHANNEL_HALF_LEN
-        if d > 0:
-            # Sign: both ends droop in the same direction (gravity-like)
-            droop = MRNA_BEND_STRENGTH * d * d
-            positions[i] += droop * droop_dir
+    # Apply quadratic droop beyond the straight zone (vectorized)
+    d = np.abs(proj) - MRNA_CHANNEL_HALF_LEN
+    mask = d > 0
+    if np.any(mask):
+        droop_amounts = MRNA_BEND_STRENGTH * d[mask] ** 2
+        positions[mask] += droop_amounts[:, np.newaxis] * droop_dir
 
     return positions
 
@@ -984,10 +997,43 @@ def main():
         orig_verts[obj.name] = co.reshape(-1, 3).copy()
         print(f"  Stored {n} vertices for {obj.name}")
 
-    # --- Apply mRNA bend (organic curvature outside ribosome) ---
+    # --- mRNA bend + codon ratchet setup ---
     mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
+
+    # Preserve unbent mRNA vertices for per-frame ratchet
+    mrna_unbent = orig_verts[obj_mrna.name].copy()
+    mrna_bend_center = mrna_unbent.mean(axis=0)
+
+    # Compute per-codon shift empirically from mesh vertices (avoids scale/rotation issues)
+    _unique_res = np.sort(np.unique(mrna_mesh_res_ids))
+    _centroids = np.array([mrna_unbent[mrna_mesh_res_ids == r].mean(axis=0)
+                           for r in _unique_res])
+    _centered = _centroids - _centroids.mean(axis=0)
+    _, _, _vt = np.linalg.svd(_centered, full_matrices=False)
+    mrna_axis_local = _vt[0]
+
+    # Per-nucleotide spacing along axis, x3 for one codon
+    _projections = _centroids @ mrna_axis_local
+    _spacings = np.diff(np.sort(_projections))
+    nt_spacing = np.median(_spacings)
+    codon_shift_vertex = 3.0 * nt_spacing * mrna_axis_local
+
+    # Ensure shift direction matches CODON_SHIFT intent (inverse-rotate to compare)
+    _cos_r, _sin_r = math.cos(-math.pi / 2), math.sin(-math.pi / 2)
+    _cs_local = np.array([CODON_SHIFT[0] * _cos_r - CODON_SHIFT[1] * _sin_r,
+                          CODON_SHIFT[0] * _sin_r + CODON_SHIFT[1] * _cos_r,
+                          CODON_SHIFT[2]])
+    if np.dot(codon_shift_vertex, _cs_local) < 0:
+        codon_shift_vertex = -codon_shift_vertex
+
+    print(f"  Codon shift (vertex space): magnitude={np.linalg.norm(codon_shift_vertex):.4f} BU")
+
+    # Apply initial bend and precompute frame-0 bent positions for loop cross-fade
     print(f"  Applying mRNA bend (channel ±{MRNA_CHANNEL_HALF_LEN} BU, "
           f"strength {MRNA_BEND_STRENGTH})...")
+    mrna_frame0_bent = apply_mrna_bend(
+        mrna_unbent.copy(), mrna_mesh_res_ids,
+        center=mrna_bend_center, axis=mrna_axis_local)
     orig_verts[obj_mrna.name] = apply_mrna_bend(
         orig_verts[obj_mrna.name], mrna_mesh_res_ids)
     # Write bent positions back to mesh so first frame renders correctly
@@ -1135,8 +1181,18 @@ def main():
             print(f"\n--- Cycle {cycle}, Frame {local_frame}/{FRAMES_PER_CYCLE - 1} "
                   f"(global {global_frame}/{TOTAL_FRAMES - 1}) ---")
 
-            # Single-cycle choreographic deltas
+            # Single-cycle choreographic deltas (tRNA only; mRNA handled in vertex space)
             _, trna_p_d, trna_a_d = get_positions(local_frame)
+
+            # mRNA phase delta in vertex space
+            f144, f192 = scale_frames(144), scale_frames(192)
+            if local_frame < f144:
+                mrna_d_local = np.zeros(3)
+            elif local_frame < f192:
+                t = frame_t(local_frame, f144, f192)
+                mrna_d_local = lerp(np.zeros(3), codon_shift_vertex, t)
+            else:
+                mrna_d_local = codon_shift_vertex.copy()
 
             # --- Ribosome: static pose + optional pre-computed thermal ---
             obj_surface.location = (0, 0, 0)
@@ -1150,21 +1206,32 @@ def main():
                 obj_surface.data.vertices.foreach_set('co', ribo_pos.ravel())
                 obj_surface.data.update()
 
-            # --- mRNA: stationary + MD thermal ---
+            # --- mRNA: codon ratchet + rebend + MD thermal ---
             obj_mrna.location = (0, 0, 0)
             obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
-            # MD thermal deformation for mRNA
+            cumulative_mrna = cycle * codon_shift_vertex + mrna_d_local
+            shifted = mrna_unbent + cumulative_mrna
+            bent = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
+                                   center=mrna_bend_center, axis=mrna_axis_local)
+
+            # Loop cross-fade for seamless looping
+            frames_from_end = TOTAL_FRAMES - 1 - global_frame
+            if frames_from_end < LOOP_BLEND_FRAMES:
+                t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
+                t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
+                bent = t_blend * bent + (1.0 - t_blend) * mrna_frame0_bent
+
+            # MD thermal
             md_mrna = md_sims.get('mrna')
             if md_mrna is not None:
                 raw_deltas = md_mrna.step_and_get_deltas(global_frame)
                 mrna_deltas = md_mrna.get_blended_deltas(
                     global_frame, TOTAL_FRAMES, raw_deltas)
                 mrna_pos = apply_md_deltas_to_mesh(
-                    orig_verts[obj_mrna.name], mrna_mesh_res_ids,
-                    mrna_deltas, md_mrna.residue_ids)
+                    bent, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
             else:
-                mrna_pos = orig_verts[obj_mrna.name]
+                mrna_pos = bent
             obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
             obj_mrna.data.update()
 
