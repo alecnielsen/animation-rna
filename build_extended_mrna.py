@@ -34,8 +34,8 @@ from scipy.spatial import KDTree
 from biotite.structure import AtomArrayStack, concatenate, connect_via_residue_names
 from biotite.structure.io.pdb import PDBFile
 
-N_COPIES = 20
-CENTER_INDEX = 10  # copy index that stays at crystallographic position
+N_COPIES = 40
+CENTER_INDEX = 20  # copy index that stays at crystallographic position
 OUTPUT = "extended_mrna.pdb"
 SKIP_MINIMIZE = "--skip-minimize" in sys.argv
 

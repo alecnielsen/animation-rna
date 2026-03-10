@@ -1,5 +1,10 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v15: Smooth mRNA ratchet + extended mRNA.
+- Smooth linear mRNA advance across all frames (replaces phase-locked translocation burst)
+- Extended mRNA from 20→40 tiles (680 nt) so ends stay off-camera at max shift
+- Next: pre-relaxed keyframe interpolation (3 MD-relaxed conformations at shift 0/19/38)
+
 v14: mRNA codon ratchet movement.
 - mRNA physically advances one codon per cycle (38 codons total) through ribosome
 - Empirical codon shift computed from mesh vertex centroids (no scale/rotation issues)
@@ -1184,15 +1189,8 @@ def main():
             # Single-cycle choreographic deltas (tRNA only; mRNA handled in vertex space)
             _, trna_p_d, trna_a_d = get_positions(local_frame)
 
-            # mRNA phase delta in vertex space
-            f144, f192 = scale_frames(144), scale_frames(192)
-            if local_frame < f144:
-                mrna_d_local = np.zeros(3)
-            elif local_frame < f192:
-                t = frame_t(local_frame, f144, f192)
-                mrna_d_local = lerp(np.zeros(3), codon_shift_vertex, t)
-            else:
-                mrna_d_local = codon_shift_vertex.copy()
+            # mRNA smooth continuous advance (linear across entire animation)
+            mrna_d_local = np.zeros(3)  # unused, kept for clarity
 
             # --- Ribosome: static pose + optional pre-computed thermal ---
             obj_surface.location = (0, 0, 0)
@@ -1206,11 +1204,13 @@ def main():
                 obj_surface.data.vertices.foreach_set('co', ribo_pos.ravel())
                 obj_surface.data.update()
 
-            # --- mRNA: codon ratchet + rebend + MD thermal ---
+            # --- mRNA: smooth codon ratchet + rebend + MD thermal ---
             obj_mrna.location = (0, 0, 0)
             obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
-            cumulative_mrna = cycle * codon_shift_vertex + mrna_d_local
+            # Smooth linear advance: spread total shift evenly across all frames
+            mrna_progress = global_frame / max(TOTAL_FRAMES - 1, 1)
+            cumulative_mrna = mrna_progress * N_CYCLES * codon_shift_vertex
             shifted = mrna_unbent + cumulative_mrna
             bent = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
                                    center=mrna_bend_center, axis=mrna_axis_local)
