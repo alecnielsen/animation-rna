@@ -234,13 +234,38 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Confirmed choreographic motion (tRNA swapping, polypeptide fold) works with and without jitter
 - Note: when re-rendering, MUST delete old frames first (resume support skips existing frames)
 
-### v13 (in progress)
+### v13 (complete)
 - [x] Surface mesh for all internal molecules in animate.py (`--style=surface`)
   - [x] mRNA: full atoms (not backbone-stripped) when style=surface
   - [x] tRNA: surface style (replaces ribbon)
   - [x] Polypeptide: surface style (replaces spheres)
   - [x] Ribosome: still cartoon (2-pass outline composite)
-- [ ] Full 456-frame production render with surface mesh + thermal jitter
+
+### v14 (complete)
+- [x] mRNA codon ratchet: physical one-codon-per-cycle advance through ribosome
+  - [x] Per-frame codon shift computed from P-atom spacing along backbone PCA axis
+  - [x] Phase 5 translocation drives mRNA advance (mRNA + P-site tRNA move together)
+
+### v15 (complete)
+- [x] Smooth mRNA ratchet: continuous linear advance (replaces jumpy phase-locked burst)
+- [x] Extended mRNA: 30 tiles, asymmetric (20 trailing + 10 leading), ends off-camera
+- [x] CENTER_INDEX=20 for PDB coordinate limit compliance
+
+### v16 (complete)
+- [x] Keyframe interpolation for mRNA ratchet
+  - [x] `relax_mrna_keyframes.py`: generate MD-relaxed keyframes at codon shift positions
+  - [x] 9 keyframes (shifts 0,5,10,...,35,38), 100K MD steps each
+  - [x] `animate.py`: load keyframes from NPZ, interpolate per-residue centroids
+  - [x] Fallback to shift+bend when keyframes not available
+
+### v17 (in progress)
+- [x] Adaptive wall anchors: multi-round MD with periodic ribosome wall re-query
+  - [x] `build_extended_mrna.py`: `_update_wall_anchors()` recomputes nearest ribosome atoms every 25K steps via KDTree on ALL ~210K ribosome atoms
+  - [x] Brief minimization after each wall anchor update to prevent NaN explosions
+  - [x] `relax_mrna_keyframes.py`: same adaptive wall approach for keyframe relaxation
+- [ ] Rebuild `extended_mrna.pdb` with adaptive wall anchors
+- [ ] Regenerate `mrna_keyframes.npz` with adaptive wall anchors
+- [ ] Coordinated whole-structure "breathing" motion (not per-atom jitter)
 
 ## Tech stack
 

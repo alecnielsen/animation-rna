@@ -57,10 +57,15 @@ Multi-step pipeline: build extended structures → compute modes → render fram
 ```bash
 source mn_env/bin/activate
 
-# 0a. Build extended mRNA (tiles chain A4 x20, 500K-step 3-stage annealing + wall repulsion,
-#     shifts to decoding center for tRNA-mRNA base pairing)
-#     Writes extended_mrna.pdb (~40-60 min on CPU)
+# 0a. Build extended mRNA (tiles chain A4 x30, 500K-step 3-stage annealing +
+#     adaptive wall repulsion re-queried every 25K steps against full ribosome)
+#     Writes extended_mrna.pdb (~4h on CPU)
 python3.11 build_extended_mrna.py
+
+# 0a2. Generate MD-relaxed mRNA keyframes (9 keyframes at codon shifts 0-38,
+#      100K MD steps each with adaptive wall anchors)
+#      Writes mrna_keyframes.npz (~2h on CPU)
+python3.11 relax_mrna_keyframes.py
 
 # 0b. Build repeating polypeptide (traces exit tunnel, places 8 Villin HP35 domains
 #     with GSG linkers, outputs folded PDB + dual-coordinate NPZ for morph animation)
@@ -90,7 +95,8 @@ Output:
 
 | Script | Output | Purpose |
 |--------|--------|---------|
-| `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x20, 500K-step 3-stage MD annealing with ribosome wall repulsion, shift to decoding center |
+| `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x30, 500K-step 3-stage MD annealing with adaptive ribosome wall repulsion (re-queries every 25K steps), shift to decoding center |
+| `relax_mrna_keyframes.py` | `mrna_keyframes.npz` | MD-relaxed mRNA keyframes at codon shift positions (9 keyframes, 100K steps each, adaptive wall anchors). Used by animate.py for interpolated ratchet |
 | `build_tunnel_polypeptide.py` | `repeating_polypeptide.pdb`, `repeating_polypeptide_folds.npz` | Trace exit tunnel, place 8 repeating Villin HP35 (1YRF) folded domains with GSG linkers. NPZ stores dual extended/folded coordinates per domain for morph animation |
 | `render_single_frame.py` | `renders/single_frame.png` | Single-frame render of full translation complex (ribosome, mRNA, tRNAs, polypeptide) |
 | `modal_gpu.py` | `ribosome_thermal.npz` | Modal GPU: MD relaxation, ribosome ENM thermal trajectory (456 frames), production renders |

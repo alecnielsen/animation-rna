@@ -336,8 +336,27 @@ def _load_and_prepare(input_pdb):
     return ff, modeller
 
 
-def relax_rna(input_pdb, output_pdb, ribo_coords=None):
-    """3-stage annealing with wall repulsion to eliminate tile periodicity.
+def _update_wall_anchors(wall_force, sim, all_ribo_tree, all_ribo_coords):
+    """Recompute nearest ribosome atoms and update wall force anchor positions.
+
+    Called periodically during MD to keep wall repulsion tracking the mRNA's
+    current position (not its starting position).
+    """
+    from openmm.unit import nanometer, angstrom
+    state = sim.context.getState(getPositions=True)
+    pos_A = state.getPositions(asNumpy=True).value_in_unit(angstrom)
+
+    _, nearest_idx = all_ribo_tree.query(pos_A)
+    nearest_nm = all_ribo_coords[nearest_idx] * 0.1  # Å → nm
+
+    for i in range(wall_force.getNumParticles()):
+        wall_force.setParticleParameters(i, i, [
+            nearest_nm[i, 0], nearest_nm[i, 1], nearest_nm[i, 2]])
+    wall_force.updateParametersInContext(sim.context)
+
+
+def relax_rna(input_pdb, output_pdb, ribo_coords=None, all_ribo_coords=None):
+    """3-stage annealing with adaptive wall repulsion.
 
     Pipeline:
       1. Energy minimization
@@ -346,8 +365,8 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
       4. 100K MD steps at 310K (physiological temperature)
       5. Final energy minimization (quench)
 
-    If ribo_coords is provided, adds a wall repulsion force that prevents
-    mRNA atoms from clipping through ribosome walls.
+    Wall anchors are updated every WALL_UPDATE_INTERVAL steps using
+    all_ribo_coords (full ribosome) for nearest-neighbor queries.
     """
     from openmm.app import (
         PDBFile as OmmPDB, Simulation, NoCutoff, CutoffNonPeriodic, HBonds,
@@ -363,6 +382,7 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
     PHASE3_STEPS = 100000
     PHASE3_TEMP = 310  # K
     TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS + PHASE3_STEPS
+    WALL_UPDATE_INTERVAL = 25000  # update wall anchors every N steps
 
     print(f"\n=== Relaxation ({TOTAL_STEPS} MD steps: "
           f"{PHASE1_STEPS}@{PHASE1_TEMP}K + {PHASE2_STEPS}@{PHASE2_TEMP}K + "
@@ -374,13 +394,11 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
                              nonbondedCutoff=1.0 * nanometer, constraints=HBonds)
 
     # Backbone straightening force: penalize sharp P-P-P angles
-    # Encourages smoother backbone without forcing it perfectly straight
     from openmm import CustomAngleForce
     p_indices = [a.index for a in modeller.topology.atoms() if a.name == 'P']
     if len(p_indices) >= 3:
-        # k_angle in kJ/mol/rad², theta0 = pi (straight)
         angle_force = CustomAngleForce("0.5*k_angle*(theta-theta0)^2")
-        angle_force.addGlobalParameter("k_angle", 50.0)  # gentle straightening
+        angle_force.addGlobalParameter("k_angle", 50.0)
         angle_force.addGlobalParameter("theta0", np.pi)
         for i in range(len(p_indices) - 2):
             angle_force.addAngle(p_indices[i], p_indices[i+1], p_indices[i+2], [])
@@ -388,21 +406,22 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
         print(f"  Backbone straightening: {len(p_indices)-2} P-P-P angle restraints "
               f"(k=50 kJ/mol/rad²)")
 
-    # Wall repulsion force (if ribosome context provided)
-    if ribo_coords is not None:
-        print(f"  Adding wall repulsion force ({len(ribo_coords)} ribosome atoms)...")
-        ribo_tree = KDTree(ribo_coords)
+    # Wall repulsion force with adaptive anchors
+    wall_force = None
+    # Use all ribosome atoms for KDTree queries (accurate nearest-neighbor)
+    # Fall back to nearby subset if full set not provided
+    query_ribo = all_ribo_coords if all_ribo_coords is not None else ribo_coords
+    if query_ribo is not None:
+        all_ribo_tree = KDTree(query_ribo)
         n_atoms = modeller.topology.getNumAtoms()
         positions = modeller.positions
 
-        # Get mRNA atom positions in Angstroms for KDTree query
         mrna_coords_nm = np.array([positions[i].value_in_unit(nanometer)
                                     for i in range(n_atoms)])
         mrna_coords_A = mrna_coords_nm * 10.0
 
-        _, nearest_idx = ribo_tree.query(mrna_coords_A)
-        nearest_ribo_A = ribo_coords[nearest_idx]
-        nearest_ribo_nm = nearest_ribo_A * 0.1  # -> nm
+        _, nearest_idx = all_ribo_tree.query(mrna_coords_A)
+        nearest_ribo_nm = query_ribo[nearest_idx] * 0.1
 
         wall_force = CustomExternalForce(
             "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
@@ -416,12 +435,11 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
 
         for i in range(n_atoms):
             wall_force.addParticle(i, [
-                nearest_ribo_nm[i, 0], nearest_ribo_nm[i, 1], nearest_ribo_nm[i, 2]
-            ])
+                nearest_ribo_nm[i, 0], nearest_ribo_nm[i, 1], nearest_ribo_nm[i, 2]])
         system.addForce(wall_force)
+        print(f"  Wall repulsion: {len(query_ribo)} ribosome atoms for queries, "
+              f"r_min=5Å, k=5000, update every {WALL_UPDATE_INTERVAL} steps")
 
-    # Phase 1: 400K high-temperature conformational sampling
-    # Force CPU platform (OpenCL can hang on Apple Silicon)
     from openmm import Platform
     platform = Platform.getPlatformByName('CPU')
     integrator = LangevinMiddleIntegrator(
@@ -429,7 +447,7 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
     sim = Simulation(modeller.topology, system, integrator, platform)
     sim.context.setPositions(modeller.positions)
 
-    # Step 1: Initial minimization (aggressive — tile clashes need many iterations)
+    # Initial minimization
     state0 = sim.context.getState(getEnergy=True)
     print(f"  Initial energy: {state0.getPotentialEnergy()}")
     print("  Minimizing (up to 10000 iterations)...")
@@ -437,25 +455,29 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
     state1 = sim.context.getState(getEnergy=True)
     print(f"  Post-minimize energy: {state1.getPotentialEnergy()}")
 
-    # Step 2: Phase 1 -- MD at 400K
-    print(f"  Phase 1: {PHASE1_STEPS} MD steps (dt=2fs, T={PHASE1_TEMP}K)...")
-    sim.reporters.append(
-        StateDataReporter(sys.stdout, max(PHASE1_STEPS // 5, 1), step=True,
-                          potentialEnergy=True, temperature=True, speed=True)
-    )
-    sim.step(PHASE1_STEPS)
+    def run_phase(label, total_steps, temp):
+        """Run MD in chunks, updating wall anchors periodically."""
+        print(f"  {label}: {total_steps} MD steps (T={temp}K, "
+              f"wall update every {WALL_UPDATE_INTERVAL})...")
+        integrator.setTemperature(temp * kelvin)
+        steps_done = 0
+        while steps_done < total_steps:
+            chunk = min(WALL_UPDATE_INTERVAL, total_steps - steps_done)
+            sim.step(chunk)
+            steps_done += chunk
+            if wall_force is not None and steps_done < total_steps:
+                _update_wall_anchors(wall_force, sim, all_ribo_tree, query_ribo)
+                # Brief minimization to absorb new wall forces before resuming dynamics
+                sim.minimizeEnergy(maxIterations=200)
+                state = sim.context.getState(getEnergy=True)
+                print(f"    Step {steps_done}: E={state.getPotentialEnergy()}, "
+                      f"walls updated + minimized")
 
-    # Step 3: Phase 2 -- cool to 350K
-    print(f"  Phase 2: {PHASE2_STEPS} MD steps (dt=2fs, T={PHASE2_TEMP}K)...")
-    integrator.setTemperature(PHASE2_TEMP * kelvin)
-    sim.step(PHASE2_STEPS)
+    run_phase("Phase 1 (400K)", PHASE1_STEPS, PHASE1_TEMP)
+    run_phase("Phase 2 (350K)", PHASE2_STEPS, PHASE2_TEMP)
+    run_phase("Phase 3 (310K)", PHASE3_STEPS, PHASE3_TEMP)
 
-    # Step 4: Phase 3 -- cool to 310K (physiological)
-    print(f"  Phase 3: {PHASE3_STEPS} MD steps (dt=2fs, T={PHASE3_TEMP}K)...")
-    integrator.setTemperature(PHASE3_TEMP * kelvin)
-    sim.step(PHASE3_STEPS)
-
-    # Step 5: Final minimization (quench)
+    # Final minimization (quench)
     print("  Final minimization (quench)...")
     sim.minimizeEnergy(maxIterations=1000)
     state_final = sim.context.getState(getEnergy=True, getPositions=True)
@@ -611,7 +633,8 @@ def main():
     if SKIP_MINIMIZE:
         print("\n  Skipping minimization (--skip-minimize)")
     else:
-        relax_rna(OUTPUT, OUTPUT, ribo_coords=nearby_ribo)
+        relax_rna(OUTPUT, OUTPUT, ribo_coords=nearby_ribo,
+                  all_ribo_coords=all_ribo_coords)
 
         # Verify final clearance
         final_pdb = PDBFile.read(OUTPUT)
