@@ -1,9 +1,16 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v16: Pre-relaxed mRNA keyframe interpolation.
+- 9 MD-relaxed keyframes (every 5 codons: 0,5,10,...,35,38) via relax_mrna_keyframes.py
+- Each keyframe: shifted mRNA + 100K MD steps with ribosome wall repulsion
+- animate.py interpolates between bracketing keyframes based on global_frame progress
+- Fallback to shift+bend when mrna_keyframes.npz not present
+- Asymmetric mRNA tiling: 30 tiles, CENTER_INDEX=20 (20 trailing + 10 leading)
+- WIP: wall repulsion too weak (mRNA clips ribosome), need stronger tunnel constraints
+
 v15: Smooth mRNA ratchet + extended mRNA.
 - Smooth linear mRNA advance across all frames (replaces phase-locked translocation burst)
 - Extended mRNA from 20→40 tiles (680 nt) so ends stay off-camera at max shift
-- Next: pre-relaxed keyframe interpolation (3 MD-relaxed conformations at shift 0/19/38)
 
 v14: mRNA codon ratchet movement.
 - mRNA physically advances one codon per cycle (38 codons total) through ribosome
@@ -292,6 +299,54 @@ def frame_t(frame, start, end):
 def scale_frames(f):
     """Scale frame number from 240-frame schedule to actual FRAMES_PER_CYCLE."""
     return int(round(f * FRAMES_PER_CYCLE / 240))
+
+
+def apply_keyframe_interpolation(progress, keyframes, mesh_res_ids, base_verts):
+    """Interpolate between pre-relaxed mRNA keyframes and apply to mesh vertices.
+
+    Args:
+        progress: 0.0 to 1.0 (animation progress)
+        keyframes: dict with 'shifts', 'centroids' (list of (n_res,3) in Å),
+                   'base_centroids_bu' (shift=0 centroids in BU)
+        mesh_res_ids: per-vertex residue IDs from mesh
+        base_verts: (N, 3) original mesh vertex positions in BU (shift=0)
+
+    Returns: (N, 3) interpolated vertex positions in BU.
+    """
+    shift_codons = progress * N_CYCLES  # 0.0 to 38.0
+    shifts = keyframes['shifts']
+
+    # Find bracketing keyframes
+    idx_hi = np.searchsorted(shifts, shift_codons, side='right')
+    idx_hi = min(idx_hi, len(shifts) - 1)
+    idx_lo = max(idx_hi - 1, 0)
+
+    if idx_lo == idx_hi:
+        target_centroids_bu = keyframes['centroids_bu'][idx_lo]
+    else:
+        t = (shift_codons - shifts[idx_lo]) / (shifts[idx_hi] - shifts[idx_lo])
+        t = np.clip(t, 0.0, 1.0)
+        target_centroids_bu = (
+            (1.0 - t) * keyframes['centroids_bu'][idx_lo] +
+            t * keyframes['centroids_bu'][idx_hi])
+
+    # Compute per-residue deltas from base (shift=0) centroids
+    base_centroids_bu = keyframes['base_centroids_bu']
+    deltas_bu = target_centroids_bu - base_centroids_bu
+
+    # Apply deltas to mesh vertices by residue
+    result = base_verts.copy()
+    unique_mesh_res = np.unique(mesh_res_ids)
+    n_kf = len(deltas_bu)
+    n_mesh = len(unique_mesh_res)
+    n_map = min(n_kf, n_mesh)
+
+    for i in range(n_map):
+        mesh_res = unique_mesh_res[i]
+        mask = mesh_res_ids == mesh_res
+        result[mask] += deltas_bu[i]
+
+    return result
 
 
 def apply_md_deltas_to_mesh(positions, res_ids, md_deltas, md_residue_ids):
@@ -1002,46 +1057,64 @@ def main():
         orig_verts[obj.name] = co.reshape(-1, 3).copy()
         print(f"  Stored {n} vertices for {obj.name}")
 
-    # --- mRNA bend + codon ratchet setup ---
+    # --- mRNA codon ratchet setup ---
     mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
-
-    # Preserve unbent mRNA vertices for per-frame ratchet
     mrna_unbent = orig_verts[obj_mrna.name].copy()
-    mrna_bend_center = mrna_unbent.mean(axis=0)
 
-    # Compute per-codon shift empirically from mesh vertices (avoids scale/rotation issues)
+    # --- Load pre-relaxed mRNA keyframes (if available) ---
+    mrna_keyframes = None
+    keyframes_path = "mrna_keyframes.npz"
+    if os.path.exists(keyframes_path):
+        kf_data = np.load(keyframes_path)
+        kf_shifts = kf_data['shifts']
+        kf_res_ids = kf_data['residue_ids']
+        kf_centroids_ang = [kf_data[f'centroids_{s}'] for s in kf_shifts]
+        # Convert all centroids to BU for vertex-space interpolation
+        kf_centroids_bu = [c * ANG_TO_BU for c in kf_centroids_ang]
+        # Base centroids (shift=0) in BU
+        base_centroids_bu = kf_centroids_bu[0]
+        mrna_keyframes = {
+            'shifts': kf_shifts.astype(float),
+            'centroids_bu': kf_centroids_bu,
+            'base_centroids_bu': base_centroids_bu,
+            'residue_ids': kf_res_ids,
+        }
+        # Precompute frame-0 keyframed positions for loop cross-fade
+        mrna_frame0_kf = apply_keyframe_interpolation(
+            0.0, mrna_keyframes, mrna_mesh_res_ids, mrna_unbent)
+        print(f"  mRNA keyframes: {len(kf_shifts)} keyframes at shifts {list(kf_shifts)}")
+    else:
+        mrna_frame0_kf = None
+        print(f"  mRNA keyframes: {keyframes_path} not found, using shift+bend fallback")
+
+    # Fallback: compute vertex-space codon shift for shift+bend path
+    mrna_bend_center = mrna_unbent.mean(axis=0)
     _unique_res = np.sort(np.unique(mrna_mesh_res_ids))
     _centroids = np.array([mrna_unbent[mrna_mesh_res_ids == r].mean(axis=0)
                            for r in _unique_res])
     _centered = _centroids - _centroids.mean(axis=0)
     _, _, _vt = np.linalg.svd(_centered, full_matrices=False)
     mrna_axis_local = _vt[0]
-
-    # Per-nucleotide spacing along axis, x3 for one codon
     _projections = _centroids @ mrna_axis_local
     _spacings = np.diff(np.sort(_projections))
     nt_spacing = np.median(_spacings)
     codon_shift_vertex = 3.0 * nt_spacing * mrna_axis_local
-
-    # Ensure shift direction matches CODON_SHIFT intent (inverse-rotate to compare)
     _cos_r, _sin_r = math.cos(-math.pi / 2), math.sin(-math.pi / 2)
     _cs_local = np.array([CODON_SHIFT[0] * _cos_r - CODON_SHIFT[1] * _sin_r,
                           CODON_SHIFT[0] * _sin_r + CODON_SHIFT[1] * _cos_r,
                           CODON_SHIFT[2]])
     if np.dot(codon_shift_vertex, _cs_local) < 0:
         codon_shift_vertex = -codon_shift_vertex
-
     print(f"  Codon shift (vertex space): magnitude={np.linalg.norm(codon_shift_vertex):.4f} BU")
 
-    # Apply initial bend and precompute frame-0 bent positions for loop cross-fade
-    print(f"  Applying mRNA bend (channel ±{MRNA_CHANNEL_HALF_LEN} BU, "
-          f"strength {MRNA_BEND_STRENGTH})...")
+    # Apply initial bend for fallback path and precompute frame-0 bent positions
     mrna_frame0_bent = apply_mrna_bend(
         mrna_unbent.copy(), mrna_mesh_res_ids,
         center=mrna_bend_center, axis=mrna_axis_local)
-    orig_verts[obj_mrna.name] = apply_mrna_bend(
-        orig_verts[obj_mrna.name], mrna_mesh_res_ids)
-    # Write bent positions back to mesh so first frame renders correctly
+    if mrna_keyframes is None:
+        # Only bend the initial mesh when not using keyframes
+        orig_verts[obj_mrna.name] = apply_mrna_bend(
+            orig_verts[obj_mrna.name], mrna_mesh_res_ids)
     obj_mrna.data.vertices.foreach_set('co', orig_verts[obj_mrna.name].ravel())
     obj_mrna.data.update()
 
@@ -1189,9 +1262,6 @@ def main():
             # Single-cycle choreographic deltas (tRNA only; mRNA handled in vertex space)
             _, trna_p_d, trna_a_d = get_positions(local_frame)
 
-            # mRNA smooth continuous advance (linear across entire animation)
-            mrna_d_local = np.zeros(3)  # unused, kept for clarity
-
             # --- Ribosome: static pose + optional pre-computed thermal ---
             obj_surface.location = (0, 0, 0)
             obj_surface.rotation_euler = (0, 0, math.pi / 2)
@@ -1204,34 +1274,45 @@ def main():
                 obj_surface.data.vertices.foreach_set('co', ribo_pos.ravel())
                 obj_surface.data.update()
 
-            # --- mRNA: smooth codon ratchet + rebend + MD thermal ---
+            # --- mRNA: keyframe interpolation or shift+bend fallback ---
             obj_mrna.location = (0, 0, 0)
             obj_mrna.rotation_euler = (0, 0, math.pi / 2)
 
-            # Smooth linear advance: spread total shift evenly across all frames
             mrna_progress = global_frame / max(TOTAL_FRAMES - 1, 1)
-            cumulative_mrna = mrna_progress * N_CYCLES * codon_shift_vertex
-            shifted = mrna_unbent + cumulative_mrna
-            bent = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
-                                   center=mrna_bend_center, axis=mrna_axis_local)
 
-            # Loop cross-fade for seamless looping
-            frames_from_end = TOTAL_FRAMES - 1 - global_frame
-            if frames_from_end < LOOP_BLEND_FRAMES:
-                t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
-                t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
-                bent = t_blend * bent + (1.0 - t_blend) * mrna_frame0_bent
+            if mrna_keyframes is not None:
+                # Keyframe interpolation path
+                mrna_pos = apply_keyframe_interpolation(
+                    mrna_progress, mrna_keyframes, mrna_mesh_res_ids, mrna_unbent)
 
-            # MD thermal
+                # Loop cross-fade
+                frames_from_end = TOTAL_FRAMES - 1 - global_frame
+                if frames_from_end < LOOP_BLEND_FRAMES:
+                    t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
+                    t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
+                    mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_kf
+            else:
+                # Fallback: shift + geometric bend
+                cumulative_mrna = mrna_progress * N_CYCLES * codon_shift_vertex
+                shifted = mrna_unbent + cumulative_mrna
+                mrna_pos = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
+                                           center=mrna_bend_center, axis=mrna_axis_local)
+
+                # Loop cross-fade
+                frames_from_end = TOTAL_FRAMES - 1 - global_frame
+                if frames_from_end < LOOP_BLEND_FRAMES:
+                    t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
+                    t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
+                    mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_bent
+
+            # MD thermal (applies on top of either path)
             md_mrna = md_sims.get('mrna')
             if md_mrna is not None:
                 raw_deltas = md_mrna.step_and_get_deltas(global_frame)
                 mrna_deltas = md_mrna.get_blended_deltas(
                     global_frame, TOTAL_FRAMES, raw_deltas)
                 mrna_pos = apply_md_deltas_to_mesh(
-                    bent, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
-            else:
-                mrna_pos = bent
+                    mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
             obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
             obj_mrna.data.update()
 

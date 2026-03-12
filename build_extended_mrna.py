@@ -34,8 +34,8 @@ from scipy.spatial import KDTree
 from biotite.structure import AtomArrayStack, concatenate, connect_via_residue_names
 from biotite.structure.io.pdb import PDBFile
 
-N_COPIES = 40
-CENTER_INDEX = 20  # copy index that stays at crystallographic position
+N_COPIES = 30
+CENTER_INDEX = 20  # copy index that stays at crystallographic position (asymmetric: 20 trailing + 10 leading)
 OUTPUT = "extended_mrna.pdb"
 SKIP_MINIMIZE = "--skip-minimize" in sys.argv
 
@@ -243,8 +243,9 @@ def tile_mrna():
     for i in range(N_COPIES):
         tile = a4.copy()
         tile.coord += (i - CENTER_INDEX) * tile_offset
-        # 1.5A random perturbation per atom to seed divergent tile conformations
-        tile.coord += rng.normal(0, 1.5, tile.coord.shape)
+        # 0.5A random perturbation per atom to seed divergent tile conformations
+        # (small enough to avoid kinks that MD can't smooth out)
+        tile.coord += rng.normal(0, 0.5, tile.coord.shape)
         tile.res_id = (base_idx + i * n_res + 1).astype(a4.res_id.dtype)
         tile.chain_id[:] = "A"
         copies.append(tile)
@@ -406,9 +407,9 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
         wall_force = CustomExternalForce(
             "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
             "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
-            "r_min=0.3"
+            "r_min=0.5"
         )
-        wall_force.addGlobalParameter("k_wall", 1000.0)
+        wall_force.addGlobalParameter("k_wall", 5000.0)
         wall_force.addPerParticleParameter("wx")
         wall_force.addPerParticleParameter("wy")
         wall_force.addPerParticleParameter("wz")
@@ -428,11 +429,11 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None):
     sim = Simulation(modeller.topology, system, integrator, platform)
     sim.context.setPositions(modeller.positions)
 
-    # Step 1: Initial minimization
+    # Step 1: Initial minimization (aggressive — tile clashes need many iterations)
     state0 = sim.context.getState(getEnergy=True)
     print(f"  Initial energy: {state0.getPotentialEnergy()}")
-    print("  Minimizing...")
-    sim.minimizeEnergy(maxIterations=1000)
+    print("  Minimizing (up to 10000 iterations)...")
+    sim.minimizeEnergy(maxIterations=10000)
     state1 = sim.context.getState(getEnergy=True)
     print(f"  Post-minimize energy: {state1.getPotentialEnergy()}")
 
