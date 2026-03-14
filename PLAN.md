@@ -258,13 +258,14 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] `animate.py`: load keyframes from NPZ, interpolate per-residue centroids
   - [x] Fallback to shift+bend when keyframes not available
 
-### v17 (in progress)
+### v17 (complete)
 - [x] Adaptive wall anchors: multi-round MD with periodic ribosome wall re-query
-  - [x] `build_extended_mrna.py`: `_update_wall_anchors()` recomputes nearest ribosome atoms every 25K steps via KDTree on ALL ~210K ribosome atoms
-  - [x] Brief minimization after each wall anchor update to prevent NaN explosions
-  - [x] `relax_mrna_keyframes.py`: same adaptive wall approach for keyframe relaxation
-- [ ] Rebuild `extended_mrna.pdb` with adaptive wall anchors
-- [ ] Regenerate `mrna_keyframes.npz` with adaptive wall anchors
+  - [x] `_update_wall_anchors()` recomputes nearest ribosome atoms every 5K steps via KDTree on ALL ~210K ribosome atoms
+  - [x] Minimization + velocity reset after each wall anchor update to prevent NaN
+  - [x] Softer wall force (k_wall=1000) with 0.3 nm force cap for stability
+  - [x] Applied to both `build_extended_mrna.py` and `relax_mrna_keyframes.py`
+- [x] Rebuilt `extended_mrna.pdb` (500K steps, 27 atoms <2.5Å vs 204 pre-relaxation)
+- [x] Regenerated `mrna_keyframes.npz` (9 keyframes, 100K steps each, ~91 min total)
 - [ ] Coordinated whole-structure "breathing" motion (not per-atom jitter)
 
 ## Tech stack
