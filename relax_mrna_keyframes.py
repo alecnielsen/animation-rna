@@ -171,7 +171,7 @@ def relax_shifted_mrna(mrna_arr, shift_vec, ribo_coords,
     from scipy.spatial import KDTree
     from biotite.structure.io.pdb import PDBFile
 
-    WALL_UPDATE_INTERVAL = 25000  # update wall anchors every N steps
+    WALL_UPDATE_INTERVAL = 5000  # update wall anchors every N steps (frequent to prevent drift at 400K)
 
     # Shift coordinates
     mrna_arr.coord += shift_vec
@@ -244,11 +244,11 @@ def relax_shifted_mrna(mrna_arr, shift_vec, ribo_coords,
         nearest_ribo_nm = query_ribo[nearest_idx] * 0.1
 
         wall_force = CustomExternalForce(
-            "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
+            "0.5*k_wall*step(r_min-dist)*(min(r_min-dist, cap)^2);"
             "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
-            "r_min=0.5"
+            "r_min=0.5; cap=0.3"
         )
-        wall_force.addGlobalParameter("k_wall", 5000.0)
+        wall_force.addGlobalParameter("k_wall", 1000.0)
         wall_force.addPerParticleParameter("wx")
         wall_force.addPerParticleParameter("wy")
         wall_force.addPerParticleParameter("wz")
@@ -286,11 +286,12 @@ def relax_shifted_mrna(mrna_arr, shift_vec, ribo_coords,
             steps_done += chunk
             if wall_force is not None and all_ribo_tree is not None and steps_done < total_steps:
                 _update_wall_anchors(wall_force, sim, all_ribo_tree, query_ribo)
-                # Brief minimization to absorb new wall forces before resuming dynamics
+                # Minimization + velocity reset to absorb new wall forces safely
                 sim.minimizeEnergy(maxIterations=200)
+                sim.context.setVelocitiesToTemperature(temp * kelvin)
                 state = sim.context.getState(getEnergy=True)
                 print(f"      Step {steps_done}: E={state.getPotentialEnergy()}, "
-                      f"walls updated + minimized")
+                      f"walls updated + minimized + velocities reset")
 
     platform = Platform.getPlatformByName('CPU')
     integrator = LangevinMiddleIntegrator(

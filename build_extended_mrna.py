@@ -382,7 +382,7 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None, all_ribo_coords=None):
     PHASE3_STEPS = 100000
     PHASE3_TEMP = 310  # K
     TOTAL_STEPS = PHASE1_STEPS + PHASE2_STEPS + PHASE3_STEPS
-    WALL_UPDATE_INTERVAL = 25000  # update wall anchors every N steps
+    WALL_UPDATE_INTERVAL = 5000  # update wall anchors every N steps (frequent to prevent drift at 400K)
 
     print(f"\n=== Relaxation ({TOTAL_STEPS} MD steps: "
           f"{PHASE1_STEPS}@{PHASE1_TEMP}K + {PHASE2_STEPS}@{PHASE2_TEMP}K + "
@@ -424,11 +424,11 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None, all_ribo_coords=None):
         nearest_ribo_nm = query_ribo[nearest_idx] * 0.1
 
         wall_force = CustomExternalForce(
-            "0.5*k_wall*step(r_min-dist)*((r_min-dist)^2);"
+            "0.5*k_wall*step(r_min-dist)*(min(r_min-dist, cap)^2);"
             "dist=sqrt((x-wx)^2+(y-wy)^2+(z-wz)^2);"
-            "r_min=0.5"
+            "r_min=0.5; cap=0.3"
         )
-        wall_force.addGlobalParameter("k_wall", 5000.0)
+        wall_force.addGlobalParameter("k_wall", 1000.0)
         wall_force.addPerParticleParameter("wx")
         wall_force.addPerParticleParameter("wy")
         wall_force.addPerParticleParameter("wz")
@@ -467,11 +467,12 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None, all_ribo_coords=None):
             steps_done += chunk
             if wall_force is not None and steps_done < total_steps:
                 _update_wall_anchors(wall_force, sim, all_ribo_tree, query_ribo)
-                # Brief minimization to absorb new wall forces before resuming dynamics
+                # Minimization + velocity reset to absorb new wall forces safely
                 sim.minimizeEnergy(maxIterations=200)
+                sim.context.setVelocitiesToTemperature(temp * kelvin)
                 state = sim.context.getState(getEnergy=True)
                 print(f"    Step {steps_done}: E={state.getPotentialEnergy()}, "
-                      f"walls updated + minimized")
+                      f"walls updated + minimized + velocities reset")
 
     run_phase("Phase 1 (400K)", PHASE1_STEPS, PHASE1_TEMP)
     run_phase("Phase 2 (350K)", PHASE2_STEPS, PHASE2_TEMP)
