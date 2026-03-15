@@ -148,7 +148,7 @@ CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of tunnel)
 
 # mRNA bend — droop outside the ribosome channel
-MRNA_CHANNEL_HALF_LEN = 4.0   # BU — straight zone around mRNA centroid
+MRNA_CHANNEL_HALF_LEN = 1.5   # BU (~150Å) — straight zone around mRNA centroid (ribosome tunnel ~80Å)
 MRNA_BEND_STRENGTH = 0.015    # BU per BU² beyond channel (quadratic droop)
 
 
@@ -200,15 +200,20 @@ def apply_mrna_bend(positions, res_ids, center=None, axis=None):
     droop_dir = 0.7 * droop_dir + 0.3 * np.array([0.0, 0.0, -1.0])
     droop_dir = droop_dir / np.linalg.norm(droop_dir)
 
-    # Straighten vertices inside the channel zone:
-    # Pull off-axis displacement toward the backbone axis (reduces clipping)
-    STRAIGHTEN_STRENGTH = 0.7  # 0=no straightening, 1=fully on axis
-    inside = np.abs(proj) < MRNA_CHANNEL_HALF_LEN
+    # Straighten vertices inside the channel zone with smooth falloff:
+    # Full strength at center, fading to zero at boundary
+    STRAIGHTEN_STRENGTH = 0.7  # peak strength at center
+    abs_proj = np.abs(proj)
+    inside = abs_proj < MRNA_CHANNEL_HALF_LEN
     if np.any(inside):
+        # Smooth falloff: 1.0 at center → 0.0 at boundary (cosine ease)
+        t = abs_proj[inside] / MRNA_CHANNEL_HALF_LEN  # 0→1
+        falloff = 0.5 * (1.0 + np.cos(t * np.pi))  # 1→0 smoothly
+        strength = STRAIGHTEN_STRENGTH * falloff
         # Off-axis component = relative - projection along axis
         proj_vec = proj[inside, np.newaxis] * local_axis
         off_axis = relative[inside] - proj_vec
-        positions[inside] -= STRAIGHTEN_STRENGTH * off_axis
+        positions[inside] -= strength[:, np.newaxis] * off_axis
 
     # Apply quadratic droop beyond the straight zone (vectorized)
     d = np.abs(proj) - MRNA_CHANNEL_HALF_LEN
@@ -1317,12 +1322,13 @@ def main():
                 mrna_pos = apply_mrna_bend(mrna_pos, mrna_mesh_res_ids,
                                            center=mrna_bend_center, axis=mrna_axis_local)
 
-                # Loop cross-fade
-                frames_from_end = TOTAL_FRAMES - 1 - global_frame
-                if frames_from_end < LOOP_BLEND_FRAMES:
-                    t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
-                    t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
-                    mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_kf
+                # Loop cross-fade (only for full 38-cycle seamless loop)
+                if N_CYCLES == 38:
+                    frames_from_end = TOTAL_FRAMES - 1 - global_frame
+                    if frames_from_end < LOOP_BLEND_FRAMES:
+                        t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
+                        t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
+                        mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_kf
             else:
                 # Fallback: shift + geometric bend
                 cumulative_mrna = mrna_progress * N_CYCLES * codon_shift_vertex
@@ -1330,12 +1336,13 @@ def main():
                 mrna_pos = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
                                            center=mrna_bend_center, axis=mrna_axis_local)
 
-                # Loop cross-fade
-                frames_from_end = TOTAL_FRAMES - 1 - global_frame
-                if frames_from_end < LOOP_BLEND_FRAMES:
-                    t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
-                    t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
-                    mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_bent
+                # Loop cross-fade (only for full 38-cycle seamless loop)
+                if N_CYCLES == 38:
+                    frames_from_end = TOTAL_FRAMES - 1 - global_frame
+                    if frames_from_end < LOOP_BLEND_FRAMES:
+                        t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
+                        t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
+                        mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_bent
 
             # ENM thermal breathing (pre-computed, coordinated whole-structure)
             if mrna_enm_thermal is not None:
