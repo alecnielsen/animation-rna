@@ -148,7 +148,7 @@ def _update_wall_anchors(wall_force, sim, all_ribo_tree, all_ribo_coords):
 
 def relax_shifted_mrna(mrna_arr, shift_vec, ribo_coords,
                        all_ribo_coords=None, all_ribo_tree=None,
-                       k_restraint=25.0, n_steps=100000):
+                       k_restraint=2.0, n_steps=100000):
     """Run MD relaxation on shifted mRNA with adaptive wall repulsion.
 
     Args:
@@ -388,7 +388,7 @@ def main():
                 arr_copy, shift_vec, nearby_ribo,
                 all_ribo_coords=all_ribo_coords,
                 all_ribo_tree=all_ribo_tree,
-                k_restraint=25.0, n_steps=100000)
+                k_restraint=2.0, n_steps=100000)
 
             # The MD residue IDs are 0-based (OpenMM topology).
             # We need to store centroids in the same order as res_ids from base.

@@ -1239,6 +1239,15 @@ def main():
         surface_res_ids = get_mesh_res_ids(obj_surface)
         print(f"  Stored {n_ribo} ribosome vertices for thermal deformation")
 
+    # --- Build ribosome mesh KDTree for mRNA wall repulsion ---
+    from scipy.spatial import KDTree as _KDTree
+    ribo_mesh_tree = None
+    ribo_mesh_verts = None
+    if obj_surface.name in orig_verts:
+        ribo_mesh_verts = orig_verts[obj_surface.name]
+        ribo_mesh_tree = _KDTree(ribo_mesh_verts)
+        print(f"  Ribosome mesh KDTree: {len(ribo_mesh_verts)} vertices for mRNA wall repulsion")
+
     dt_md = _time.time() - t_md_start
     print(f"  MD initialization: {dt_md:.1f}s")
 
@@ -1364,6 +1373,20 @@ def main():
                         global_frame, TOTAL_FRAMES, raw_deltas)
                     mrna_pos = apply_md_deltas_to_mesh(
                         mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
+            # Push mRNA vertices away from ribosome mesh (render-space wall repulsion)
+            if ribo_mesh_tree is not None:
+                WALL_DIST = 0.06  # BU (~6Å) — minimum clearance
+                dists, idxs = ribo_mesh_tree.query(mrna_pos)
+                too_close = dists < WALL_DIST
+                if np.any(too_close):
+                    nearest_ribo = ribo_mesh_verts[idxs[too_close]]
+                    direction = mrna_pos[too_close] - nearest_ribo
+                    norms = np.linalg.norm(direction, axis=1, keepdims=True)
+                    norms = np.maximum(norms, 1e-8)  # avoid div by zero
+                    direction = direction / norms
+                    push = WALL_DIST - dists[too_close]
+                    mrna_pos[too_close] += push[:, np.newaxis] * direction
+
             obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
             obj_mrna.data.update()
 
