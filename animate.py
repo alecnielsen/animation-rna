@@ -200,6 +200,16 @@ def apply_mrna_bend(positions, res_ids, center=None, axis=None):
     droop_dir = 0.7 * droop_dir + 0.3 * np.array([0.0, 0.0, -1.0])
     droop_dir = droop_dir / np.linalg.norm(droop_dir)
 
+    # Straighten vertices inside the channel zone:
+    # Pull off-axis displacement toward the backbone axis (reduces clipping)
+    STRAIGHTEN_STRENGTH = 0.7  # 0=no straightening, 1=fully on axis
+    inside = np.abs(proj) < MRNA_CHANNEL_HALF_LEN
+    if np.any(inside):
+        # Off-axis component = relative - projection along axis
+        proj_vec = proj[inside, np.newaxis] * local_axis
+        off_axis = relative[inside] - proj_vec
+        positions[inside] -= STRAIGHTEN_STRENGTH * off_axis
+
     # Apply quadratic droop beyond the straight zone (vectorized)
     d = np.abs(proj) - MRNA_CHANNEL_HALF_LEN
     mask = d > 0
@@ -1303,6 +1313,9 @@ def main():
                 # Keyframe interpolation path
                 mrna_pos = apply_keyframe_interpolation(
                     mrna_progress, mrna_keyframes, mrna_mesh_res_ids, mrna_unbent)
+                # Straighten tunnel region + droop outside
+                mrna_pos = apply_mrna_bend(mrna_pos, mrna_mesh_res_ids,
+                                           center=mrna_bend_center, axis=mrna_axis_local)
 
                 # Loop cross-fade
                 frames_from_end = TOTAL_FRAMES - 1 - global_frame
