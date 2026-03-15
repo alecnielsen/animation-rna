@@ -79,6 +79,9 @@ ANG_TO_BU = 0.01  # MolecularNodes world_scale: 1 Å = 0.01 BU
 DEBUG = "--debug" in sys.argv
 SAVE_BLEND = "--save-blend" in sys.argv
 N_CYCLES = 38  # one repeat unit (35 res domain + 3 res linker)
+for arg in sys.argv:
+    if arg.startswith("--cycles="):
+        N_CYCLES = int(arg.split("=", 1)[1])
 
 # Molecule style: cartoon (fast) or surface (production)
 MOL_STYLE = "cartoon"
@@ -1196,6 +1199,22 @@ def main():
         else:
             print(f"  Ribosome thermal: {ribo_thermal_path} not found, ribosome static")
 
+    # --- Load pre-computed mRNA ENM thermal motion (if available) ---
+    mrna_enm_thermal = None
+    mrna_enm_res_ids = None
+    if NO_JITTER:
+        print("  mRNA ENM thermal: DISABLED (--no-jitter)")
+    else:
+        mrna_thermal_path = "mrna_thermal.npz"
+        if os.path.exists(mrna_thermal_path):
+            mrna_t_data = np.load(mrna_thermal_path)
+            mrna_enm_thermal = mrna_t_data['deltas']  # (n_frames, n_residues, 3) in BU
+            mrna_enm_res_ids = mrna_t_data['residue_ids']
+            print(f"  mRNA ENM thermal: {mrna_enm_thermal.shape[0]} frames, "
+                  f"{mrna_enm_thermal.shape[1]} residues from {mrna_thermal_path}")
+        else:
+            print(f"  mRNA ENM thermal: {mrna_thermal_path} not found, using per-frame MD fallback")
+
     # Store ribosome orig verts if thermal motion available
     if ribo_thermal is not None:
         n_ribo = len(obj_surface.data.vertices)
@@ -1305,14 +1324,26 @@ def main():
                     t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
                     mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_bent
 
-            # MD thermal (applies on top of either path)
-            md_mrna = md_sims.get('mrna')
-            if md_mrna is not None:
-                raw_deltas = md_mrna.step_and_get_deltas(global_frame)
-                mrna_deltas = md_mrna.get_blended_deltas(
-                    global_frame, TOTAL_FRAMES, raw_deltas)
+            # ENM thermal breathing (pre-computed, coordinated whole-structure)
+            if mrna_enm_thermal is not None:
+                enm_frame = global_frame % len(mrna_enm_thermal)
+                enm_deltas = mrna_enm_thermal[enm_frame].copy()
+                # Smooth deltas along chain to prevent gaps between residues
+                from scipy.ndimage import gaussian_filter1d
+                for axis in range(3):
+                    enm_deltas[:, axis] = gaussian_filter1d(enm_deltas[:, axis], sigma=3.0)
                 mrna_pos = apply_md_deltas_to_mesh(
-                    mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
+                    mrna_pos, mrna_mesh_res_ids,
+                    enm_deltas, mrna_enm_res_ids)
+            else:
+                # Fallback: per-frame MD thermal (subtle per-atom jitter)
+                md_mrna = md_sims.get('mrna')
+                if md_mrna is not None:
+                    raw_deltas = md_mrna.step_and_get_deltas(global_frame)
+                    mrna_deltas = md_mrna.get_blended_deltas(
+                        global_frame, TOTAL_FRAMES, raw_deltas)
+                    mrna_pos = apply_md_deltas_to_mesh(
+                        mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
             obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
             obj_mrna.data.update()
 

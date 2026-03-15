@@ -266,7 +266,12 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Applied to both `build_extended_mrna.py` and `relax_mrna_keyframes.py`
 - [x] Rebuilt `extended_mrna.pdb` (500K steps, 27 atoms <2.5Å vs 204 pre-relaxation)
 - [x] Regenerated `mrna_keyframes.npz` (9 keyframes, 100K steps each, ~91 min total)
-- [ ] Coordinated whole-structure "breathing" motion (not per-atom jitter)
+- [x] Coordinated whole-structure "breathing" motion via ENM thermal trajectory
+  - [x] `compute_mrna_thermal.py`: coarse-grained ENM (one bead per residue, P-atom positions)
+  - [x] Softer springs (ENM_K=5, k_restraint=20) for visible collective motion
+  - [x] 456-frame trajectory with seamless loop cross-fade
+  - [x] Gaussian smoothing (sigma=3 residues) along chain prevents cartoon mesh gaps
+  - [x] `animate.py`: loads `mrna_thermal.npz`, applies ENM deltas per-frame (replaces per-atom MD jitter)
 
 ## Tech stack
 

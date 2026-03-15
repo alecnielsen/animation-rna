@@ -97,6 +97,7 @@ Output:
 |--------|--------|---------|
 | `build_extended_mrna.py` | `extended_mrna.pdb` | Tile chain A4 x30, 500K-step 3-stage MD annealing with adaptive ribosome wall repulsion (re-queries every 25K steps), shift to decoding center |
 | `relax_mrna_keyframes.py` | `mrna_keyframes.npz` | MD-relaxed mRNA keyframes at codon shift positions (9 keyframes, 100K steps each, adaptive wall anchors). Used by animate.py for interpolated ratchet |
+| `compute_mrna_thermal.py` | `mrna_thermal.npz` | Pre-compute mRNA ENM thermal trajectory (456 frames, coarse-grained elastic network, Gaussian-smoothed). Coordinated breathing motion |
 | `build_tunnel_polypeptide.py` | `repeating_polypeptide.pdb`, `repeating_polypeptide_folds.npz` | Trace exit tunnel, place 8 repeating Villin HP35 (1YRF) folded domains with GSG linkers. NPZ stores dual extended/folded coordinates per domain for morph animation |
 | `render_single_frame.py` | `renders/single_frame.png` | Single-frame render of full translation complex (ribosome, mRNA, tRNAs, polypeptide) |
 | `modal_gpu.py` | `ribosome_thermal.npz` | Modal GPU: MD relaxation, ribosome ENM thermal trajectory (456 frames), production renders |
