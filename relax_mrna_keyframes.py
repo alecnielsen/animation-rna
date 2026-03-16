@@ -217,19 +217,9 @@ def relax_shifted_mrna(mrna_arr, shift_vec, ribo_coords,
         constraints=HBonds,
     )
 
-    # Position restraints (gentle — allow conformational change near walls)
-    restraint = CustomExternalForce(
-        "0.5*k_restraint*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
-    restraint.addGlobalParameter("k_restraint", k_restraint)
-    restraint.addPerParticleParameter("x0")
-    restraint.addPerParticleParameter("y0")
-    restraint.addPerParticleParameter("z0")
-
+    # No position restraints — let the force field + wall force + angle restraints
+    # freely determine the mRNA conformation inside the tunnel.
     positions = modeller.positions
-    for i in range(n_atoms):
-        pos = positions[i].value_in_unit(nanometer)
-        restraint.addParticle(i, [pos[0], pos[1], pos[2]])
-    system.addForce(restraint)
 
     # Wall repulsion from ribosome (use all_ribo for KDTree queries)
     query_ribo = all_ribo_coords if all_ribo_coords is not None else ribo_coords

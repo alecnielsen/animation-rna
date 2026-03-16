@@ -202,7 +202,7 @@ def apply_mrna_bend(positions, res_ids, center=None, axis=None):
 
     # Straighten vertices inside the channel zone with smooth falloff:
     # Full strength at center, fading to zero at boundary
-    STRAIGHTEN_STRENGTH = 0.7  # peak strength at center
+    STRAIGHTEN_STRENGTH = 0.95  # peak strength at center (nearly fully on-axis in tunnel)
     abs_proj = np.abs(proj)
     inside = abs_proj < MRNA_CHANNEL_HALF_LEN
     if np.any(inside):
@@ -1331,13 +1331,6 @@ def main():
                 mrna_pos = apply_mrna_bend(mrna_pos, mrna_mesh_res_ids,
                                            center=mrna_bend_center, axis=mrna_axis_local)
 
-                # Loop cross-fade (only for full 38-cycle seamless loop)
-                if N_CYCLES == 38:
-                    frames_from_end = TOTAL_FRAMES - 1 - global_frame
-                    if frames_from_end < LOOP_BLEND_FRAMES:
-                        t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
-                        t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
-                        mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_kf
             else:
                 # Fallback: shift + geometric bend
                 cumulative_mrna = mrna_progress * N_CYCLES * codon_shift_vertex
@@ -1345,8 +1338,8 @@ def main():
                 mrna_pos = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
                                            center=mrna_bend_center, axis=mrna_axis_local)
 
-                # Loop cross-fade (only for full 38-cycle seamless loop)
-                if N_CYCLES == 38:
+                # Loop cross-fade (disabled — conveyor belt handles seamless loop)
+                if False:
                     frames_from_end = TOTAL_FRAMES - 1 - global_frame
                     if frames_from_end < LOOP_BLEND_FRAMES:
                         t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
@@ -1373,20 +1366,6 @@ def main():
                         global_frame, TOTAL_FRAMES, raw_deltas)
                     mrna_pos = apply_md_deltas_to_mesh(
                         mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
-            # Push mRNA vertices away from ribosome mesh (render-space wall repulsion)
-            if ribo_mesh_tree is not None:
-                WALL_DIST = 0.06  # BU (~6Å) — minimum clearance
-                dists, idxs = ribo_mesh_tree.query(mrna_pos)
-                too_close = dists < WALL_DIST
-                if np.any(too_close):
-                    nearest_ribo = ribo_mesh_verts[idxs[too_close]]
-                    direction = mrna_pos[too_close] - nearest_ribo
-                    norms = np.linalg.norm(direction, axis=1, keepdims=True)
-                    norms = np.maximum(norms, 1e-8)  # avoid div by zero
-                    direction = direction / norms
-                    push = WALL_DIST - dists[too_close]
-                    mrna_pos[too_close] += push[:, np.newaxis] * direction
-
             obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
             obj_mrna.data.update()
 
