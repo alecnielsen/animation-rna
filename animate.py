@@ -872,6 +872,47 @@ def compute_polypeptide_morph(orig_positions, res_ids, fold_data,
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+N_MRNA_SEGMENTS = 3  # split mRNA into segments for surface mesh (avoids MN crash on 16K+ atoms)
+
+
+def _split_mrna_pdb(in_pdb, n_segments=N_MRNA_SEGMENTS):
+    """Split extended mRNA PDB into segments for surface mesh rendering.
+
+    Returns list of (pdb_path, res_start_ordinal, n_residues) tuples.
+    Each segment has ~5-6K atoms, well within MN surface mesh limits.
+    """
+    from biotite.structure.io.pdb import PDBFile as BiotitePDB
+    from biotite.structure import AtomArrayStack
+
+    pdb = BiotitePDB.read(in_pdb)
+    arr = pdb.get_structure(model=1)
+    if isinstance(arr, AtomArrayStack):
+        arr = arr[0]
+
+    unique_res = np.sort(np.unique(arr.res_id))
+    n_res = len(unique_res)
+    seg_size = n_res // n_segments
+
+    segments = []
+    for i in range(n_segments):
+        start = i * seg_size
+        end = (i + 1) * seg_size if i < n_segments - 1 else n_res
+        seg_res = unique_res[start:end]
+        mask = np.isin(arr.res_id, seg_res)
+        seg_atoms = arr[mask]
+
+        seg_path = in_pdb.replace('.pdb', f'_seg{i}.pdb')
+        seg_pdb = BiotitePDB()
+        seg_pdb.set_structure(seg_atoms)
+        seg_pdb.write(seg_path)
+
+        segments.append((seg_path, start, len(seg_res)))
+        print(f"    Segment {i}: residues {seg_res[0]}-{seg_res[-1]} "
+              f"({len(seg_res)} res, {len(seg_atoms)} atoms) -> {seg_path}")
+
+    return segments
+
+
 def _write_backbone(in_pdb, out_pdb, mol_type="rna"):
     """Write a backbone-only PDB for cleaner visualization."""
     from biotite.structure.io.pdb import PDBFile as BiotitePDB
@@ -994,14 +1035,28 @@ def main():
     # Internal molecule style: surface for production, cartoon/ribbon for dev
     internal_style = MOL_STYLE if MOL_STYLE == "surface" else None
 
-    # 2. mRNA
-    mrna_search = os.path.splitext(os.path.basename(mrna_pdb))[0]
-    mol_mrna = mn.Molecule.load(mrna_pdb)
-    mol_mrna.add_style(
-        style=internal_style or "cartoon",
-        material=make_solid_material((0.05, 0.25, 0.95)),
-        name="mRNA",
-    )
+    # 2. mRNA — segmented surface mesh or single cartoon
+    mrna_segments_info = None  # list of (seg_path, res_offset, n_res) when segmented
+    if MOL_STYLE == "surface":
+        print("  Splitting mRNA for surface mesh...")
+        mrna_segments_info = _split_mrna_pdb("extended_mrna.pdb")
+        mrna_seg_mols = []
+        for seg_path, _, _ in mrna_segments_info:
+            mol = mn.Molecule.load(seg_path)
+            mol.add_style(
+                style="surface",
+                material=make_solid_material((0.05, 0.25, 0.95)),
+                name=f"mRNA_{os.path.basename(seg_path).replace('.pdb','')}",
+            )
+            mrna_seg_mols.append(mol)
+    else:
+        mrna_search = os.path.splitext(os.path.basename(mrna_pdb))[0]
+        mol_mrna = mn.Molecule.load(mrna_pdb)
+        mol_mrna.add_style(
+            style="cartoon",
+            material=make_solid_material((0.05, 0.25, 0.95)),
+            name="mRNA",
+        )
 
     # 3. P-site tRNA (chain B4)
     mol_trna_p = mn.Molecule.load("trna_b4.pdb")
@@ -1038,14 +1093,28 @@ def main():
         return [o for o in bpy.data.objects if name_substr in o.name and o.type == "MESH"]
 
     objs_surface = find_mesh("6Y0G")
-    objs_mrna = find_mesh(mrna_search)
     objs_trna_p = find_mesh("trna_b4")
     objs_trna_a = find_mesh("trna_d4")
     pep_search = os.path.splitext(os.path.basename(peptide_pdb))[0]
     objs_pep = find_mesh(pep_search)
 
+    # mRNA objects: multiple segments or single
+    mrna_seg_objs = []  # list of Blender mesh objects for mRNA segments
+    if mrna_segments_info is not None:
+        for seg_path, _, _ in mrna_segments_info:
+            seg_name = os.path.splitext(os.path.basename(seg_path))[0]
+            seg_objs = find_mesh(seg_name)
+            if seg_objs:
+                mrna_seg_objs.append(seg_objs[0])
+        obj_mrna = mrna_seg_objs[0]  # primary reference for axis computation
+        objs_mrna = mrna_seg_objs
+        print(f"  Found mRNA segments: {[o.name for o in mrna_seg_objs]}")
+    else:
+        objs_mrna = find_mesh(mrna_search)
+        obj_mrna = objs_mrna[0] if objs_mrna else None
+        print(f"  Found mRNA: {[o.name for o in objs_mrna]}")
+
     print(f"  Found: surface={[o.name for o in objs_surface]}, "
-          f"mRNA={[o.name for o in objs_mrna]}, "
           f"tRNA_P={[o.name for o in objs_trna_p]}, "
           f"tRNA_A={[o.name for o in objs_trna_a]}, "
           f"peptide={[o.name for o in objs_pep]}")
@@ -1057,16 +1126,19 @@ def main():
     obj_surface = objs_surface[0]
     obj_trna_p = objs_trna_p[0]
     obj_trna_a = objs_trna_a[0]
-    obj_mrna = objs_mrna[0]
+    if not mrna_seg_objs:
+        obj_mrna = objs_mrna[0]
     obj_peptide = objs_pep[0]
 
     # Apply rotation to all primary objects
-    primary_objects = [obj_surface, obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+    primary_objects = [obj_surface, obj_trna_p, obj_trna_a, obj_peptide] + (
+        mrna_seg_objs if mrna_seg_objs else [obj_mrna])
     for o in primary_objects:
         o.rotation_euler.z = math.pi / 2
 
     # --- Store original vertex positions for per-residue deformation ---
-    deform_objects = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+    deform_objects = [obj_trna_p, obj_trna_a, obj_peptide] + (
+        mrna_seg_objs if mrna_seg_objs else [obj_mrna])
     orig_verts = {}
     for obj in deform_objects:
         n = len(obj.data.vertices)
@@ -1076,8 +1148,37 @@ def main():
         print(f"  Stored {n} vertices for {obj.name}")
 
     # --- mRNA codon ratchet setup ---
-    mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
-    mrna_unbent = orig_verts[obj_mrna.name].copy()
+    # When segmented: concatenate all segment data for global computations,
+    # but keep per-segment info for distributing positions back to meshes.
+    if mrna_seg_objs:
+        # Build concatenated "virtual" full mRNA from segments
+        _seg_res_ids_list = []
+        _seg_verts_list = []
+        mrna_seg_data = []  # (obj, res_ids, orig_verts, res_offset, n_unique_res)
+        cumulative_offset = 0
+        for seg_obj in mrna_seg_objs:
+            seg_rid = get_mesh_res_ids(seg_obj)
+            seg_v = orig_verts[seg_obj.name].copy()
+            n_unique = len(np.unique(seg_rid))
+            mrna_seg_data.append((seg_obj, seg_rid, seg_v, cumulative_offset, n_unique))
+            _seg_res_ids_list.append(seg_rid)
+            _seg_verts_list.append(seg_v)
+            cumulative_offset += n_unique
+        # Concatenated data for global computations (axis, center, etc.)
+        # Remap res_ids to be globally unique across segments
+        _global_res_ids = []
+        _offset = 0
+        for seg_rid in _seg_res_ids_list:
+            unique_seg = np.unique(seg_rid)
+            remap = {old: new for new, old in enumerate(unique_seg, start=_offset)}
+            _global_res_ids.append(np.array([remap[r] for r in seg_rid]))
+            _offset += len(unique_seg)
+        mrna_mesh_res_ids = np.concatenate(_global_res_ids)
+        mrna_unbent = np.concatenate(_seg_verts_list)
+    else:
+        mrna_seg_data = None
+        mrna_mesh_res_ids = get_mesh_res_ids(obj_mrna)
+        mrna_unbent = orig_verts[obj_mrna.name].copy()
 
     # --- Load pre-relaxed mRNA keyframes (if available) ---
     mrna_keyframes = None
@@ -1129,12 +1230,29 @@ def main():
     mrna_frame0_bent = apply_mrna_bend(
         mrna_unbent.copy(), mrna_mesh_res_ids,
         center=mrna_bend_center, axis=mrna_axis_local)
-    if mrna_keyframes is None:
-        # Only bend the initial mesh when not using keyframes
-        orig_verts[obj_mrna.name] = apply_mrna_bend(
-            orig_verts[obj_mrna.name], mrna_mesh_res_ids)
-    obj_mrna.data.vertices.foreach_set('co', orig_verts[obj_mrna.name].ravel())
-    obj_mrna.data.update()
+    if mrna_seg_data:
+        # Apply initial bend to each segment
+        if mrna_keyframes is None:
+            bent_full = apply_mrna_bend(mrna_unbent.copy(), mrna_mesh_res_ids)
+            vert_offset = 0
+            for seg_obj, seg_rid, seg_orig, res_off, n_res_seg in mrna_seg_data:
+                n_v = len(seg_orig)
+                seg_bent = bent_full[vert_offset:vert_offset + n_v]
+                orig_verts[seg_obj.name] = seg_bent
+                seg_obj.data.vertices.foreach_set('co', seg_bent.ravel())
+                seg_obj.data.update()
+                vert_offset += n_v
+        else:
+            for seg_obj in mrna_seg_objs:
+                seg_v = orig_verts[seg_obj.name]
+                seg_obj.data.vertices.foreach_set('co', seg_v.ravel())
+                seg_obj.data.update()
+    else:
+        if mrna_keyframes is None:
+            orig_verts[obj_mrna.name] = apply_mrna_bend(
+                orig_verts[obj_mrna.name], mrna_mesh_res_ids)
+        obj_mrna.data.vertices.foreach_set('co', orig_verts[obj_mrna.name].ravel())
+        obj_mrna.data.update()
 
     # --- Get mesh res_ids for MD mapping ---
     trna_p_mesh_res_ids = get_mesh_res_ids(obj_trna_p)
@@ -1282,7 +1400,8 @@ def main():
     # --- 2-pass composite constants ---
     OUTLINE_COLOR = (70, 120, 200)
     OUTLINE_THICKNESS = 3
-    internal_objs = [obj_mrna, obj_trna_p, obj_trna_a, obj_peptide]
+    internal_objs = (mrna_seg_objs if mrna_seg_objs else [obj_mrna]) + [
+        obj_trna_p, obj_trna_a, obj_peptide]
 
     # --- Render loop (2-pass composite per frame) ---
     import time
@@ -1318,8 +1437,10 @@ def main():
                 obj_surface.data.update()
 
             # --- mRNA: keyframe interpolation or shift+bend fallback ---
-            obj_mrna.location = (0, 0, 0)
-            obj_mrna.rotation_euler = (0, 0, math.pi / 2)
+            # Set location/rotation on all mRNA objects (segments or single)
+            for _mrna_obj in (mrna_seg_objs if mrna_seg_objs else [obj_mrna]):
+                _mrna_obj.location = (0, 0, 0)
+                _mrna_obj.rotation_euler = (0, 0, math.pi / 2)
 
             mrna_progress = global_frame / max(TOTAL_FRAMES - 1, 1)
 
@@ -1337,14 +1458,6 @@ def main():
                 shifted = mrna_unbent + cumulative_mrna
                 mrna_pos = apply_mrna_bend(shifted.copy(), mrna_mesh_res_ids,
                                            center=mrna_bend_center, axis=mrna_axis_local)
-
-                # Loop cross-fade (disabled — conveyor belt handles seamless loop)
-                if False:
-                    frames_from_end = TOTAL_FRAMES - 1 - global_frame
-                    if frames_from_end < LOOP_BLEND_FRAMES:
-                        t_blend = (frames_from_end + 1) / LOOP_BLEND_FRAMES
-                        t_blend = t_blend * t_blend * (3.0 - 2.0 * t_blend)
-                        mrna_pos = t_blend * mrna_pos + (1.0 - t_blend) * mrna_frame0_bent
 
             # ENM thermal breathing (pre-computed, coordinated whole-structure)
             if mrna_enm_thermal is not None:
@@ -1366,8 +1479,20 @@ def main():
                         global_frame, TOTAL_FRAMES, raw_deltas)
                     mrna_pos = apply_md_deltas_to_mesh(
                         mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
-            obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
-            obj_mrna.data.update()
+
+            # Distribute computed positions to mesh objects
+            if mrna_seg_data:
+                # Split concatenated mrna_pos back to per-segment meshes
+                vert_offset = 0
+                for seg_obj, seg_rid, seg_orig, res_off, n_res_seg in mrna_seg_data:
+                    n_verts = len(seg_orig)
+                    seg_pos = mrna_pos[vert_offset:vert_offset + n_verts]
+                    seg_obj.data.vertices.foreach_set('co', seg_pos.ravel())
+                    seg_obj.data.update()
+                    vert_offset += n_verts
+            else:
+                obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
+                obj_mrna.data.update()
 
             # --- P-site tRNA: choreographic position + MD thermal ---
             obj_trna_p.location = tuple(trna_p_d)

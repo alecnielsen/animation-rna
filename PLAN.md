@@ -273,13 +273,15 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] Gaussian smoothing (sigma=3 residues) along chain prevents cartoon mesh gaps
   - [x] `animate.py`: loads `mrna_thermal.npz`, applies ENM deltas per-frame (replaces per-atom MD jitter)
 
-### v18 (in progress)
-- [x] Production render with surface mesh for internal molecules
+### v18 (complete)
+- [x] Surface mesh for ALL internal molecules (unified production look)
+  - [x] mRNA: segmented into 3 × ~170 residues (~5.5K atoms each) to avoid MN surface mesh segfault on 16K+ atoms
   - [x] tRNA: surface style (replaces ribbon)
   - [x] Polypeptide: surface style (replaces spheres)
-  - [x] mRNA: forced to cartoon (surface mesh segfaults on 16K+ atom extended strand)
   - [x] Ribosome: cartoon (2-pass silhouette outline)
-- [ ] 456-frame production render (1920×1080, 128 samples) — 75% complete
+- [x] `_split_mrna_pdb()`: splits extended mRNA PDB into N segments at load time
+- [x] Per-frame vertex distribution: compute full mRNA positions, then slice to segment meshes
+- [x] 456-frame production render (1920×1080, 128 samples) complete
 
 ## Tech stack
 
