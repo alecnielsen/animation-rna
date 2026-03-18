@@ -1,10 +1,9 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
-v20: Curved tRNA entry/exit paths with per-cycle variety.
-- Catmull-Rom spline paths replace straight-line lerps for tRNA delivery and departure
-- Entry swoops in from above+lateral; exit lifts away in opposite lateral direction
-- Per-cycle randomized path jitter (seeded RNG) so each tRNA takes a unique trajectory
-- Closer waypoints (~2x PA_VEC) keep more of the path on-camera
+v20: Smooth tRNA entry/exit arcs with per-cycle variety.
+- arc_lerp(): linear interp + sin(πt) perpendicular offset for clean single-arc swoops
+- Per-cycle randomized paths via get_cycle_arc() — random direction + arc curvature per cycle
+- tRNAs enter/exit from off-frame (8 BU distance); shallow arcs (0.4 BU peak)
 - Smoothstep easing on all motion phases; --frames=N CLI override for temporal resolution
 
 v19: Per-frame tRNA-mRNA declash.
@@ -156,65 +155,71 @@ PA_VEC = np.array((-2.51, 1.86, 0.05))       # P-site to A-site direction
 EP_VEC = -PA_VEC                               # A-site to P-site = E to P direction
 CODON_SHIFT = np.array((-0.75, 0.35, -0.56))  # one codon mRNA advance
 
-# Direction perpendicular to PA_VEC in XY plane (for lateral entry/exit variety)
-_pa_xy = np.array([PA_VEC[0], PA_VEC[1], 0.0])
-_pa_xy_norm = _pa_xy / np.linalg.norm(_pa_xy)
-LATERAL_VEC = np.array([_pa_xy_norm[1], -_pa_xy_norm[0], 0.0])  # 90° CW in XY
 UP_VEC = np.array([0.0, 0.0, 1.0])
 
-# Base entry path: tRNA swoops in from above-lateral toward A-site
-# Waypoints kept within ~2x PA_VEC so most of the path is on-camera
-ENTRY_PATH_BASE = np.array([
-    PA_VEC * 2.0 + UP_VEC * 1.5 + LATERAL_VEC * 1.5,  # visible near edge, elevated
-    PA_VEC * 1.5 + UP_VEC * 0.8 + LATERAL_VEC * 0.5,  # approaching
-    PA_VEC * 1.1 + UP_VEC * 0.15,                       # near A-site, descending
-    PA_VEC.copy(),                                        # A-site (fixed)
-])
-
-# Base departure path: tRNA lifts away from E-site in opposite lateral direction
-DEPART_PATH_BASE = np.array([
-    EP_VEC.copy(),                                        # E-site (fixed)
-    EP_VEC * 1.1 + UP_VEC * 0.3 - LATERAL_VEC * 0.3,   # lifting off
-    EP_VEC * 1.5 + UP_VEC * 1.0 - LATERAL_VEC * 1.0,   # climbing away
-    EP_VEC * 2.0 + UP_VEC * 1.8 - LATERAL_VEC * 2.0,   # near edge, elevated
-])
-
-# Per-cycle path randomization amplitude (BU)
-PATH_JITTER_LATERAL = 1.0  # lateral spread
-PATH_JITTER_VERTICAL = 0.6  # vertical spread
-PATH_JITTER_ALONG = 0.5     # along PA direction
+# tRNA arc path configuration
+# Camera ortho scale=10.5 → half-width ~9.3 BU. 8 BU from A/E-site guarantees off-frame.
+TRNA_ENTRY_DIST = 8.0   # BU from A-site to start of entry arc
+TRNA_DEPART_DIST = 8.0  # BU from E-site to end of departure arc
+TRNA_ARC_HEIGHT = 0.4   # BU peak perpendicular offset (shallow arc)
 
 
-def get_cycle_paths(cycle):
-    """Generate per-cycle randomized entry/exit waypoints.
+def _random_direction(rng, bias=None, bias_weight=0.3):
+    """Random unit vector on the upper hemisphere, optionally biased."""
+    v = rng.randn(3)
+    v[2] = abs(v[2])  # upper hemisphere (Z >= 0)
+    if bias is not None:
+        v = v + bias_weight * bias / max(np.linalg.norm(bias), 1e-8)
+    return v / np.linalg.norm(v)
 
-    Each cycle gets a deterministic but unique path by seeding an RNG
-    with the cycle number. Endpoints (A-site, E-site) stay fixed;
-    intermediate and far waypoints are jittered.
+
+def get_cycle_arc(cycle):
+    """Generate per-cycle randomized arc parameters for tRNA entry/exit.
+
+    Each cycle gets deterministic but unique start/end positions and arc
+    curvature via a seeded RNG. A-site and E-site positions are fixed;
+    the far endpoints and arc offsets vary.
+
+    Returns: (entry_start, entry_arc_vec, depart_end, depart_arc_vec)
     """
     rng = np.random.RandomState(seed=cycle * 137 + 42)
 
-    entry = ENTRY_PATH_BASE.copy()
-    depart = DEPART_PATH_BASE.copy()
+    # --- Entry: random start position, biased along PA direction ---
+    entry_dir = _random_direction(rng, bias=PA_VEC)
+    entry_start = PA_VEC + entry_dir * TRNA_ENTRY_DIST
 
-    # Jitter entry waypoints 0-2 (keep index 3 = A-site fixed)
-    for i in range(3):
-        # Stronger jitter for farther waypoints
-        scale = 1.0 - i * 0.3  # 1.0, 0.7, 0.4
-        entry[i] += (
-            rng.uniform(-1, 1) * PATH_JITTER_LATERAL * scale * LATERAL_VEC +
-            rng.uniform(-1, 1) * PATH_JITTER_VERTICAL * scale * UP_VEC +
-            rng.uniform(-1, 1) * PATH_JITTER_ALONG * scale * _pa_xy_norm)
+    # Arc: perpendicular to the entry line
+    entry_line_n = (PA_VEC - entry_start)
+    entry_line_n = entry_line_n / np.linalg.norm(entry_line_n)
+    perp = rng.randn(3)
+    perp -= perp.dot(entry_line_n) * entry_line_n  # project out parallel
+    pn = np.linalg.norm(perp)
+    perp = perp / pn if pn > 1e-6 else UP_VEC
+    entry_arc_vec = perp * TRNA_ARC_HEIGHT * rng.uniform(0.5, 1.5)
 
-    # Jitter departure waypoints 1-3 (keep index 0 = E-site fixed)
-    for i in range(1, 4):
-        scale = (i / 3.0)  # 0.33, 0.67, 1.0
-        depart[i] += (
-            rng.uniform(-1, 1) * PATH_JITTER_LATERAL * scale * LATERAL_VEC +
-            rng.uniform(-1, 1) * PATH_JITTER_VERTICAL * scale * UP_VEC +
-            rng.uniform(-1, 1) * PATH_JITTER_ALONG * scale * _pa_xy_norm)
+    # --- Departure: random end position, biased along EP direction ---
+    depart_dir = _random_direction(rng, bias=EP_VEC)
+    depart_end = EP_VEC + depart_dir * TRNA_DEPART_DIST
 
-    return entry, depart
+    depart_line_n = (depart_end - EP_VEC)
+    depart_line_n = depart_line_n / np.linalg.norm(depart_line_n)
+    perp = rng.randn(3)
+    perp -= perp.dot(depart_line_n) * depart_line_n
+    pn = np.linalg.norm(perp)
+    perp = perp / pn if pn > 1e-6 else UP_VEC
+    depart_arc_vec = perp * TRNA_ARC_HEIGHT * rng.uniform(0.5, 1.5)
+
+    return entry_start, entry_arc_vec, depart_end, depart_arc_vec
+
+
+def arc_lerp(start, end, t, arc_vec):
+    """Interpolate along a smooth arc from start to end.
+
+    Linear interpolation + sinusoidal perpendicular offset.
+    t in [0,1]. arc_vec is the perpendicular offset at peak (t=0.5).
+    """
+    base = start + (end - start) * t
+    return base + np.sin(np.pi * t) * arc_vec
 
 RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
@@ -476,34 +481,6 @@ def smoothstep(t):
     t = np.clip(t, 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
-
-def eval_catmull_rom(waypoints, t):
-    """Evaluate Catmull-Rom spline through waypoints at parameter t in [0,1].
-
-    waypoints: (N, 3) array of control points (spline passes through all).
-    t: scalar in [0, 1].
-    Returns: (3,) interpolated position.
-    """
-    n = len(waypoints)
-    if n < 2:
-        return waypoints[0].copy()
-    # Map t to segment
-    t_scaled = np.clip(t, 0.0, 1.0) * (n - 1)
-    seg = int(np.floor(t_scaled))
-    seg = min(seg, n - 2)
-    lt = t_scaled - seg
-    # 4 control points (clamp at boundaries)
-    p0 = waypoints[max(seg - 1, 0)]
-    p1 = waypoints[seg]
-    p2 = waypoints[min(seg + 1, n - 1)]
-    p3 = waypoints[min(seg + 2, n - 1)]
-    lt2 = lt * lt
-    lt3 = lt2 * lt
-    return 0.5 * (
-        2 * p1 +
-        (-p0 + p2) * lt +
-        (2*p0 - 5*p1 + 4*p2 - p3) * lt2 +
-        (-p0 + 3*p1 - 3*p2 + p3) * lt3)
 
 
 def frame_t(frame, start, end):
@@ -814,8 +791,8 @@ def get_positions(local_frame, cycle=0):
 
     zero = np.zeros(3)
 
-    # Per-cycle randomized paths
-    entry_path, depart_path = get_cycle_paths(cycle)
+    # Per-cycle randomized arc parameters
+    entry_start, entry_arc, depart_end, depart_arc = get_cycle_arc(cycle)
 
     # --- mRNA (translation only, no rotation) ---
     if local_frame < f144:
@@ -829,7 +806,7 @@ def get_positions(local_frame, cycle=0):
     # --- P-site tRNA ---
     # Phases 1-4: stationary at P-site
     # Phase 5 (translocation): eased move P→E
-    # Phase 6 (departure): curved Catmull-Rom exit path (per-cycle randomized)
+    # Phase 6 (departure): arc sweep to random far position
     if local_frame < f144:
         trna_p_delta = zero.copy()
     elif local_frame < f192:
@@ -837,21 +814,21 @@ def get_positions(local_frame, cycle=0):
         trna_p_delta = lerp(zero, EP_VEC, t)
     elif local_frame < f240:
         t = smoothstep(frame_t(local_frame, f192, f240))
-        trna_p_delta = eval_catmull_rom(depart_path, t)
+        trna_p_delta = arc_lerp(EP_VEC, depart_end, t, depart_arc)
     else:
-        trna_p_delta = depart_path[-1].copy()
+        trna_p_delta = depart_end.copy()
 
     # --- A-site tRNA ---
     # Phase 1 (establish): waiting at far entry position
-    # Phase 2 (delivery): curved Catmull-Rom approach to A-site (per-cycle randomized)
+    # Phase 2 (delivery): arc sweep from random far position to A-site
     # Phase 3 (accommodation): stationary at A-site
     # Phase 5 (translocation): eased move A→P
     # Phase 6: stationary at P-site (now the new P-site tRNA)
     if local_frame < f12:
-        trna_a_delta = entry_path[0].copy()
+        trna_a_delta = entry_start.copy()
     elif local_frame < f96:
         t = smoothstep(frame_t(local_frame, f12, f96))
-        trna_a_delta = eval_catmull_rom(entry_path, t)
+        trna_a_delta = arc_lerp(entry_start, PA_VEC, t, entry_arc)
     elif local_frame < f144:
         trna_a_delta = PA_VEC.copy()
     elif local_frame < f192:
