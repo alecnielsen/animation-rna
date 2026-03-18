@@ -283,6 +283,14 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Per-frame vertex distribution: compute full mRNA positions, then slice to segment meshes
 - [x] 456-frame production render (1920×1080, 128 samples) complete
 
+### v19 (complete)
+- [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
+  - [x] `declash_mrna_from_trna()`: KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms
+  - [x] Transforms to world space (Rz(π/2) rotation + tRNA location offsets), declashes, transforms back
+  - [x] Smoothstep falloff: hard push at 6 Å, smooth fade to zero at 10 Å — no pop artifacts
+  - [x] Render loop restructured: tRNA positions computed before mRNA distribution for declash input
+  - [x] Works across all 38 cycles as mRNA ratchets (consistent ~160-200 vertices pushed per frame)
+
 ## Tech stack
 
 - **Python 3.11** — required by Blender

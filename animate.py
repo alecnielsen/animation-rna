@@ -1,5 +1,11 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v19: Per-frame tRNA-mRNA declash.
+- KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms at the decoding center
+- Smoothstep falloff (6–10 Å) prevents visual clipping without pop artifacts
+- tRNA positions computed before mRNA distribution so declash can use them
+- Works across all 38 cycles as mRNA ratchets
+
 v16: Pre-relaxed mRNA keyframe interpolation.
 - 9 MD-relaxed keyframes (every 5 codons: 0,5,10,...,35,38) via relax_mrna_keyframes.py
 - Each keyframe: shifted mRNA + 100K MD steps with ribosome wall repulsion
@@ -223,6 +229,97 @@ def apply_mrna_bend(positions, res_ids, center=None, axis=None):
         positions[mask] += droop_amounts[:, np.newaxis] * droop_dir
 
     return positions
+
+
+# ---------------------------------------------------------------------------
+# tRNA-mRNA declash: push mRNA vertices away from tRNA atoms
+# ---------------------------------------------------------------------------
+DECLASH_MIN_DIST_BU = 0.06   # 6 Å — minimum allowed distance between surfaces
+DECLASH_SOFT_DIST_BU = 0.10  # 10 Å — soft influence radius (smooth falloff)
+
+def _rotate_z90(pts):
+    """Rz(π/2): (x,y,z) → (−y, x, z). Works on (N,3) arrays."""
+    out = np.empty_like(pts)
+    out[:, 0] = -pts[:, 1]
+    out[:, 1] = pts[:, 0]
+    out[:, 2] = pts[:, 2]
+    return out
+
+def _rotate_z90_inv(pts):
+    """Rz(−π/2): (x,y,z) → (y, −x, z). Works on (N,3) arrays."""
+    out = np.empty_like(pts)
+    out[:, 0] = pts[:, 1]
+    out[:, 1] = -pts[:, 0]
+    out[:, 2] = pts[:, 2]
+    return out
+
+def declash_mrna_from_trna(mrna_local, trna_local_list, trna_offsets):
+    """Push mRNA vertices away from tRNA atoms to prevent visual clipping.
+
+    All molecule meshes share rotation_euler = (0, 0, π/2).
+    mRNA has location=(0,0,0); tRNAs have location=trna_offset (world space).
+
+    World coords: Rz(π/2) @ local + location.
+    We transform to world, declash, and transform mRNA back to local.
+
+    Uses soft repulsion: smoothstep falloff from DECLASH_MIN_DIST_BU to
+    DECLASH_SOFT_DIST_BU so there's no hard pop at the boundary.
+
+    Args:
+        mrna_local: (N,3) mRNA vertex positions in local/object space
+        trna_local_list: list of (M,3) tRNA vertex positions in local space
+        trna_offsets: list of (3,) tRNA world-space location offsets
+    Returns:
+        (N,3) declashed mRNA positions in local space (modified in-place)
+    """
+    from scipy.spatial import cKDTree
+
+    # Collect all tRNA world-space positions
+    trna_world_parts = []
+    for trna_local, offset in zip(trna_local_list, trna_offsets):
+        trna_world_parts.append(_rotate_z90(trna_local) + offset)
+    if not trna_world_parts:
+        return mrna_local
+    trna_world = np.concatenate(trna_world_parts, axis=0)
+
+    # mRNA to world (location is origin)
+    mrna_world = _rotate_z90(mrna_local)
+
+    # KDTree query: find nearest tRNA atom for each mRNA vertex
+    tree = cKDTree(trna_world)
+    dists, idxs = tree.query(mrna_world, k=1)
+
+    affect = dists < DECLASH_SOFT_DIST_BU
+    if not np.any(affect):
+        return mrna_local
+
+    # Compute push with smoothstep falloff
+    ad = dists[affect]
+    nearest = trna_world[idxs[affect]]
+    vecs = mrna_world[affect] - nearest
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    vecs /= norms  # unit direction away from tRNA
+
+    # smoothstep: t=0 at min_dist (full push), t=1 at soft_dist (no push)
+    t = np.clip((ad - DECLASH_MIN_DIST_BU) / (DECLASH_SOFT_DIST_BU - DECLASH_MIN_DIST_BU), 0, 1)
+    t_smooth = t * t * (3 - 2 * t)
+
+    # Target distance: at least DECLASH_MIN_DIST_BU, blending to actual dist at soft boundary
+    target = DECLASH_MIN_DIST_BU + (ad - DECLASH_MIN_DIST_BU) * t_smooth
+    target = np.maximum(target, DECLASH_MIN_DIST_BU)  # never closer than min
+
+    mrna_world[affect] = nearest + vecs * target[:, np.newaxis]
+
+    n_hard = np.sum(ad < DECLASH_MIN_DIST_BU)
+    if n_hard > 0:
+        worst = (DECLASH_MIN_DIST_BU - ad[ad < DECLASH_MIN_DIST_BU].min()) / ANG_TO_BU
+        print(f"    declash: {n_hard} hard + {np.sum(affect) - n_hard} soft "
+              f"(worst overlap {worst:.1f} Å)")
+
+    # Transform back to local space
+    mrna_local[:] = _rotate_z90_inv(mrna_world)
+    return mrna_local
 
 
 # ---------------------------------------------------------------------------
@@ -1480,7 +1577,38 @@ def main():
                     mrna_pos = apply_md_deltas_to_mesh(
                         mrna_pos, mrna_mesh_res_ids, mrna_deltas, md_mrna.residue_ids)
 
-            # Distribute computed positions to mesh objects
+            # --- Compute tRNA positions BEFORE mRNA distribution (for declash) ---
+            # P-site tRNA local vertex positions
+            md_trna_p = md_sims.get('trna_p')
+            if md_trna_p is not None:
+                raw_deltas = md_trna_p.step_and_get_deltas(global_frame)
+                trna_p_deltas = md_trna_p.get_blended_deltas(
+                    global_frame, TOTAL_FRAMES, raw_deltas)
+                trna_p_pos = apply_md_deltas_to_mesh(
+                    orig_verts[obj_trna_p.name], trna_p_mesh_res_ids,
+                    trna_p_deltas, md_trna_p.residue_ids)
+            else:
+                trna_p_pos = orig_verts[obj_trna_p.name].copy()
+
+            # A-site tRNA local vertex positions
+            md_trna_a = md_sims.get('trna_a')
+            if md_trna_a is not None:
+                raw_deltas = md_trna_a.step_and_get_deltas(global_frame)
+                trna_a_deltas = md_trna_a.get_blended_deltas(
+                    global_frame, TOTAL_FRAMES, raw_deltas)
+                trna_a_pos = apply_md_deltas_to_mesh(
+                    orig_verts[obj_trna_a.name], trna_a_mesh_res_ids,
+                    trna_a_deltas, md_trna_a.residue_ids)
+            else:
+                trna_a_pos = orig_verts[obj_trna_a.name].copy()
+
+            # --- Declash: push mRNA vertices away from tRNA atoms ---
+            mrna_pos = declash_mrna_from_trna(
+                mrna_pos,
+                [trna_p_pos, trna_a_pos],
+                [np.array(trna_p_d), np.array(trna_a_d)])
+
+            # Distribute computed mRNA positions to mesh objects
             if mrna_seg_data:
                 # Split concatenated mrna_pos back to per-segment meshes
                 vert_offset = 0
@@ -1494,37 +1622,15 @@ def main():
                 obj_mrna.data.vertices.foreach_set('co', mrna_pos.ravel())
                 obj_mrna.data.update()
 
-            # --- P-site tRNA: choreographic position + MD thermal ---
+            # --- P-site tRNA: set mesh + choreographic position ---
             obj_trna_p.location = tuple(trna_p_d)
             obj_trna_p.rotation_euler = (0, 0, math.pi / 2)
-
-            md_trna_p = md_sims.get('trna_p')
-            if md_trna_p is not None:
-                raw_deltas = md_trna_p.step_and_get_deltas(global_frame)
-                trna_p_deltas = md_trna_p.get_blended_deltas(
-                    global_frame, TOTAL_FRAMES, raw_deltas)
-                trna_p_pos = apply_md_deltas_to_mesh(
-                    orig_verts[obj_trna_p.name], trna_p_mesh_res_ids,
-                    trna_p_deltas, md_trna_p.residue_ids)
-            else:
-                trna_p_pos = orig_verts[obj_trna_p.name]
             obj_trna_p.data.vertices.foreach_set('co', trna_p_pos.ravel())
             obj_trna_p.data.update()
 
-            # --- A-site tRNA: choreographic position + MD thermal ---
+            # --- A-site tRNA: set mesh + choreographic position ---
             obj_trna_a.location = tuple(trna_a_d)
             obj_trna_a.rotation_euler = (0, 0, math.pi / 2)
-
-            md_trna_a = md_sims.get('trna_a')
-            if md_trna_a is not None:
-                raw_deltas = md_trna_a.step_and_get_deltas(global_frame)
-                trna_a_deltas = md_trna_a.get_blended_deltas(
-                    global_frame, TOTAL_FRAMES, raw_deltas)
-                trna_a_pos = apply_md_deltas_to_mesh(
-                    orig_verts[obj_trna_a.name], trna_a_mesh_res_ids,
-                    trna_a_deltas, md_trna_a.residue_ids)
-            else:
-                trna_a_pos = orig_verts[obj_trna_a.name]
             obj_trna_a.data.vertices.foreach_set('co', trna_a_pos.ravel())
             obj_trna_a.data.update()
 
