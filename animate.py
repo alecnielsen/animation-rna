@@ -1,10 +1,11 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
-v20: Curved tRNA entry/exit paths with easing.
+v20: Curved tRNA entry/exit paths with per-cycle variety.
 - Catmull-Rom spline paths replace straight-line lerps for tRNA delivery and departure
 - Entry swoops in from above+lateral; exit lifts away in opposite lateral direction
-- Smoothstep easing on all motion phases (entry, translocation, departure, mRNA shift)
-- ENTRY_PATH / DEPART_PATH waypoint arrays + eval_catmull_rom() spline evaluator
+- Per-cycle randomized path jitter (seeded RNG) so each tRNA takes a unique trajectory
+- Closer waypoints (~2x PA_VEC) keep more of the path on-camera
+- Smoothstep easing on all motion phases; --frames=N CLI override for temporal resolution
 
 v19: Per-frame tRNA-mRNA declash.
 - KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms at the decoding center
@@ -110,6 +111,11 @@ else:
     FRAMES_PER_CYCLE = 12  # production: 12 frames/cycle @ 24fps = 2 AA/s
     SAMPLES = 64
 
+# CLI override for frames per cycle (useful for testing tRNA path smoothness)
+for arg in sys.argv:
+    if arg.startswith("--frames="):
+        FRAMES_PER_CYCLE = int(arg.split("=", 1)[1])
+
 TOTAL_FRAMES = N_CYCLES * FRAMES_PER_CYCLE
 FPS = 24
 
@@ -150,29 +156,65 @@ PA_VEC = np.array((-2.51, 1.86, 0.05))       # P-site to A-site direction
 EP_VEC = -PA_VEC                               # A-site to P-site = E to P direction
 CODON_SHIFT = np.array((-0.75, 0.35, -0.56))  # one codon mRNA advance
 
-ENTRY_OFFSET = 3.0 * PA_VEC   # starting position for incoming tRNA (legacy)
-DEPART_OFFSET = 3.0 * EP_VEC  # departure position for leaving tRNA (legacy)
-
 # Direction perpendicular to PA_VEC in XY plane (for lateral entry/exit variety)
 _pa_xy = np.array([PA_VEC[0], PA_VEC[1], 0.0])
 _pa_xy_norm = _pa_xy / np.linalg.norm(_pa_xy)
 LATERAL_VEC = np.array([_pa_xy_norm[1], -_pa_xy_norm[0], 0.0])  # 90° CW in XY
+UP_VEC = np.array([0.0, 0.0, 1.0])
 
-# Curved entry path: tRNA swoops in from above-lateral toward A-site
-ENTRY_PATH = np.array([
-    PA_VEC * 4.0 + np.array([0, 0, 2.5]) + LATERAL_VEC * 3.0,  # far, high, lateral
-    PA_VEC * 2.0 + np.array([0, 0, 1.5]) + LATERAL_VEC * 1.0,  # approaching
-    PA_VEC * 1.1 + np.array([0, 0, 0.3]),                        # near A-site, descending
-    PA_VEC.copy(),                                                  # A-site
+# Base entry path: tRNA swoops in from above-lateral toward A-site
+# Waypoints kept within ~2x PA_VEC so most of the path is on-camera
+ENTRY_PATH_BASE = np.array([
+    PA_VEC * 2.0 + UP_VEC * 1.5 + LATERAL_VEC * 1.5,  # visible near edge, elevated
+    PA_VEC * 1.5 + UP_VEC * 0.8 + LATERAL_VEC * 0.5,  # approaching
+    PA_VEC * 1.1 + UP_VEC * 0.15,                       # near A-site, descending
+    PA_VEC.copy(),                                        # A-site (fixed)
 ])
 
-# Curved departure path: tRNA lifts away from E-site in opposite lateral direction
-DEPART_PATH = np.array([
-    EP_VEC.copy(),                                                  # E-site
-    EP_VEC * 1.2 + np.array([0, 0, 0.5]) - LATERAL_VEC * 0.5,   # lifting off
-    EP_VEC * 2.5 + np.array([0, 0, 2.0]) - LATERAL_VEC * 2.0,   # climbing away
-    EP_VEC * 4.0 + np.array([0, 0, 3.0]) - LATERAL_VEC * 3.5,   # far, high, opposite side
+# Base departure path: tRNA lifts away from E-site in opposite lateral direction
+DEPART_PATH_BASE = np.array([
+    EP_VEC.copy(),                                        # E-site (fixed)
+    EP_VEC * 1.1 + UP_VEC * 0.3 - LATERAL_VEC * 0.3,   # lifting off
+    EP_VEC * 1.5 + UP_VEC * 1.0 - LATERAL_VEC * 1.0,   # climbing away
+    EP_VEC * 2.0 + UP_VEC * 1.8 - LATERAL_VEC * 2.0,   # near edge, elevated
 ])
+
+# Per-cycle path randomization amplitude (BU)
+PATH_JITTER_LATERAL = 1.0  # lateral spread
+PATH_JITTER_VERTICAL = 0.6  # vertical spread
+PATH_JITTER_ALONG = 0.5     # along PA direction
+
+
+def get_cycle_paths(cycle):
+    """Generate per-cycle randomized entry/exit waypoints.
+
+    Each cycle gets a deterministic but unique path by seeding an RNG
+    with the cycle number. Endpoints (A-site, E-site) stay fixed;
+    intermediate and far waypoints are jittered.
+    """
+    rng = np.random.RandomState(seed=cycle * 137 + 42)
+
+    entry = ENTRY_PATH_BASE.copy()
+    depart = DEPART_PATH_BASE.copy()
+
+    # Jitter entry waypoints 0-2 (keep index 3 = A-site fixed)
+    for i in range(3):
+        # Stronger jitter for farther waypoints
+        scale = 1.0 - i * 0.3  # 1.0, 0.7, 0.4
+        entry[i] += (
+            rng.uniform(-1, 1) * PATH_JITTER_LATERAL * scale * LATERAL_VEC +
+            rng.uniform(-1, 1) * PATH_JITTER_VERTICAL * scale * UP_VEC +
+            rng.uniform(-1, 1) * PATH_JITTER_ALONG * scale * _pa_xy_norm)
+
+    # Jitter departure waypoints 1-3 (keep index 0 = E-site fixed)
+    for i in range(1, 4):
+        scale = (i / 3.0)  # 0.33, 0.67, 1.0
+        depart[i] += (
+            rng.uniform(-1, 1) * PATH_JITTER_LATERAL * scale * LATERAL_VEC +
+            rng.uniform(-1, 1) * PATH_JITTER_VERTICAL * scale * UP_VEC +
+            rng.uniform(-1, 1) * PATH_JITTER_ALONG * scale * _pa_xy_norm)
+
+    return entry, depart
 
 RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
@@ -754,10 +796,11 @@ class MolecularDynamics:
 #   Phase 5: TRANSLOCATION    f144-f192 (20%)
 #   Phase 6: tRNA DEPARTURE   f192-f240 (20%)
 # ---------------------------------------------------------------------------
-def get_positions(local_frame):
+def get_positions(local_frame, cycle=0):
     """Return (mRNA_delta, tRNA_P_delta, tRNA_A_delta) for one cycle.
 
     local_frame: frame index within a single cycle (0 to FRAMES_PER_CYCLE-1).
+    cycle: cycle number (used for per-cycle path randomization).
     All deltas are relative to the object's crystallographic pose (0 = no movement).
     Does NOT include cumulative offsets -- caller adds those.
     """
@@ -771,6 +814,9 @@ def get_positions(local_frame):
 
     zero = np.zeros(3)
 
+    # Per-cycle randomized paths
+    entry_path, depart_path = get_cycle_paths(cycle)
+
     # --- mRNA (translation only, no rotation) ---
     if local_frame < f144:
         mrna_delta = zero.copy()
@@ -783,7 +829,7 @@ def get_positions(local_frame):
     # --- P-site tRNA ---
     # Phases 1-4: stationary at P-site
     # Phase 5 (translocation): eased move P→E
-    # Phase 6 (departure): curved Catmull-Rom exit path
+    # Phase 6 (departure): curved Catmull-Rom exit path (per-cycle randomized)
     if local_frame < f144:
         trna_p_delta = zero.copy()
     elif local_frame < f192:
@@ -791,21 +837,21 @@ def get_positions(local_frame):
         trna_p_delta = lerp(zero, EP_VEC, t)
     elif local_frame < f240:
         t = smoothstep(frame_t(local_frame, f192, f240))
-        trna_p_delta = eval_catmull_rom(DEPART_PATH, t)
+        trna_p_delta = eval_catmull_rom(depart_path, t)
     else:
-        trna_p_delta = DEPART_PATH[-1].copy()
+        trna_p_delta = depart_path[-1].copy()
 
     # --- A-site tRNA ---
     # Phase 1 (establish): waiting at far entry position
-    # Phase 2 (delivery): curved Catmull-Rom approach to A-site
+    # Phase 2 (delivery): curved Catmull-Rom approach to A-site (per-cycle randomized)
     # Phase 3 (accommodation): stationary at A-site
     # Phase 5 (translocation): eased move A→P
     # Phase 6: stationary at P-site (now the new P-site tRNA)
     if local_frame < f12:
-        trna_a_delta = ENTRY_PATH[0].copy()
+        trna_a_delta = entry_path[0].copy()
     elif local_frame < f96:
         t = smoothstep(frame_t(local_frame, f12, f96))
-        trna_a_delta = eval_catmull_rom(ENTRY_PATH, t)
+        trna_a_delta = eval_catmull_rom(entry_path, t)
     elif local_frame < f144:
         trna_a_delta = PA_VEC.copy()
     elif local_frame < f192:
@@ -1589,7 +1635,7 @@ def main():
                   f"(global {global_frame}/{TOTAL_FRAMES - 1}) ---")
 
             # Single-cycle choreographic deltas (tRNA only; mRNA handled in vertex space)
-            _, trna_p_d, trna_a_d = get_positions(local_frame)
+            _, trna_p_d, trna_a_d = get_positions(local_frame, cycle)
 
             # --- Ribosome: static pose + optional pre-computed thermal ---
             obj_surface.location = (0, 0, 0)

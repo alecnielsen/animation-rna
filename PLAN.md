@@ -284,13 +284,14 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] 456-frame production render (1920×1080, 128 samples) complete
 
 ### v20 (complete)
-- [x] Curved tRNA entry/exit paths with easing
+- [x] Curved tRNA entry/exit paths with per-cycle variety
   - [x] Catmull-Rom spline paths (4 waypoints each) replace straight-line lerps
   - [x] Entry: tRNA swoops in from above + laterally offset toward A-site
   - [x] Exit: tRNA lifts away from E-site in opposite lateral direction (visually distinct from entry)
+  - [x] Per-cycle randomized path jitter via `get_cycle_paths(cycle)` — seeded RNG perturbs intermediate waypoints (±1 BU lateral, ±0.6 BU vertical, ±0.5 BU along-axis) while keeping A-site/E-site endpoints fixed
+  - [x] Closer waypoints (~2× PA_VEC instead of ~4×) so most of the tRNA path is visible on-camera
   - [x] `smoothstep()` easing on all motion phases (delivery, translocation, departure, mRNA shift)
-  - [x] `eval_catmull_rom()` general-purpose spline evaluator + ENTRY_PATH / DEPART_PATH waypoint arrays
-  - [x] LATERAL_VEC computed perpendicular to PA_VEC in XY plane for lateral variety
+  - [x] `--frames=N` CLI override for testing temporal resolution independently of debug/prod mode
 
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
