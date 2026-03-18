@@ -1,5 +1,11 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v20: Curved tRNA entry/exit paths with easing.
+- Catmull-Rom spline paths replace straight-line lerps for tRNA delivery and departure
+- Entry swoops in from above+lateral; exit lifts away in opposite lateral direction
+- Smoothstep easing on all motion phases (entry, translocation, departure, mRNA shift)
+- ENTRY_PATH / DEPART_PATH waypoint arrays + eval_catmull_rom() spline evaluator
+
 v19: Per-frame tRNA-mRNA declash.
 - KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms at the decoding center
 - Smoothstep falloff (6–10 Å) prevents visual clipping without pop artifacts
@@ -144,8 +150,29 @@ PA_VEC = np.array((-2.51, 1.86, 0.05))       # P-site to A-site direction
 EP_VEC = -PA_VEC                               # A-site to P-site = E to P direction
 CODON_SHIFT = np.array((-0.75, 0.35, -0.56))  # one codon mRNA advance
 
-ENTRY_OFFSET = 3.0 * PA_VEC   # starting position for incoming tRNA
-DEPART_OFFSET = 3.0 * EP_VEC  # departure position for leaving tRNA
+ENTRY_OFFSET = 3.0 * PA_VEC   # starting position for incoming tRNA (legacy)
+DEPART_OFFSET = 3.0 * EP_VEC  # departure position for leaving tRNA (legacy)
+
+# Direction perpendicular to PA_VEC in XY plane (for lateral entry/exit variety)
+_pa_xy = np.array([PA_VEC[0], PA_VEC[1], 0.0])
+_pa_xy_norm = _pa_xy / np.linalg.norm(_pa_xy)
+LATERAL_VEC = np.array([_pa_xy_norm[1], -_pa_xy_norm[0], 0.0])  # 90° CW in XY
+
+# Curved entry path: tRNA swoops in from above-lateral toward A-site
+ENTRY_PATH = np.array([
+    PA_VEC * 4.0 + np.array([0, 0, 2.5]) + LATERAL_VEC * 3.0,  # far, high, lateral
+    PA_VEC * 2.0 + np.array([0, 0, 1.5]) + LATERAL_VEC * 1.0,  # approaching
+    PA_VEC * 1.1 + np.array([0, 0, 0.3]),                        # near A-site, descending
+    PA_VEC.copy(),                                                  # A-site
+])
+
+# Curved departure path: tRNA lifts away from E-site in opposite lateral direction
+DEPART_PATH = np.array([
+    EP_VEC.copy(),                                                  # E-site
+    EP_VEC * 1.2 + np.array([0, 0, 0.5]) - LATERAL_VEC * 0.5,   # lifting off
+    EP_VEC * 2.5 + np.array([0, 0, 2.0]) - LATERAL_VEC * 2.0,   # climbing away
+    EP_VEC * 4.0 + np.array([0, 0, 3.0]) - LATERAL_VEC * 3.5,   # far, high, opposite side
+])
 
 RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
@@ -400,6 +427,41 @@ def set_bg(scene, color, strength):
 def lerp(a, b, t):
     """Linear interpolation between vectors a and b, t in [0, 1]."""
     return a + (b - a) * np.clip(t, 0, 1)
+
+
+def smoothstep(t):
+    """Hermite ease-in-out: 0→1 with zero derivative at endpoints."""
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def eval_catmull_rom(waypoints, t):
+    """Evaluate Catmull-Rom spline through waypoints at parameter t in [0,1].
+
+    waypoints: (N, 3) array of control points (spline passes through all).
+    t: scalar in [0, 1].
+    Returns: (3,) interpolated position.
+    """
+    n = len(waypoints)
+    if n < 2:
+        return waypoints[0].copy()
+    # Map t to segment
+    t_scaled = np.clip(t, 0.0, 1.0) * (n - 1)
+    seg = int(np.floor(t_scaled))
+    seg = min(seg, n - 2)
+    lt = t_scaled - seg
+    # 4 control points (clamp at boundaries)
+    p0 = waypoints[max(seg - 1, 0)]
+    p1 = waypoints[seg]
+    p2 = waypoints[min(seg + 1, n - 1)]
+    p3 = waypoints[min(seg + 2, n - 1)]
+    lt2 = lt * lt
+    lt3 = lt2 * lt
+    return 0.5 * (
+        2 * p1 +
+        (-p0 + p2) * lt +
+        (2*p0 - 5*p1 + 4*p2 - p3) * lt2 +
+        (-p0 + 3*p1 - 3*p2 + p3) * lt3)
 
 
 def frame_t(frame, start, end):
@@ -713,33 +775,41 @@ def get_positions(local_frame):
     if local_frame < f144:
         mrna_delta = zero.copy()
     elif local_frame < f192:
-        t = frame_t(local_frame, f144, f192)
+        t = smoothstep(frame_t(local_frame, f144, f192))
         mrna_delta = lerp(zero, CODON_SHIFT, t)
     else:
         mrna_delta = CODON_SHIFT.copy()
 
     # --- P-site tRNA ---
+    # Phases 1-4: stationary at P-site
+    # Phase 5 (translocation): eased move P→E
+    # Phase 6 (departure): curved Catmull-Rom exit path
     if local_frame < f144:
         trna_p_delta = zero.copy()
     elif local_frame < f192:
-        t = frame_t(local_frame, f144, f192)
+        t = smoothstep(frame_t(local_frame, f144, f192))
         trna_p_delta = lerp(zero, EP_VEC, t)
     elif local_frame < f240:
-        t = frame_t(local_frame, f192, f240)
-        trna_p_delta = lerp(EP_VEC, EP_VEC + DEPART_OFFSET, t)
+        t = smoothstep(frame_t(local_frame, f192, f240))
+        trna_p_delta = eval_catmull_rom(DEPART_PATH, t)
     else:
-        trna_p_delta = EP_VEC + DEPART_OFFSET
+        trna_p_delta = DEPART_PATH[-1].copy()
 
     # --- A-site tRNA ---
+    # Phase 1 (establish): waiting at far entry position
+    # Phase 2 (delivery): curved Catmull-Rom approach to A-site
+    # Phase 3 (accommodation): stationary at A-site
+    # Phase 5 (translocation): eased move A→P
+    # Phase 6: stationary at P-site (now the new P-site tRNA)
     if local_frame < f12:
-        trna_a_delta = PA_VEC + ENTRY_OFFSET
+        trna_a_delta = ENTRY_PATH[0].copy()
     elif local_frame < f96:
-        t = frame_t(local_frame, f12, f96)
-        trna_a_delta = lerp(PA_VEC + ENTRY_OFFSET, PA_VEC, t)
+        t = smoothstep(frame_t(local_frame, f12, f96))
+        trna_a_delta = eval_catmull_rom(ENTRY_PATH, t)
     elif local_frame < f144:
         trna_a_delta = PA_VEC.copy()
     elif local_frame < f192:
-        t = frame_t(local_frame, f144, f192)
+        t = smoothstep(frame_t(local_frame, f144, f192))
         trna_a_delta = lerp(PA_VEC, zero, t)
     else:
         trna_a_delta = zero.copy()

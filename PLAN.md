@@ -283,6 +283,15 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 - [x] Per-frame vertex distribution: compute full mRNA positions, then slice to segment meshes
 - [x] 456-frame production render (1920×1080, 128 samples) complete
 
+### v20 (complete)
+- [x] Curved tRNA entry/exit paths with easing
+  - [x] Catmull-Rom spline paths (4 waypoints each) replace straight-line lerps
+  - [x] Entry: tRNA swoops in from above + laterally offset toward A-site
+  - [x] Exit: tRNA lifts away from E-site in opposite lateral direction (visually distinct from entry)
+  - [x] `smoothstep()` easing on all motion phases (delivery, translocation, departure, mRNA shift)
+  - [x] `eval_catmull_rom()` general-purpose spline evaluator + ENTRY_PATH / DEPART_PATH waypoint arrays
+  - [x] LATERAL_VEC computed perpendicular to PA_VEC in XY plane for lateral variety
+
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
   - [x] `declash_mrna_from_trna()`: KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms
