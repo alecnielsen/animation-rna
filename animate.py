@@ -1,7 +1,7 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
 v20: Straight-line tRNA flight from random positions on left/right frame edges.
-- Constant speed entry/exit (no easing) — tRNA flies in and stops at A-site, then flies out
+- Constant speed on ALL tRNA motion (no easing anywhere) — linear interpolation throughout
 - Per-cycle random endpoints: ±4 BU lateral, ±2.5 BU vertical spread across frame edges
 - 8 BU flight distance along PA/EP direction guarantees off-screen start/end
 - --frames=N CLI override for temporal resolution
@@ -786,12 +786,12 @@ def get_positions(local_frame, cycle=0):
 
     # --- P-site tRNA ---
     # Phases 1-4: stationary at P-site
-    # Phase 5 (translocation): eased P→E
+    # Phase 5 (translocation): constant speed P→E
     # Phase 6 (departure): constant speed flight to off-screen
     if local_frame < f144:
         trna_p_delta = zero.copy()
     elif local_frame < f192:
-        t = smoothstep(frame_t(local_frame, f144, f192))
+        t = frame_t(local_frame, f144, f192)
         trna_p_delta = lerp(zero, EP_VEC, t)
     elif local_frame < f240:
         t = frame_t(local_frame, f192, f240)
@@ -802,7 +802,7 @@ def get_positions(local_frame, cycle=0):
     # --- A-site tRNA ---
     # Phases 1+2 (f0→f96): constant speed flight from off-screen to A-site
     # Phase 3+4: stationary at A-site
-    # Phase 5 (translocation): eased A→P
+    # Phase 5 (translocation): constant speed A→P
     # Phase 6: stationary at P-site (now the new P-site tRNA)
     if local_frame < f96:
         t = frame_t(local_frame, f0, f96)
@@ -810,7 +810,7 @@ def get_positions(local_frame, cycle=0):
     elif local_frame < f144:
         trna_a_delta = PA_VEC.copy()
     elif local_frame < f192:
-        t = smoothstep(frame_t(local_frame, f144, f192))
+        t = frame_t(local_frame, f144, f192)
         trna_a_delta = lerp(PA_VEC, zero, t)
     else:
         trna_a_delta = zero.copy()
