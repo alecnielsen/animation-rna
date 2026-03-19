@@ -1,10 +1,10 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
-v20: Smooth tRNA entry/exit arcs with per-cycle variety.
-- arc_lerp(): linear interp + sin(πt) perpendicular offset for clean single-arc swoops
-- Per-cycle randomized paths via get_cycle_arc() — random direction + arc curvature per cycle
-- tRNAs enter/exit from off-frame (8 BU distance); shallow arcs (0.4 BU peak)
-- Smoothstep easing on all motion phases; --frames=N CLI override for temporal resolution
+v20: Straight-line tRNA flight from random positions on left/right frame edges.
+- Constant speed entry/exit (no easing) — tRNA flies in and stops at A-site, then flies out
+- Per-cycle random endpoints: ±4 BU lateral, ±2.5 BU vertical spread across frame edges
+- 8 BU flight distance along PA/EP direction guarantees off-screen start/end
+- --frames=N CLI override for temporal resolution
 
 v19: Per-frame tRNA-mRNA declash.
 - KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms at the decoding center
@@ -155,71 +155,40 @@ PA_VEC = np.array((-2.51, 1.86, 0.05))       # P-site to A-site direction
 EP_VEC = -PA_VEC                               # A-site to P-site = E to P direction
 CODON_SHIFT = np.array((-0.75, 0.35, -0.56))  # one codon mRNA advance
 
+# tRNA flight path configuration
+# Camera ortho scale=10.5 → half-width ~9.3 BU. 8 BU from site guarantees off-frame.
+TRNA_FLIGHT_DIST = 8.0     # BU along PA/EP direction (off-screen distance)
+TRNA_LATERAL_SPREAD = 4.0  # BU random lateral spread (wide variety)
+TRNA_VERTICAL_SPREAD = 2.5 # BU random vertical spread
+
+# Unit vectors along PA and perpendicular (for flight direction + jitter)
+_pa_unit = PA_VEC / np.linalg.norm(PA_VEC)
+_pa_perp = np.array([_pa_unit[1], -_pa_unit[0], 0.0])  # 90° CW in XY
 UP_VEC = np.array([0.0, 0.0, 1.0])
 
-# tRNA arc path configuration
-# Camera ortho scale=10.5 → half-width ~9.3 BU. 8 BU from A/E-site guarantees off-frame.
-TRNA_ENTRY_DIST = 8.0   # BU from A-site to start of entry arc
-TRNA_DEPART_DIST = 8.0  # BU from E-site to end of departure arc
-TRNA_ARC_HEIGHT = 0.4   # BU peak perpendicular offset (shallow arc)
 
+def get_cycle_endpoints(cycle):
+    """Generate per-cycle randomized entry/exit points across left/right edges.
 
-def _random_direction(rng, bias=None, bias_weight=0.3):
-    """Random unit vector on the upper hemisphere, optionally biased."""
-    v = rng.randn(3)
-    v[2] = abs(v[2])  # upper hemisphere (Z >= 0)
-    if bias is not None:
-        v = v + bias_weight * bias / max(np.linalg.norm(bias), 1e-8)
-    return v / np.linalg.norm(v)
+    Entry: random point off-screen to the left (along PA direction).
+    Exit: random point off-screen to the right (along EP direction).
+    Each cycle picks a different spot across the frame edge.
 
-
-def get_cycle_arc(cycle):
-    """Generate per-cycle randomized arc parameters for tRNA entry/exit.
-
-    Each cycle gets deterministic but unique start/end positions and arc
-    curvature via a seeded RNG. A-site and E-site positions are fixed;
-    the far endpoints and arc offsets vary.
-
-    Returns: (entry_start, entry_arc_vec, depart_end, depart_arc_vec)
+    Returns: (entry_start, depart_end)
     """
     rng = np.random.RandomState(seed=cycle * 137 + 42)
 
-    # --- Entry: random start position, biased along PA direction ---
-    entry_dir = _random_direction(rng, bias=PA_VEC)
-    entry_start = PA_VEC + entry_dir * TRNA_ENTRY_DIST
+    entry_start = (PA_VEC
+                   + _pa_unit * TRNA_FLIGHT_DIST
+                   + _pa_perp * rng.uniform(-1, 1) * TRNA_LATERAL_SPREAD
+                   + UP_VEC * rng.uniform(-1, 1) * TRNA_VERTICAL_SPREAD)
 
-    # Arc: perpendicular to the entry line
-    entry_line_n = (PA_VEC - entry_start)
-    entry_line_n = entry_line_n / np.linalg.norm(entry_line_n)
-    perp = rng.randn(3)
-    perp -= perp.dot(entry_line_n) * entry_line_n  # project out parallel
-    pn = np.linalg.norm(perp)
-    perp = perp / pn if pn > 1e-6 else UP_VEC
-    entry_arc_vec = perp * TRNA_ARC_HEIGHT * rng.uniform(0.5, 1.5)
+    depart_end = (EP_VEC
+                  + (-_pa_unit) * TRNA_FLIGHT_DIST
+                  + _pa_perp * rng.uniform(-1, 1) * TRNA_LATERAL_SPREAD
+                  + UP_VEC * rng.uniform(-1, 1) * TRNA_VERTICAL_SPREAD)
 
-    # --- Departure: random end position, biased along EP direction ---
-    depart_dir = _random_direction(rng, bias=EP_VEC)
-    depart_end = EP_VEC + depart_dir * TRNA_DEPART_DIST
-
-    depart_line_n = (depart_end - EP_VEC)
-    depart_line_n = depart_line_n / np.linalg.norm(depart_line_n)
-    perp = rng.randn(3)
-    perp -= perp.dot(depart_line_n) * depart_line_n
-    pn = np.linalg.norm(perp)
-    perp = perp / pn if pn > 1e-6 else UP_VEC
-    depart_arc_vec = perp * TRNA_ARC_HEIGHT * rng.uniform(0.5, 1.5)
-
-    return entry_start, entry_arc_vec, depart_end, depart_arc_vec
-
-
-def arc_lerp(start, end, t, arc_vec):
-    """Interpolate along a smooth arc from start to end.
-
-    Linear interpolation + sinusoidal perpendicular offset.
-    t in [0,1]. arc_vec is the perpendicular offset at peak (t=0.5).
-    """
-    base = start + (end - start) * t
-    return base + np.sin(np.pi * t) * arc_vec
+    return entry_start, depart_end
 
 RIBO_CENTROID = np.array((-23.90, 24.24, 22.56))
 CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
@@ -480,6 +449,18 @@ def smoothstep(t):
     """Hermite ease-in-out: 0→1 with zero derivative at endpoints."""
     t = np.clip(t, 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
+
+
+def ease_out(t):
+    """Deceleration: fast start, slow finish (for tRNA entry)."""
+    t = np.clip(t, 0.0, 1.0)
+    return 1.0 - (1.0 - t) ** 2
+
+
+def ease_in(t):
+    """Acceleration: slow start, fast finish (for tRNA departure)."""
+    t = np.clip(t, 0.0, 1.0)
+    return t * t
 
 
 
@@ -791,8 +772,8 @@ def get_positions(local_frame, cycle=0):
 
     zero = np.zeros(3)
 
-    # Per-cycle randomized arc parameters
-    entry_start, entry_arc, depart_end, depart_arc = get_cycle_arc(cycle)
+    # Per-cycle flight endpoints (straight-line with lateral jitter)
+    entry_start, depart_end = get_cycle_endpoints(cycle)
 
     # --- mRNA (translation only, no rotation) ---
     if local_frame < f144:
@@ -805,30 +786,27 @@ def get_positions(local_frame, cycle=0):
 
     # --- P-site tRNA ---
     # Phases 1-4: stationary at P-site
-    # Phase 5 (translocation): eased move P→E
-    # Phase 6 (departure): arc sweep to random far position
+    # Phase 5 (translocation): eased P→E
+    # Phase 6 (departure): constant speed flight to off-screen
     if local_frame < f144:
         trna_p_delta = zero.copy()
     elif local_frame < f192:
         t = smoothstep(frame_t(local_frame, f144, f192))
         trna_p_delta = lerp(zero, EP_VEC, t)
     elif local_frame < f240:
-        t = smoothstep(frame_t(local_frame, f192, f240))
-        trna_p_delta = arc_lerp(EP_VEC, depart_end, t, depart_arc)
+        t = frame_t(local_frame, f192, f240)
+        trna_p_delta = lerp(EP_VEC, depart_end, t)
     else:
         trna_p_delta = depart_end.copy()
 
     # --- A-site tRNA ---
-    # Phase 1 (establish): waiting at far entry position
-    # Phase 2 (delivery): arc sweep from random far position to A-site
-    # Phase 3 (accommodation): stationary at A-site
-    # Phase 5 (translocation): eased move A→P
+    # Phases 1+2 (f0→f96): constant speed flight from off-screen to A-site
+    # Phase 3+4: stationary at A-site
+    # Phase 5 (translocation): eased A→P
     # Phase 6: stationary at P-site (now the new P-site tRNA)
-    if local_frame < f12:
-        trna_a_delta = entry_start.copy()
-    elif local_frame < f96:
-        t = smoothstep(frame_t(local_frame, f12, f96))
-        trna_a_delta = arc_lerp(entry_start, PA_VEC, t, entry_arc)
+    if local_frame < f96:
+        t = frame_t(local_frame, f0, f96)
+        trna_a_delta = lerp(entry_start, PA_VEC, t)
     elif local_frame < f144:
         trna_a_delta = PA_VEC.copy()
     elif local_frame < f192:
