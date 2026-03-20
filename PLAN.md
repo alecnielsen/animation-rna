@@ -286,6 +286,7 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
 ### v20 (complete)
 - [x] Straight-line tRNA flight from random positions on left/right frame edges
   - [x] Constant speed on ALL tRNA motion (linear interpolation, no easing anywhere)
+  - [x] No A-site stationary phase — tRNA moves continuously from entry through A-site to P-site
   - [x] Per-cycle random endpoints via `get_cycle_endpoints(cycle)`: ±4 BU lateral, ±2.5 BU vertical spread across frame edges — each tRNA takes a visibly different path
   - [x] 8 BU flight distance along PA/EP direction guarantees off-screen start/end
   - [x] No Phase 1 pause: tRNA already in motion from frame 0
