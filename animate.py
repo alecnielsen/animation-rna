@@ -1,5 +1,9 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
+v21: Fix mRNA surface mesh thinning at far ends.
+- apply_mrna_bend() quadratic droop was unbounded — 1800 BU displacement at chain ends
+- Added MRNA_MAX_DROOP = 1.5 BU cap to prevent mesh collapse while preserving natural curve
+
 v20: Straight-line tRNA flight from random positions on left/right frame edges.
 - Constant speed on ALL tRNA motion (no easing anywhere) — linear interpolation throughout
 - Per-cycle random endpoints: ±4 BU lateral, ±2.5 BU vertical spread across frame edges
@@ -199,6 +203,7 @@ INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of 
 # mRNA bend — droop outside the ribosome channel
 MRNA_CHANNEL_HALF_LEN = 1.5   # BU (~150Å) — straight zone around mRNA centroid (ribosome tunnel ~80Å)
 MRNA_BEND_STRENGTH = 0.015    # BU per BU² beyond channel (quadratic droop)
+MRNA_MAX_DROOP = 1.5          # BU maximum droop (prevents mesh collapse at far ends)
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +273,7 @@ def apply_mrna_bend(positions, res_ids, center=None, axis=None):
     d = np.abs(proj) - MRNA_CHANNEL_HALF_LEN
     mask = d > 0
     if np.any(mask):
-        droop_amounts = MRNA_BEND_STRENGTH * d[mask] ** 2
+        droop_amounts = np.minimum(MRNA_BEND_STRENGTH * d[mask] ** 2, MRNA_MAX_DROOP)
         positions[mask] += droop_amounts[:, np.newaxis] * droop_dir
 
     return positions

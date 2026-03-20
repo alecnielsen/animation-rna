@@ -292,6 +292,11 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] No Phase 1 pause: tRNA already in motion from frame 0
   - [x] `--frames=N` CLI override for testing temporal resolution independently of debug/prod mode
 
+### v21 (complete)
+- [x] Fix mRNA surface mesh thinning at far ends
+  - [x] `apply_mrna_bend()` quadratic droop was unbounded — at 348 BU from channel center, displacement reached ~1800 BU, collapsing the mesh
+  - [x] Added `MRNA_MAX_DROOP = 1.5` BU cap via `np.minimum()` — natural curve preserved, mesh stays intact
+
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
   - [x] `declash_mrna_from_trna()`: KDTree-based soft repulsion pushes mRNA vertices away from tRNA atoms
