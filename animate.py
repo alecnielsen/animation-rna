@@ -800,17 +800,14 @@ def get_positions(local_frame, cycle=0):
         trna_p_delta = depart_end.copy()
 
     # --- A-site tRNA ---
-    # Phases 1+2 (f0→f96): constant speed flight from off-screen to A-site
-    # Phase 3+4: stationary at A-site
-    # Phase 5 (translocation): constant speed A→P
-    # Phase 6: stationary at P-site (now the new P-site tRNA)
+    # f0→f96: fly in from off-screen to A-site (constant speed)
+    # f96→f144: immediate translocation A→P (no pause at A-site)
+    # f144+: stationary at P-site (now the new P-site tRNA)
     if local_frame < f96:
         t = frame_t(local_frame, f0, f96)
         trna_a_delta = lerp(entry_start, PA_VEC, t)
     elif local_frame < f144:
-        trna_a_delta = PA_VEC.copy()
-    elif local_frame < f192:
-        t = frame_t(local_frame, f144, f192)
+        t = frame_t(local_frame, f96, f144)
         trna_a_delta = lerp(PA_VEC, zero, t)
     else:
         trna_a_delta = zero.copy()
