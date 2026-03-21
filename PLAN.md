@@ -297,7 +297,9 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] `apply_mrna_bend()` quadratic droop was unbounded — at 348 BU from channel center, displacement reached ~1800 BU, collapsing the mesh
   - [x] Replaced hard cap with `tanh` saturation: `MRNA_MAX_DROOP * tanh(raw / MRNA_MAX_DROOP)` — smooth asymptote, no abrupt stretch transitions
   - [x] `MRNA_MAX_DROOP = 0.5` BU — gentle curve preserved, mesh stays intact
-  - [x] Per-segment `StyleSurface(scale_radius=...)` to equalize mRNA thickness — seg0 (5' end) has 20% narrower cross-section from MD relaxation, compensated by boosting MN's Gaussian probe radius (1.87 vs default 1.5)
+  - [x] Per-segment `StyleSurface(scale_radius=...)` + PDB-level radial inflation to equalize mRNA thickness
+  - [x] Root cause: 5' end relaxes into tighter conformation during MD (13.6 Å vs 17.0 Å cross-section)
+  - [ ] TODO: add cross-section restraint to `build_extended_mrna.py` MD relaxation and rebuild pipeline
 
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center

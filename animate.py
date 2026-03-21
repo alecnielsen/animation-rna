@@ -201,7 +201,7 @@ CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of tunnel)
 
 # mRNA cross-section equalization: target radial spread for surface mesh thickness
-MRNA_TARGET_CROSS_BU = 0.17  # BU (~17 Å, matches widest segment's natural spread)
+MRNA_TARGET_CROSS_BU = 0.30  # BU (~30 Å, aggressive inflation for uniform thickness)
 
 # mRNA bend — droop outside the ribosome channel
 MRNA_CHANNEL_HALF_LEN = 1.5   # BU (~150Å) — straight zone around mRNA centroid (ribosome tunnel ~80Å)
@@ -1087,6 +1087,30 @@ def _split_mrna_pdb(in_pdb, n_segments=N_MRNA_SEGMENTS):
         print(f"    Segment {i}: residues {seg_res[0]}-{seg_res[-1]} "
               f"({len(seg_res)} res, {len(seg_atoms)} atoms) -> {seg_path}")
 
+    # Inflate thin segments in PDB BEFORE MN loads them.
+    # MN's GN surface uses original PDB atom positions, not foreach_set'd vertices.
+    target_a = MRNA_TARGET_CROSS_BU / ANG_TO_BU  # BU -> Å
+    for i, (seg_path, start, n_seg_res) in enumerate(segments):
+        pdb_s = BiotitePDB.read(seg_path)
+        arr_s = pdb_s.get_structure(model=1)
+        if isinstance(arr_s, AtomArrayStack):
+            arr_s = arr_s[0]
+        coords = arr_s.coord
+        centroid = coords.mean(axis=0)
+        centered = coords - centroid
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        seg_axis = vt[0]
+        proj_along = (centered @ seg_axis)[:, np.newaxis] * seg_axis
+        radial = centered - proj_along
+        mean_spread = np.linalg.norm(radial, axis=1).mean()
+        if mean_spread < target_a and mean_spread > 1.0:
+            scale = target_a / mean_spread
+            arr_s.coord = centroid + proj_along + radial * scale
+            seg_pdb_out = BiotitePDB()
+            seg_pdb_out.set_structure(arr_s)
+            seg_pdb_out.write(seg_path)
+            print(f"    Segment {i}: inflated PDB {mean_spread:.1f}->{target_a:.1f} Å ({scale:.2f}x)")
+
     return segments
 
 
@@ -1243,7 +1267,7 @@ def main():
             mol = mn.Molecule.load(seg_path)
             # Scale up probe radius for narrower segments to equalize thickness
             radius_boost = max_spread / max(seg_spreads[idx], 1.0)
-            sr = 1.5 * radius_boost  # default scale_radius=1.5
+            sr = 1.5 * radius_boost ** 3  # cube the boost — straightness requires aggressive compensation
             if radius_boost > 1.01:
                 print(f"    Segment {idx}: scale_radius={sr:.2f} "
                       f"(boost {radius_boost:.2f}x for {seg_spreads[idx]:.1f} Å spread)")
