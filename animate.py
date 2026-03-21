@@ -282,6 +282,7 @@ def apply_mrna_bend(positions, res_ids, center=None, axis=None):
     return positions
 
 
+
 # ---------------------------------------------------------------------------
 # tRNA-mRNA declash: push mRNA vertices away from tRNA atoms
 # ---------------------------------------------------------------------------
