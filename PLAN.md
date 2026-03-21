@@ -293,9 +293,11 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] `--frames=N` CLI override for testing temporal resolution independently of debug/prod mode
 
 ### v21 (complete)
-- [x] Fix mRNA surface mesh thinning at far ends
+- [x] Fix mRNA surface mesh collapse at far ends
   - [x] `apply_mrna_bend()` quadratic droop was unbounded — at 348 BU from channel center, displacement reached ~1800 BU, collapsing the mesh
-  - [x] Added `MRNA_MAX_DROOP = 1.5` BU cap via `np.minimum()` — natural curve preserved, mesh stays intact
+  - [x] Replaced hard cap with `tanh` saturation: `MRNA_MAX_DROOP * tanh(raw / MRNA_MAX_DROOP)` — smooth asymptote, no abrupt stretch transitions
+  - [x] `MRNA_MAX_DROOP = 0.5` BU — gentle curve preserved, mesh stays intact
+  - [x] Note: seg0 (5' end, upper right) has 20% narrower cross-section (13.6 Å vs 17.0 Å) baked into PDB from MD relaxation — would require re-relaxation to fully fix
 
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
