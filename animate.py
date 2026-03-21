@@ -1,8 +1,8 @@
 """Animate seamless-looping ribosome translation with repeating folded domains.
 
-v21: Fix mRNA surface mesh collapse at far ends.
-- apply_mrna_bend() quadratic droop was unbounded — 1800 BU displacement at chain ends
-- Replaced with tanh saturation (MRNA_MAX_DROOP=0.5 BU) — smooth asymptote, no mesh collapse
+v21: Fix mRNA surface mesh thickness uniformity.
+- apply_mrna_bend() quadratic droop was unbounded — replaced with tanh saturation (0.5 BU cap)
+- Per-segment StyleSurface(scale_radius) to equalize cross-section (seg0 boosted 1.25x)
 
 v20: Straight-line tRNA flight from random positions on left/right frame edges.
 - Constant speed on ALL tRNA motion (no easing anywhere) — linear interpolation throughout
@@ -199,6 +199,9 @@ CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 
 # Polypeptide (legacy progressive reveal kept for fallback)
 INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of tunnel)
+
+# mRNA cross-section equalization: target radial spread for surface mesh thickness
+MRNA_TARGET_CROSS_BU = 0.17  # BU (~17 Å, matches widest segment's natural spread)
 
 # mRNA bend — droop outside the ribosome channel
 MRNA_CHANNEL_HALF_LEN = 1.5   # BU (~150Å) — straight zone around mRNA centroid (ribosome tunnel ~80Å)
@@ -1214,11 +1217,38 @@ def main():
     if MOL_STYLE == "surface":
         print("  Splitting mRNA for surface mesh...")
         mrna_segments_info = _split_mrna_pdb("extended_mrna.pdb")
-        mrna_seg_mols = []
+        from molecularnodes.nodes.styles import StyleSurface
+
+        # Measure per-segment cross-section to determine scale_radius boost
+        from biotite.structure.io.pdb import PDBFile as _PDB
+        from biotite.structure import AtomArrayStack as _AAS
+        seg_spreads = []
         for seg_path, _, _ in mrna_segments_info:
+            _p = _PDB.read(seg_path)
+            _a = _p.get_structure(model=1)
+            if isinstance(_a, _AAS):
+                _a = _a[0]
+            _c = _a.coord
+            _cent = _c.mean(axis=0)
+            _centered = _c - _cent
+            _, _, _vt = np.linalg.svd(_centered, full_matrices=False)
+            _ax = _vt[0]
+            _proj = (_centered @ _ax)[:, np.newaxis] * _ax
+            _rad = _centered - _proj
+            seg_spreads.append(np.linalg.norm(_rad, axis=1).mean())
+        max_spread = max(seg_spreads)
+
+        mrna_seg_mols = []
+        for idx, (seg_path, _, _) in enumerate(mrna_segments_info):
             mol = mn.Molecule.load(seg_path)
+            # Scale up probe radius for narrower segments to equalize thickness
+            radius_boost = max_spread / max(seg_spreads[idx], 1.0)
+            sr = 1.5 * radius_boost  # default scale_radius=1.5
+            if radius_boost > 1.01:
+                print(f"    Segment {idx}: scale_radius={sr:.2f} "
+                      f"(boost {radius_boost:.2f}x for {seg_spreads[idx]:.1f} Å spread)")
             mol.add_style(
-                style="surface",
+                style=StyleSurface(scale_radius=sr),
                 material=make_solid_material((0.05, 0.25, 0.95)),
                 name=f"mRNA_{os.path.basename(seg_path).replace('.pdb','')}",
             )
