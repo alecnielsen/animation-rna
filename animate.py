@@ -201,7 +201,7 @@ CAMERA_ORBIT_DEGREES = 0  # disabled while iterating
 INITIAL_PEPTIDE_RESIDUES = 200  # visible at start (long chain extending out of tunnel)
 
 # mRNA cross-section equalization: target radial spread for surface mesh thickness
-MRNA_TARGET_CROSS_BU = 0.30  # BU (~30 Å, aggressive inflation for uniform thickness)
+MRNA_TARGET_CROSS_BU = 0.22  # BU (~22 Å, mild inflation to equalize segments)
 
 # mRNA bend — droop outside the ribosome channel
 MRNA_CHANNEL_HALF_LEN = 1.5   # BU (~150Å) — straight zone around mRNA centroid (ribosome tunnel ~80Å)
