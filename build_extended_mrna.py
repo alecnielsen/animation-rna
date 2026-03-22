@@ -440,6 +440,30 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None, all_ribo_coords=None):
         print(f"  Wall repulsion: {len(query_ribo)} ribosome atoms for queries, "
               f"r_min=5Å, k=5000, update every {WALL_UPDATE_INTERVAL} steps")
 
+    # Cross-section restraint: prevent atoms from collapsing toward the backbone axis.
+    # For each non-backbone atom, restrain its distance to the nearest P atom to be
+    # at least min_radial_dist. This keeps the mRNA tube uniformly thick during MD.
+    if len(p_indices) >= 2:
+        from openmm import CustomBondForce
+        # Flat-bottom harmonic: zero penalty when dist > r0, quadratic when dist < r0
+        radial_force = CustomBondForce("0.5*k_radial*step(r0-r)*(r0-r)^2")
+        radial_force.addGlobalParameter("k_radial", 200.0)   # kJ/mol/nm²
+        radial_force.addGlobalParameter("r0", 0.8)            # nm = 8 Å minimum radial distance
+        p_set = set(p_indices)
+        p_coords_nm = np.array([modeller.positions[i].value_in_unit(nanometer) for i in p_indices])
+        p_tree = KDTree(p_coords_nm)
+        n_radial = 0
+        for a in modeller.topology.atoms():
+            if a.index in p_set:
+                continue
+            atom_pos = np.array(modeller.positions[a.index].value_in_unit(nanometer))
+            _, nearest_p = p_tree.query(atom_pos)
+            radial_force.addBond(a.index, p_indices[nearest_p], [])
+            n_radial += 1
+        system.addForce(radial_force)
+        print(f"  Cross-section restraint: {n_radial} atom-to-P bonds "
+              f"(k=200 kJ/mol/nm², r0=8 Å)")
+
     from openmm import Platform
     platform = Platform.getPlatformByName('CPU')
     integrator = LangevinMiddleIntegrator(

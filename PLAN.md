@@ -299,7 +299,8 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] `MRNA_MAX_DROOP = 0.5` BU — gentle curve preserved, mesh stays intact
   - [x] Per-segment `StyleSurface(scale_radius=...)` + PDB-level radial inflation to equalize mRNA thickness
   - [x] Root cause: 5' end relaxes into tighter conformation during MD (13.6 Å vs 17.0 Å cross-section)
-  - [ ] TODO: add cross-section restraint to `build_extended_mrna.py` MD relaxation and rebuild pipeline
+  - [x] Cross-section restraint added to `build_extended_mrna.py` MD relaxation: `CustomBondForce` penalizes atoms closer than 8 Å to nearest P atom (k=200 kJ/mol/nm²), keeping tube uniformly thick during relaxation
+  - [ ] Rebuild in progress: 500K MD steps with new restraint, then re-run keyframe relaxation pipeline
 
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
