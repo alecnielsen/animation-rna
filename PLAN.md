@@ -299,10 +299,11 @@ proper centroid-based pivot). Slightly angled to show the exit tunnel.
   - [x] `MRNA_MAX_DROOP = 0.5` BU — gentle curve preserved, mesh stays intact
   - [x] Per-segment `StyleSurface(scale_radius=...)` + PDB-level radial inflation to equalize mRNA thickness
   - [x] Root cause: 5' end relaxes into tighter conformation during MD (13.6 Å vs 17.0 Å cross-section)
-  - [x] Cross-section restraint in `build_extended_mrna.py` MD: `CustomBondForce` penalizes atoms closer than 8 Å to nearest P atom (k=200 kJ/mol/nm²)
-  - [x] Rebuilt `extended_mrna.pdb` with 500K MD steps — seg0/seg1 cross-sections equalized (~13 Å)
-  - [x] PDB-level inflation in `_split_mrna_pdb()` targets 22 Å cross-section before MN loads (MN's GN surface uses PDB positions, not foreach_set'd vertices)
-  - [x] Per-segment `StyleSurface(scale_radius)` boost for remaining differences
+  - [x] Cross-section restraint in `build_extended_mrna.py` MD: `CustomBondForce` penalizes atoms closer than r0 to nearest P atom
+  - [x] 5 segments with off-screen boundary splits (residues 40, 210, 350, 470) — eliminates visible surface taper at segment boundaries
+  - [x] Uniform `StyleSurface(scale_radius=2.5)` — thicker surface, no per-segment hacks
+  - [x] Removed PDB inflation hacks (caused lumpy artifacts)
+  - [ ] TODO: re-run build with stronger cross-section restraint (higher k/r0) to fix remaining 5' end thinning at source
 
 ### v19 (complete)
 - [x] Per-frame tRNA-mRNA declash to prevent visual clipping at the decoding center
