@@ -447,8 +447,8 @@ def relax_rna(input_pdb, output_pdb, ribo_coords=None, all_ribo_coords=None):
         from openmm import CustomBondForce
         # Flat-bottom harmonic: zero penalty when dist > r0, quadratic when dist < r0
         radial_force = CustomBondForce("0.5*k_radial*step(r0-r)*(r0-r)^2")
-        radial_force.addGlobalParameter("k_radial", 200.0)   # kJ/mol/nm²
-        radial_force.addGlobalParameter("r0", 0.8)            # nm = 8 Å minimum radial distance
+        radial_force.addGlobalParameter("k_radial", 500.0)   # kJ/mol/nm²
+        radial_force.addGlobalParameter("r0", 1.2)            # nm = 12 Å minimum radial distance
         p_set = set(p_indices)
         p_coords_nm = np.array([modeller.positions[i].value_in_unit(nanometer) for i in p_indices])
         p_tree = KDTree(p_coords_nm)
